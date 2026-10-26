@@ -1,4 +1,4 @@
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -85,7 +85,9 @@ test("#1590: webserver/index-inject publishes __BILI__ while an origin is known 
             assert.equal(listeners.length, 1);
             const table: InjectRow[] = [];
             listeners[0](table);
-            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: proxy.origin } }]);
+            // #4237: the payload carries the Context-tab face flags — default
+            // (empty config) keeps the tab on, no label key.
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: proxy.origin, contextTab: true } }]);
         });
     } finally {
         proxy.close();
@@ -157,7 +159,8 @@ test("#1809: live /bili/origin route reflects the bound origin", async () => {
             await originRoute.handler({}, res);
             assert.equal(res.status, 200);
             assert.equal(res.headers?.["content-type"], "application/json");
-            assert.deepEqual(JSON.parse(res.body), { origin: "http://127.0.0.1:8787" });
+            // #4237: same face flags as the snapshot row — default keeps the tab on.
+            assert.deepEqual(JSON.parse(res.body), { origin: "http://127.0.0.1:8787", contextTab: true });
         });
     } finally {
         rmrf(home);
@@ -175,7 +178,63 @@ test("#1809: /bili/origin answers null before binding", async () => {
             const originRoute = routes.find((r) => r.path === "/bili/origin")!;
             const res = new FakeRes();
             await originRoute.handler({}, res);
-            assert.deepEqual(JSON.parse(res.body), { origin: null });
+            // #4237: face flags ride along even before binding.
+            assert.deepEqual(JSON.parse(res.body), { origin: null, contextTab: true });
+        });
+    } finally {
+        rmrf(home);
+    }
+});
+
+test("#4237: __BILI__ snapshot and /bili/origin carry the Context-tab face flags from config", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
+    try {
+        const cfgFile = path.join(home, "bili-config.json");
+        fs.writeFileSync(cfgFile, JSON.stringify({ dsh: { contextTab: false, contextTabLabel: "压缩账本" } }));
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:8787", BILI_CONFIG_FILE: cfgFile }, async () => {
+            _resetRegisterForTest("http://127.0.0.1:8787");
+            const routes: RouteRow[] = [];
+            const listeners: InjectListener[] = [];
+            apply(routeCtx(routes, listeners) as Parameters<typeof apply>[0]);
+            const table: InjectRow[] = [];
+            listeners[0](table);
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: "http://127.0.0.1:8787", contextTab: false, contextTabLabel: "压缩账本" } }]);
+            const res = new FakeRes();
+            await routes.find((r) => r.path === "/bili/origin")!.handler({}, res);
+            assert.deepEqual(JSON.parse(res.body), { origin: "http://127.0.0.1:8787", contextTab: false, contextTabLabel: "压缩账本" });
+        });
+    } finally {
+        rmrf(home);
+    }
+});
+
+test("#4237: BILI_DSH_CONTEXT_TAB env overrides the file tier in both directions; blank label falls back to none", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
+    try {
+        // file says hide, env says show ⇒ env wins.
+        const offFile = path.join(home, "off.json");
+        fs.writeFileSync(offFile, JSON.stringify({ dsh: { contextTab: false, contextTabLabel: "   " } }));
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:8787", BILI_CONFIG_FILE: offFile, BILI_DSH_CONTEXT_TAB: "1" }, async () => {
+            _resetRegisterForTest("http://127.0.0.1:8787");
+            const routes: RouteRow[] = [];
+            const listeners: InjectListener[] = [];
+            apply(routeCtx(routes, listeners) as Parameters<typeof apply>[0]);
+            const table: InjectRow[] = [];
+            listeners[0](table);
+            // whitespace label normalizes away — no key in the payload.
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: "http://127.0.0.1:8787", contextTab: true } }]);
+        });
+        // file silent, env says hide ⇒ env wins.
+        const onFile = path.join(home, "on.json");
+        fs.writeFileSync(onFile, "{}");
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: "http://127.0.0.1:8787", BILI_CONFIG_FILE: onFile, BILI_DSH_CONTEXT_TAB: "0" }, async () => {
+            _resetRegisterForTest("http://127.0.0.1:8787");
+            const routes: RouteRow[] = [];
+            const listeners: InjectListener[] = [];
+            apply(routeCtx(routes, listeners) as Parameters<typeof apply>[0]);
+            const table: InjectRow[] = [];
+            listeners[0](table);
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: "http://127.0.0.1:8787", contextTab: false } }]);
         });
     } finally {
         rmrf(home);
@@ -382,11 +441,21 @@ type Mounted = {
     component: () => unknown;
     resetHooks: () => void;
     runCleanups: () => void;
+    pendingTimers: () => number;
     inject: string[];
     slotsOrder: string[];
     optionsBySlot: Map<string, Record<string, unknown>>;
     dicts: Record<string, { zh: Record<string, string>; en: Record<string, string> }>;
 };
+
+// #4432: mounts whose owning test throws never reach runCleanups(); this
+// drain runs after EVERY test so an abandoned mount's clock/effects release
+// and a failing assertion can never hang the file process.
+const liveMounts = new Set<Mounted>();
+const drainAbandonedMounts = (): void => {
+    for (const m of [...liveMounts]) m.runCleanups();
+};
+after(() => drainAbandonedMounts());
 
 // Mounts the client bundle in a fresh vm realm (one page load) with the given
 // globals. React hooks are emulated with per-mount state: useState persists
@@ -397,7 +466,29 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
     const registrations: Array<{ id: string; factory: (require: (spec: string) => unknown) => unknown }> = [];
     const sandbox: Record<string, unknown> = {};
     sandbox.window = { __ModuleLoader__: { load: (reg: (typeof registrations)[number]) => registrations.push(reg) } };
-    Object.assign(sandbox, extra);
+    // #4432: the mounted client schedules HOST timers through the injected
+    // sandbox clock (origin-probe slow phase, etc.). A test that fails
+    // mid-flight never reaches its runCleanups() call, and the abandoned
+    // chain kept the file process alive forever — every CI leg holding this
+    // file hung to the job timeout. Wrap the clock so every handle is
+    // tracked and released on cleanup; the file-level drain guarantees the
+    // release even when the owning test throws.
+    const hostSetTimeout = (typeof extra.setTimeout === "function" ? extra.setTimeout : setTimeout) as (fn: () => void, ms?: number) => NodeJS.Timeout;
+    const hostClearTimeout = (typeof extra.clearTimeout === "function" ? extra.clearTimeout : clearTimeout) as (h?: NodeJS.Timeout) => void;
+    const sandboxTimers = new Set<NodeJS.Timeout>();
+    const trackedSetTimeout = (fn: (...a: unknown[]) => unknown, ms?: number): NodeJS.Timeout => {
+        const handle: NodeJS.Timeout = hostSetTimeout(() => {
+            sandboxTimers.delete(handle);
+            fn();
+        }, ms);
+        sandboxTimers.add(handle);
+        return handle;
+    };
+    const trackedClearTimeout = (h?: NodeJS.Timeout): void => {
+        if (h !== undefined) sandboxTimers.delete(h);
+        hostClearTimeout(h);
+    };
+    Object.assign(sandbox, extra, { setTimeout: trackedSetTimeout, clearTimeout: trackedClearTimeout });
     vm.createContext(sandbox);
     vm.runInContext(code, sandbox, { filename: "dsh-native-client.bundle.js" });
     assert.equal(registrations.length, 1);
@@ -464,7 +555,7 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
     });
     assert.ok(components.has(slotName), `slot ${slotName} must be registered`);
     const bound = components.get(slotName)!;
-    return {
+    const mounted: Mounted = {
         // Hook indices restart on every render (React matches hooks by
         // position within a single render). The host passes the conversation
         // identity as the entry's props; the test may mirror that explicitly.
@@ -480,14 +571,22 @@ async function mountClient(extra: Record<string, unknown>, slotName = "settings.
             effectSlots = [];
         },
         runCleanups: () => {
+            // #4432: release the sandbox clock first — the poll chains the
+            // effect cleanups may themselves clearTimeout are tracked here.
+            for (const h of sandboxTimers) hostClearTimeout(h);
+            sandboxTimers.clear();
+            liveMounts.delete(mounted);
             // Positions held by non-effect hooks (useState) stay as holes.
             for (const slot of effectSlots.splice(0)) slot?.cleanup?.();
         },
+        pendingTimers: () => sandboxTimers.size,
         inject,
         slotsOrder,
         optionsBySlot,
         dicts,
     };
+    liveMounts.add(mounted);
+    return mounted;
 }
 
 test("#1590/#2125: client bundle registers the settings.section entry bili AND the plugins.bundle.config panel (wrapper id, require purity, both render branches)", async () => {
@@ -509,8 +608,8 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
 
     const m = await mountClient(extra);
     assert.deepEqual(Array.from(m.inject), ["slots", "locale"]);
-    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view"]);
-    assert.equal(m.optionsBySlot.size, 3);
+    assert.deepEqual(m.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view", "shell.overlay"]);
+    assert.equal(m.optionsBySlot.size, 4);
     // #3862: the per-session Context tab sits right of the built-in chat (0) /
     // trajectory (10) faces and any third-party context tab (dsh-context: 20).
     const viewSlot = m.optionsBySlot.get("conversation.view")!;
@@ -556,21 +655,21 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
         "#2448: frame height follows the host viewport instead of a flat 640px",
     );
     const buttons = collectButtons(tree);
-    assert.equal(buttons.length, 5, "four tabs plus the backup open-in-browser button");
+    assert.equal(buttons.length, 6, "five tabs (versions included, #3719) plus the backup open-in-browser button");
     // #2448: the backup button drops the origin URL from the label (a narrow
     // host panel squeezed the hint row into a sliver) and keeps it in the
     // tooltip instead.
     const openLabel: string[] = [];
-    collectText(buttons[4], openLabel);
+    collectText(buttons[5], openLabel);
     assert.deepEqual(openLabel, ["打开 Web UI"], "#2448: backup button label carries no origin URL");
-    assert.equal(buttons[4].props?.title, "http://127.0.0.1:8787", "#2448: the origin moves to the tooltip");
+    assert.equal(buttons[5].props?.title, "http://127.0.0.1:8787", "#2448: the origin moves to the tooltip");
     const tabLabels: string[] = [];
-    for (const b of buttons.slice(0, 4)) {
+    for (const b of buttons.slice(0, 5)) {
         const bt: string[] = [];
         collectText(b, bt);
         tabLabels.push(bt.join(""));
     }
-    assert.deepEqual(tabLabels, ["总览", "会话", "配置", "日志"], "tabs mirror the web UI nav terminology");
+    assert.deepEqual(tabLabels, ["总览", "会话", "配置", "日志", "版本"], "tabs mirror the web UI nav terminology");
     // The open-in-browser action rides the TAB row (right after the logs
     // tab), not the footer below the iframe: the row div that parents the
     // logs tab also parents the action button, and the root's footer row
@@ -582,8 +681,8 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     });
     assert.ok(tabRow !== undefined, "logs tab has a parent row");
     const rowButtons = collectButtons(tabRow);
-    assert.equal(rowButtons.length, 5, "tab row = four tabs + the open-WebUI action");
-    assert.equal(rowButtons[4], buttons[4], "the action is the row's last child, right after the logs tab");
+    assert.equal(rowButtons.length, 6, "tab row = five tabs + the open-WebUI action");
+    assert.equal(rowButtons[5], buttons[5], "the action is the row's last child, right after the last tab");
     const footerRow = (tree.children ?? []).filter((c) => c !== null && typeof c === "object").at(-1) as ElementNode;
     assert.equal(collectButtons(footerRow).length, 0, "embedded footer carries no button — the action moved up");
     // Tab click moves only the hash — the frame navigates same-document.
@@ -593,7 +692,7 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     assert.ok(frameAfterTab !== undefined);
     assert.equal(frameAfterTab.props?.src, "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/sessions");
     // The backup button keeps the original jump target.
-    (buttons[4].props!.onClick as () => void)();
+    (buttons[5].props!.onClick as () => void)();
     assert.deepEqual(opened, ["http://127.0.0.1:8787/__bili/"]);
     m.runCleanups();
 
@@ -611,7 +710,7 @@ test("#1590/#2125: client bundle registers the settings.section entry bili AND t
     assert.ok(bframe !== undefined, "origin present renders the embedded iframe in the bundle panel");
     assert.equal(bframe.props?.src, "http://127.0.0.1:8787/__bili/?embed=1&lang=zh#/overview");
     const bButtons = collectButtons(btree);
-    assert.equal(bButtons.length, 5, "the bundle panel offers the same tabs plus backup button");
+    assert.equal(bButtons.length, 6, "the bundle panel offers the same tabs plus backup button");
     assert.equal(
         bButtons[bButtons.length - 1].props?.title,
         "http://127.0.0.1:8787",
@@ -752,7 +851,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         assert.ok(frame !== undefined, "resolved origin upgrades the entry without a reload");
         assert.equal(frame.props?.src, "http://127.0.0.1:9999/__bili/?embed=1&lang=zh#/overview");
         const upButtons = collectButtons(second);
-        assert.equal(upButtons.length, 5, "the upgraded entry shows tabs plus the backup button");
+        assert.equal(upButtons.length, 6, "the upgraded entry shows tabs plus the backup button");
         (upButtons[upButtons.length - 1].props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:9999/__bili/"]);
         // #2288: resolution no longer STOPs the probe — exactly one fast probe
@@ -797,7 +896,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         assert.ok(sframe !== undefined, "the upgraded entry keeps its frame");
         assert.equal(sframe.props?.src, "http://127.0.0.1:18798/__bili/?embed=1&lang=zh#/overview", "the embedded frame follows the corrected live origin");
         const sButtons = collectButtons(second);
-        assert.equal(sButtons.length, 5, "the upgraded entry shows tabs plus the backup button");
+        assert.equal(sButtons.length, 6, "the upgraded entry shows tabs plus the backup button");
         (sButtons[sButtons.length - 1].props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:18798/__bili/"]);
         m.runCleanups();
@@ -902,7 +1001,7 @@ test("#1809/#2125/#2187: client polls /bili/origin while unresolved — upgrades
         assert.ok(bframe !== undefined, "the bundle panel upgrades on a resolved origin");
         assert.equal(bframe.props?.src, "http://127.0.0.1:9999/__bili/?embed=1&lang=zh#/overview");
         const bUpButtons = collectButtons(second);
-        assert.equal(bUpButtons.length, 5, "the bundle panel offers tabs plus the backup button");
+        assert.equal(bUpButtons.length, 6, "the bundle panel offers tabs plus the backup button");
         (bUpButtons[bUpButtons.length - 1].props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:9999/__bili/"]);
         m.runCleanups();
@@ -1291,6 +1390,7 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
     // The face must explain the fix instead of spinning on "connecting…".
     {
         const opened: string[] = [];
+        const copiedTexts: string[] = [];
         const m = await mountClient({
             location: { hostname: "vps.example.com" },
             URL,
@@ -1299,6 +1399,7 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
                 if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connection refused");
                 return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
             },
+            navigator: { clipboard: { writeText: async (txt: string) => { copiedTexts.push(String(txt)); } } },
             setTimeout,
             clearTimeout,
         });
@@ -1316,10 +1417,12 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
         assert.ok(!joined.includes("正在连接"), "the endless connecting state is replaced by actionable guidance");
         assert.equal(findTag(tree, "iframe"), undefined, "no frame while the origin is unreachable by construction");
         // #3816 owner follow-up: the hint offers a jump straight to the panel's
-        // config page — the ONLY button in this state (the footer backup entry
-        // stays hidden: it would open the same dead loopback address).
+        // config page; the footer backup entry stays hidden (it would open the
+        // same dead loopback address). #3693: the raw probe failure proving
+        // the unreachability rides underneath with its own copy action.
+        const EXPECTED_ERROR = "connection refused (http://127.0.0.1:18787/__bili/?embed=1)";
         const btns = collectButtons(tree);
-        assert.equal(btns.length, 1, "exactly one action: the config-page jump");
+        assert.equal(btns.length, 2, "exactly two actions: the config-page jump + the error copy");
         const btn = btns[0];
         assert.equal(btn.props?.title, "http://127.0.0.1:18787/__bili/#/config", "the jump targets the panel's config page");
         const label: string[] = [];
@@ -1327,6 +1430,18 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
         assert.equal(label.join(""), "打开配置页", "the jump button carries its localized label");
         (btn.props!.onClick as () => void)();
         assert.deepEqual(opened, ["http://127.0.0.1:18787/__bili/#/config"], "clicking opens the config page in a fresh tab");
+        const copyBtn = btns[1];
+        assert.equal(copyBtn.props?.title, EXPECTED_ERROR, "the copy button carries the full error line as tooltip");
+        const copyLabel: string[] = [];
+        collectText(copyBtn.children, copyLabel);
+        assert.equal(copyLabel.join(""), "复制", "the copy button carries its localized label");
+        (copyBtn.props!.onClick as () => void)();
+        await tick();
+        assert.deepEqual(copiedTexts, [EXPECTED_ERROR], "clicking copies the exact error line including the URL");
+        const afterTree = m.component() as ElementNode;
+        const afterTexts: string[] = [];
+        collectText(afterTree, afterTexts);
+        assert.ok(afterTexts.join("").includes("已复制"), "the label flips to copied on success");
         m.runCleanups();
     }
     // Negative 1: a resolved "ok" verdict outranks the mismatch — same-machine
@@ -1474,6 +1589,141 @@ test("#3816: remote page + loopback origin (relay off) shows the adminRelay guid
     }
 });
 
+// #3693: a failing probe must never read as endless "connecting…" — the raw
+// engine error (plus the failed URL) rides beneath the hint with its own copy
+// action. Primary path: navigator.clipboard.writeText.
+test("#3693: a failing probe surfaces the raw error verbatim with a working copy action", async () => {
+    const copiedTexts: string[] = [];
+    const EXPECTED_ERROR = "connect ECONNREFUSED 127.0.0.1:18787 (http://127.0.0.1:18787/__bili/?embed=1)";
+    const m = await mountClient({
+        location: { hostname: "127.0.0.1" },
+        URL,
+        open: (_url: string) => {},
+        fetch: async (url: string) => {
+            if (String(url).endsWith("/__bili/?embed=1")) throw new Error("connect ECONNREFUSED 127.0.0.1:18787");
+            return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+        },
+        navigator: { clipboard: { writeText: async (txt: string) => { copiedTexts.push(String(txt)); } } },
+        setTimeout,
+        clearTimeout,
+    });
+    m.resetHooks();
+    m.component();
+    await tick();
+    m.component();
+    await tick();
+    let tree = m.component() as ElementNode;
+    const texts: string[] = [];
+    collectText(tree, texts);
+    const joined = texts.join(" ");
+    assert.ok(joined.includes("正在连接"), "the connecting headline stays");
+    assert.ok(joined.includes(EXPECTED_ERROR), "the raw engine error plus the failed URL are shown");
+    assert.equal(findTag(tree, "iframe"), undefined, "no frame while the probe fails");
+    const btns = collectButtons(tree);
+    assert.equal(btns.length, 2, "the copy action plus the standing footer backup button only");
+    const copyBtn = btns.find((b) => b.props?.title === EXPECTED_ERROR);
+    assert.ok(copyBtn !== undefined, "the copy button carries the full error line as tooltip");
+    (copyBtn!.props!.onClick as () => void)();
+    await tick();
+    assert.deepEqual(copiedTexts, [EXPECTED_ERROR], "clicking copies the exact error line including the URL");
+    tree = m.component() as ElementNode;
+    const after: string[] = [];
+    collectText(tree, after);
+    assert.ok(after.join("").includes("已复制"), "the label flips to copied on success");
+    m.runCleanups();
+});
+
+// #3693 follow-up: LAN-http pages (the reporter's exact posture) are NOT
+// secure contexts — navigator.clipboard is absent there, so the copy must
+// fall back to the legacy execCommand path instead of silently doing nothing.
+test("#3693: without navigator.clipboard the copy falls back to execCommand", async () => {
+    const legacyCopies: string[] = [];
+    let ta: { value: string } | undefined;
+    const docMock = {
+        body: { appendChild: (_n: unknown) => {}, removeChild: (_n: unknown) => {} },
+        createElement: (_tag: string) => {
+            ta = { value: "" };
+            return ta;
+        },
+        execCommand: (cmd: string) => {
+            if (cmd !== "copy" || ta === undefined) return false;
+            legacyCopies.push(ta.value);
+            return true;
+        },
+    };
+    const EXPECTED_ERROR = "network down (http://127.0.0.1:18787/__bili/?embed=1)";
+    const m = await mountClient({
+        location: { hostname: "127.0.0.1" },
+        URL,
+        open: (_url: string) => {},
+        fetch: async (url: string) => {
+            if (String(url).endsWith("/__bili/?embed=1")) throw new Error("network down");
+            return { ok: true, json: async () => ({ origin: "http://127.0.0.1:18787" }) };
+        },
+        document: docMock,
+        setTimeout,
+        clearTimeout,
+    });
+    m.resetHooks();
+    m.component();
+    await tick();
+    m.component();
+    await tick();
+    const tree = m.component() as ElementNode;
+    const texts: string[] = [];
+    collectText(tree, texts);
+    assert.ok(texts.join(" ").includes(EXPECTED_ERROR), "the error readout renders without any clipboard API");
+    const copyBtn = collectButtons(tree).find((b) => b.props?.title === EXPECTED_ERROR);
+    assert.ok(copyBtn !== undefined, "the copy action renders regardless of clipboard availability");
+    (copyBtn!.props!.onClick as () => void)();
+    await tick();
+    assert.deepEqual(legacyCopies, [EXPECTED_ERROR], "the execCommand fallback copies the exact error line");
+    m.runCleanups();
+});
+
+// #3693: the Context tab's status poll swallows its failures too — a dead
+// proxy reads as the generic degraded hint forever. Its raw error must ride
+// beneath that hint with the same copy action.
+test("#3693: the Context tab surfaces status-poll failures verbatim with a copy action", async () => {
+    const ORIGIN = "http://127.0.0.1:8787";
+    const EXPECTED_ERROR = `ECONNRESET (${ORIGIN}/__bili/plugin/status?conversationId=dsh&fallback=latest)`;
+    const copiedTexts: string[] = [];
+    const m = await mountClient({
+        __BILI__: { origin: ORIGIN },
+        open: (_url: string) => {},
+        fetch: async (url: string) => {
+            const u = String(url);
+            if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+            if (u.endsWith("/__bili/plugin/status?conversationId=dsh&fallback=latest")) throw new Error("ECONNRESET");
+            if (u.endsWith("/__bili/?embed=1")) return htmlOk();
+            throw new Error(`unexpected fetch: ${u}`);
+        },
+        navigator: { clipboard: { writeText: async (txt: string) => { copiedTexts.push(String(txt)); } } },
+        setTimeout,
+        clearTimeout,
+        setInterval: (() => 0) as unknown as typeof setInterval,
+        clearInterval: (() => {}) as unknown as typeof clearInterval,
+    }, "conversation.view");
+    m.resetHooks();
+    m.component();
+    await tick();
+    m.component();
+    await tick();
+    const tree = m.component() as ElementNode;
+    const texts: string[] = [];
+    collectText(tree, texts);
+    const joined = texts.join(" ");
+    assert.ok(joined.includes("/acp"), "the degraded hint stands");
+    assert.ok(joined.includes(EXPECTED_ERROR), "the raw poll error names the exact status URL polled");
+    assert.equal(findTag(tree, "iframe"), undefined, "never frame while the status poll fails");
+    const copyBtn = collectButtons(tree).find((b) => b.props?.title === EXPECTED_ERROR);
+    assert.ok(copyBtn !== undefined, "the copy action renders with the error line");
+    (copyBtn!.props!.onClick as () => void)();
+    await tick();
+    assert.deepEqual(copiedTexts, [EXPECTED_ERROR], "clicking copies the exact error line including the URL");
+    m.runCleanups();
+});
+
 // #3862: the per-session Context tab (conversation.view slot). The tab does
 // NOT re-render the data natively (#3886 v1); it EMBEDS the web UI's own
 // session page (?embed=1 + #/session/<id>) so compression tree and ledger
@@ -1536,7 +1786,19 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
     assert.ok(frame.props !== null, "frame carries props");
     assert.equal(frame.props.src, EXPECTED_SRC, "frame navigates to #/session/<id> on the ?embed=1 face");
     assert.equal(frame.props.title, "billion-context 压缩代理", "frame keeps the shared bili frame title");
-    // Footer: refresh + the shared open-in-browser action.
+    // #4281: the tab FILLS the conversation view — full-height column root
+    // with no outer padding, a borderless frame stretched by flex, and the
+    // actions riding a slim TOP row instead of a footer below the frame.
+    assert.equal(tree.type, "div");
+    const rootStyle = (tree.props?.style ?? {}) as Record<string, unknown>;
+    assert.equal(rootStyle.height, "100%", "#4281: root fills the conversation view");
+    assert.equal(rootStyle.padding, undefined, "#4281: no outer padding");
+    const frameStyle = (frame.props?.style ?? {}) as Record<string, unknown>;
+    assert.equal(frameStyle.border, "none", "#4281: borderless frame");
+    assert.equal(frameStyle.borderRadius, undefined, "#4281: no rounded corners");
+    assert.equal(frameStyle.flex, 1, "#4281: frame stretches the remaining height");
+    assert.equal(frameStyle.height, "100%");
+    // Top-row actions: refresh + the shared open-in-browser action.
     const buttons = collectButtons(tree);
     assert.equal(buttons.length, 2, "refresh + open-WebUI only");
     const refresh = buttons.find((b) => {
@@ -1547,6 +1809,15 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
     assert.ok(refresh !== undefined, "refresh button renders");
     const webBtn = buttons.find((b) => b.props?.title === ORIGIN);
     assert.ok(webBtn !== undefined, "open-WebUI button keeps the origin tooltip");
+    // #4281: BOTH actions share one slim row above the frame — nothing rides
+    // a footer below it anymore.
+    const actionRow = findDivParenting(tree, (el) => {
+        const bt: string[] = [];
+        collectText(el, bt);
+        return bt.join("") === "刷新";
+    });
+    assert.ok(actionRow !== undefined, "refresh button has a parent row");
+    assert.deepEqual(collectButtons(actionRow), buttons, "#4281: refresh + open-WebUI share ONE top row");
     (webBtn!.props!.onClick as () => void)();
     assert.deepEqual(opened, [`${ORIGIN}/__bili/`]);
     // Polling: exactly one loop on the slow cadence — counting STATUS reads
@@ -1601,6 +1872,13 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
         const st = await subMount({ ok: true, phase: "pre-first-request", sessionId: null });
         assert.ok(textOf(st).includes("等待首个模型请求…"), "pre-first-request waits, does not guess");
         assert.equal(findTag(st, "iframe"), undefined);
+        // #4281: hint states keep breathing room — with the root padding gone,
+        // the content wrapper pads itself (the toolbar row still renders:
+        // origin known ⇒ actions available even before the session exists).
+        const kids = (st.children ?? []).filter((c) => c !== null && typeof c === "object") as ElementNode[];
+        const wrap = kids.at(-1)!;
+        assert.equal((wrap.props?.style as Record<string, unknown>).padding, 16, "#4281: hint wrapper carries its own padding");
+        assert.equal(collectButtons(wrap).length, 0, "#4281: actions never ride inside the content wrapper");
     }
     {
         // #1357 chain-advisory carries a panel string but NO session id: reads
@@ -1663,4 +1941,177 @@ test("#3862: conversation.view Context tab embeds the web UI session page, polls
         assert.equal(collectButtons(dtree).length, 0, "no actions before the origin resolves");
         dm.runCleanups();
     }
+});
+
+// #4237: dsh.contextTab=false drops ONLY the conversation.view registration —
+// the settings section and the plugin bundle config face stay (they are the
+// remaining ledger entry points), and compression itself is untouched.
+test("#4237: contextTab=false hides the Context tab; absent field fails open to today's registration", async () => {
+    const baseExtra = (): Record<string, unknown> => ({
+        open: (_url: string) => {},
+        fetch: async () => ({ ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) }),
+        setTimeout,
+        clearTimeout,
+    });
+    const hidden = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTab: false } });
+    // #4254: the shell.overlay availability pill is NOT user-hidable — it rides along
+    // even when the Context tab is hidden (it is an error surface, not a preference).
+    assert.deepEqual(hidden.slotsOrder, ["settings.section", "plugins.bundle.config", "shell.overlay"]);
+    assert.equal(hidden.optionsBySlot.size, 3);
+    assert.ok(!hidden.optionsBySlot.has("conversation.view"), "hidden tab registers nothing");
+    assert.ok(hidden.optionsBySlot.has("shell.overlay"), "the #4254 pill stays registered");
+    hidden.runCleanups();
+    // relay-mode snapshot carries the gate too.
+    const hiddenRelay = await mountClient({ ...baseExtra(), __BILI__: { origin: null, relay: true, contextTab: false } });
+    assert.ok(!hiddenRelay.optionsBySlot.has("conversation.view"), "relay snapshot gate applies as well");
+    hiddenRelay.runCleanups();
+    // explicit on keeps it; (absent-field fail-open is pinned by the #1590/#2125
+    // and #3862 tests above, which mount without the field).
+    const shown = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTab: true } });
+    assert.deepEqual(shown.slotsOrder, ["settings.section", "plugins.bundle.config", "conversation.view", "shell.overlay"]);
+    shown.runCleanups();
+});
+
+test("#4237: contextTabLabel overrides the built-in tab name; blank or non-string falls back", async () => {
+    const baseExtra = (): Record<string, unknown> => ({
+        open: (_url: string) => {},
+        fetch: async () => ({ ok: true, json: async () => ({ origin: "http://127.0.0.1:8787" }) }),
+        setTimeout,
+        clearTimeout,
+    });
+    const named = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTabLabel: "压缩账本" } });
+    const viewSlot = named.optionsBySlot.get("conversation.view")!;
+    assert.equal((viewSlot.label as () => string)(), "压缩账本");
+    named.runCleanups();
+    const blank = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTabLabel: "   " } });
+    assert.equal((blank.optionsBySlot.get("conversation.view")!.label as () => string)(), "上下文");
+    blank.runCleanups();
+    const junk = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTabLabel: 42 } });
+    assert.equal((junk.optionsBySlot.get("conversation.view")!.label as () => string)(), "上下文");
+    junk.runCleanups();
+});
+
+test("#4432: an abandoned mount's clock is drained after its test — a failing assertion can never hang the file", async () => {
+    // Reproduces the CI-stuck shape: a mount whose owning test throws before
+    // runCleanups() leaves the client's origin-probe slow phase holding host
+    // timers. The file-level after() drain must release them unconditionally.
+    const m = await mountClient({
+        open: (_url: string) => {},
+        fetch: async (url: string) => {
+            const u = String(url);
+            if (u === "/bili/origin") return { ok: true, json: async () => ({ origin: "http://127.0.0.1:9999" }) };
+            if (u.endsWith("/__bili/?embed=1")) return htmlOk();
+            throw new Error(`unexpected fetch: ${u}`);
+        },
+        setTimeout,
+        clearTimeout,
+    });
+    m.resetHooks();
+    m.component();
+    await tick();
+    m.component();
+    await tick();
+    // The slow follow-up is pending exactly as in the #2288 block — a host
+    // timer is held by the sandbox clock right now.
+    assert.ok(m.pendingTimers() > 0, "the origin-probe slow phase holds a pending host timer");
+    // The owning test "fails" here (no runCleanups call) — the drain must
+    // still release every tracked timer and deregister the mount.
+    drainAbandonedMounts();
+    assert.equal(m.pendingTimers(), 0, "the drain released every pending sandbox timer");
+    assert.ok(!liveMounts.has(m), "the drain deregistered the abandoned mount");
+});
+
+test("#4254: shell.overlay upstream-unavailable pill polls /__bili/upstreams, renders per-host rows, auto-dismisses when healthy", async () => {
+    const ORIGIN = "http://127.0.0.1:8787";
+    const intervals: Array<{ id: number; delay: number; fn: () => void }> = [];
+    let nextId = 1;
+    const fakeSetInterval = ((fn: () => void, delay?: number): unknown => {
+        const id = nextId++;
+        intervals.push({ id, delay: delay ?? 0, fn });
+        return id;
+    }) as unknown as typeof setInterval;
+    const fakeClearInterval = ((id: unknown): void => {
+        const i = intervals.findIndex((p) => p.id === id);
+        if (i >= 0) intervals.splice(i, 1);
+    }) as unknown as typeof clearInterval;
+    const textOf = (node: unknown): string => {
+        const out: string[] = [];
+        collectText(node, out);
+        return out.join(" ");
+    };
+    const mountOverlay = async (upstreams: unknown): Promise<Awaited<ReturnType<typeof mountClient>>> =>
+        mountClient({
+            __BILI__: { origin: ORIGIN },
+            fetch: async (url: string) => {
+                const u = String(url);
+                if (u.endsWith("/bili/origin")) return { ok: true, json: async () => ({ origin: ORIGIN }) };
+                if (u.endsWith("/__bili/upstreams")) return { ok: true, json: async () => ({ upstreams }) };
+                throw new Error(`unexpected fetch: ${u}`);
+            },
+            setTimeout,
+            clearTimeout,
+            setInterval: fakeSetInterval,
+            clearInterval: fakeClearInterval,
+        }, "shell.overlay");
+
+    // Populated: one unreachable upstream with an OPEN circuit (retry ETA present).
+    const m = await mountOverlay([{ host: "127.0.0.1:7864", kind: "connect-refused", code: "ECONNREFUSED", count: 9, firstSeen: 0, lastSeen: 0, circuit: { state: "open", nextProbeInMs: 60000 } }]);
+    m.resetHooks();
+    m.component();
+    assert.equal(m.component(), null, "first paint is empty until the health report resolves");
+    await tick();
+    const txt = textOf(m.component());
+    assert.ok(txt.includes("127.0.0.1:7864"), "row shows the forwarded host:port");
+    assert.ok(txt.includes("connect-refused"), "row shows the failure kind");
+    assert.ok(txt.includes("ECONNREFUSED"), "row shows the errno code");
+    assert.ok(txt.includes("×9"), "row shows the consecutive-failure tally");
+    assert.ok(txt.includes("约 60s 后重试"), "open circuit surfaces the retry ETA (zh)");
+    assert.ok(txt.includes("1 个上游不可用"), "singular header for one upstream");
+    assert.equal(intervals.length, 1, "one poll loop while mounted");
+    assert.equal(intervals[0].delay, 10000, "poll cadence is 10s");
+    m.runCleanups();
+    assert.deepEqual(intervals, [], "unmount cancels the poll loop");
+
+    // Healthy: empty report ⇒ the banner dismisses (renders null).
+    const h = await mountOverlay([]);
+    h.resetHooks();
+    h.component();
+    await tick();
+    assert.equal(h.component(), null, "no unreachable upstreams ⇒ no banner");
+    h.runCleanups();
+
+    // Multiple: header pluralizes, one row per host, and only the OPEN-circuit
+    // host carries a retry ETA (an alert-only host has circuit:null).
+    const mm = await mountOverlay([
+        { host: "127.0.0.1:7864", kind: "connect-refused", code: "ECONNREFUSED", count: 3, circuit: { state: "open", nextProbeInMs: 30000 } },
+        { host: "10.0.0.5:9000", kind: "connect-timeout", count: 2, circuit: null },
+    ]);
+    mm.resetHooks();
+    mm.component();
+    await tick();
+    const mt = textOf(mm.component());
+    assert.ok(mt.includes("2 个上游不可用"), "plural header for two upstreams");
+    assert.ok(mt.includes("127.0.0.1:7864") && mt.includes("10.0.0.5:9000"), "one row per unreachable host");
+    assert.ok(mt.includes("connect-timeout") && mt.includes("×2"), "alert-only host still lists kind + tally");
+    assert.ok(mt.includes("约 30s 后重试"), "open-circuit host surfaces its own retry ETA");
+    assert.ok(!mt.includes("×2 · 约"), "alert-only (circuit-null) host carries no retry ETA");
+    mm.runCleanups();
+
+    // Defensive parse: malformed entries degrade to fewer rows and never throw —
+    // only the well-formed host survives into the banner.
+    const g = await mountOverlay([
+        { host: "192.168.1.20:8080", kind: "connect-refused", code: "ECONNREFUSED", count: 2 },
+        "not-an-object",
+        { kind: "no-host-entry" },
+        { host: "", code: 42 },
+    ]);
+    g.resetHooks();
+    g.component();
+    await tick();
+    const gt = textOf(g.component());
+    assert.ok(gt.includes("192.168.1.20:8080"), "well-formed entry still renders");
+    assert.ok(gt.includes("×2"), "the survivor keeps its tally");
+    assert.ok(!gt.includes("no-host-entry") && !gt.includes("not-an-object"), "malformed entries are dropped");
+    assert.ok(gt.includes("1 个上游不可用"), "header counts only surviving rows");
+    g.runCleanups();
 });

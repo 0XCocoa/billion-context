@@ -60,6 +60,8 @@ const MAX_CHAIN_WALK = 8192;
  *  MIN_RESYNC_RUN in fold-reconcile (there 3, because reconcile matches on
  *  position alone; here the second consecutive match must ALSO line up with
  *  the view, which a stray duplicate cannot provide). */
+import { sha256Hex } from "../storage/store.js";
+
 const MIN_SEAM_RUN = 2;
 
 /** #3658 canonical identity signature minus the hash: the tuple the kernel
@@ -69,13 +71,26 @@ const MIN_SEAM_RUN = 2;
  *  same bytes ⇒ same length; different images practically always differ). */
 function identitySig(m: BiliMessage): string {
     const text = typeof m.text === "string" ? m.text : "";
-    const img = m.imagePart === true ? `|img:${(m.imageBase64 ?? "").length}` : "";
+    // #4390: hash the image BYTES, never the length — same-size screenshots
+    // used to collide and chain a false seam (silent truncation). The walk
+    // only touches the tail region, so per-request hashing is bounded; a
+    // 24-hex prefix is far beyond collision reach for seam evidence.
+    const img = m.imagePart === true ? `|img:${sha256Hex(m.imageBase64 ?? "").slice(0, 24)}` : "";
     return `${m.role}|${m.contentType}|${m.toolName ?? ""}|${text}${img}`;
+}
+
+/** Test seam (#4390): the seam fingerprint under test — see identitySig. */
+export function identitySigForTest(m: BiliMessage): string {
+    return identitySig(m);
 }
 
 interface ViewRow {
     seq: number;
-    msg: BiliMessage;
+    msgId: string;
+    /** Present only for UNCOVERED rows — covered rows' bytes never ride the
+     *  outbound (suppressed behind anchors), so the windowed loader (#D5-5)
+     * never reads them. */
+    msg?: BiliMessage;
 }
 
 interface SnapshotRenderDeps {
@@ -109,7 +124,16 @@ function parseRow(content: string, seq: number): BiliMessage | null {
     try {
         const parsed = JSON.parse(content) as { id?: unknown; role?: unknown };
         if (typeof parsed.id !== "string" || typeof parsed.role !== "string") return null;
-        return parsed as BiliMessage;
+        const msg = parsed as BiliMessage;
+        // #4316 layer 3: the row's (session, seq) is the message's permanent
+        // ledger position — stamp it so assignRefs issues the ref as the
+        // direct display of the seq (never re-minted across byte churn).
+        // Store seqs are 0-based; the ref display space is 1-based
+        // (MIN_INDEX=1, "m00001" is the first number) — the stamp carries the
+        // DISPLAY index. Rows written before this change simply lack the
+        // field; the kernel counter path keeps serving them unchanged.
+        msg.ledgerSeq = seq + 1;
+        return msg;
     } catch {
         return null;
     }
@@ -121,24 +145,31 @@ function parseRow(content: string, seq: number): BiliMessage | null {
  * are two observability fields on `session.metadata` (the render latch and the
  * last post-arm degrade reason) — neither touches outbound bytes.
  */
-type ViewResult = { ok: true; view: BiliMessage[] } | { ok: false; reason: string };
+// tailStart (#4241): the first CLIENT index of the live tail (clientJoin) —
+// everything in clientMsgs at indices >= tailStart rides the outbound verbatim,
+// everything below is server-rendered territory. Exposed so the egress judge can
+// exempt the rendered prefix and validate only the tail it promises byte-intact.
+type ViewResult = { ok: true; view: BiliMessage[]; tailStart: number } | { ok: false; reason: string };
 
 function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     const activeBlocks = session.state.blocks.filter((b) => b.active);
     if (activeBlocks.length === 0) return { ok: false, reason: "no-active-blocks" };
     const store = getStore();
     if (!store) return { ok: false, reason: "store-unavailable" };
+    // #D5-5 windowed load — two tiers:
+    //   (a) identity rows (seq + msg_id, no bytes) for EVERY live row —
+    //       positions and ids drive block anchoring and the byId seam chain;
+    //   (b) content rows (bytes + media) ONLY for seqs OUTSIDE the covered
+    //       intervals — covered rows are suppressed behind anchors, so their
+    //       bytes never ride the outbound and are never read. A covered row
+    //       with corrupt bytes therefore cannot degrade the render.
     let rows: ViewRow[] = [];
     try {
-        const rawRows = store.unifiedTailViewRows(session.id);
+        const light = store.unifiedMessageIdRows(session.id);
         const seqs = store.unifiedTailSeqs(session.id);
-        if (!rawRows || rawRows.length === 0 || !seqs || seqs.length === 0) return { ok: false, reason: "transcript-empty" };
+        if (!light || light.length === 0 || !seqs || seqs.length === 0) return { ok: false, reason: "transcript-empty" };
         const bySeq = new Map<number, ViewRow>();
-        for (const row of rawRows) {
-            const msg = parseRow(row.content, row.seq);
-            if (!msg) return { ok: false, reason: "row-unparsable" }; // untrustworthy transcript: degrade, never guess
-            bySeq.set(row.seq, { seq: row.seq, msg });
-        }
+        for (const row of light) bySeq.set(row.seq, { seq: row.seq, msgId: row.msgId });
         for (const seq of seqs) {
             const v = bySeq.get(seq);
             if (!v) return { ok: false, reason: "view-pointer-missing-row" }; // view pointer to a missing row: degrade
@@ -160,10 +191,9 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     const coveredSeqUnion = new Set<number>();
     for (const block of activeBlocks) {
         const blockSeqs = new Set<number>();
-        for (const id of block.effectiveMessageIds) {
-            for (let i = 0; i < rows.length; i++) {
-                if (rows[i].msg.id === id) blockSeqs.add(rows[i].seq);
-            }
+        const wanted = new Set(block.effectiveMessageIds);
+        for (let i = 0; i < rows.length; i++) {
+            if (wanted.has(rows[i].msgId)) blockSeqs.add(rows[i].seq);
         }
         // #3812: no fold-time id resolves against the view — the block cannot
         // be positioned (and its covered region cannot be bounded). Anchoring
@@ -175,6 +205,59 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
         blockSeeds.push({ blockId: block.blockId, seqs: blockSeqs });
     }
 
+    // #D5-5: merge the covered seqs into disjoint intervals and load bytes
+    // only for the uncovered window. Row-unparsable now guards UNCOVERED
+    // bytes only — covered corruption cannot degrade the render.
+    try {
+        const intervals: [number, number][] = [];
+        {
+            const sorted = [...coveredSeqUnion].sort((a, b) => a - b);
+            for (const seq of sorted) {
+                const last = intervals[intervals.length - 1];
+                if (last && seq <= last[1] + 1) last[1] = Math.max(last[1], seq);
+                else intervals.push([seq, seq]);
+            }
+        }
+        const contentRows = store.unifiedUncoveredRows(session.id, intervals);
+        if (contentRows !== null) {
+            const bySeq = new Map<number, ViewRow>();
+            for (const row of contentRows) {
+                const msg = parseRow(row.content, row.seq);
+                if (!msg) return { ok: false, reason: "row-unparsable" }; // uncovered bytes are untrustworthy: degrade, never guess
+                bySeq.set(row.seq, { seq: row.seq, msgId: row.msgId, msg });
+            }
+            let coveredSeen = 0;
+            for (const r of rows) {
+                const v = bySeq.get(r.seq);
+                if (v) r.msg = v.msg;
+                else if (coveredSeqUnion.has(r.seq)) coveredSeen++;
+            }
+            // Every row must be accounted for: uncovered-with-bytes or
+            // covered. A gap (a row neither loaded nor covered — e.g. a
+            // concurrent ingest raced the two queries) falls back to one full
+            // load rather than rendering a hole.
+            if (coveredSeen !== [...coveredSeqUnion].filter((seq) => rows.some((r) => r.seq === seq)).length || rows.some((r) => !r.msg && !coveredSeqUnion.has(r.seq))) {
+                const full = store.unifiedTailViewRows(session.id);
+                if (full !== null) {
+                    const fullBySeq = new Map<number, BiliMessage>();
+                    for (const row of full) {
+                        const msg = parseRow(row.content, row.seq);
+                        if (msg) fullBySeq.set(row.seq, msg);
+                    }
+                    for (const r of rows) {
+                        if (!r.msg) {
+                            const m = fullBySeq.get(r.seq);
+                            if (!m && !coveredSeqUnion.has(r.seq)) return { ok: false, reason: "row-unparsable" };
+                            if (m) r.msg = m;
+                        }
+                    }
+                }
+            }
+        }
+    } catch {
+        return { ok: false, reason: "transcript-error" };
+    }
+
     // Backward chain: from the client's end, match view rows (id fast path,
     // then identity signature). The chain must be contiguous; the first
     // unmatched client message bounds the client tail.
@@ -182,7 +265,7 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     let clientJoin = clientMsgs.length; // first client index of the tail
     {
         const byId = new Map<string, number>(); // msgId -> view index (last occurrence)
-        for (let i = 0; i < rows.length; i++) byId.set(rows[i].msg.id, i);
+        for (let i = 0; i < rows.length; i++) byId.set(rows[i].msgId, i);
         const bySig = new Map<string, number[]>(); // sig -> descending view indices
         for (let i = rows.length - 1; i >= 0; i--) {
             // #4052: covered rows take no signature binds. They never render
@@ -198,7 +281,9 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
             // an exact id is unambiguous (kernel contract: ids never reused)
             // and steady-state seams need it.
             if (coveredSeqUnion.has(rows[i].seq)) continue;
-            const sig = identitySig(rows[i].msg);
+            const m = rows[i].msg;
+            if (!m) continue;
+            const sig = identitySig(m);
             const list = bySig.get(sig);
             if (list) list.push(i);
             else bySig.set(sig, [i]);
@@ -295,15 +380,30 @@ function buildView(session: Session, clientMsgs: BiliMessage[]): ViewResult {
     for (let i = 0; i < d; i++) {
         while (ai < anchors.length && anchors[ai].at === i) merged.push(anchors[ai++].msg);
         if (coveredSeqUnion.has(rows[i].seq)) continue;
-        merged.push(rows[i].msg);
+        const m = rows[i].msg;
+        if (!m) return { ok: false, reason: "row-unparsable" }; // uncovered row without bytes: never render a hole
+        merged.push(m);
     }
     while (ai < anchors.length) merged.push(anchors[ai++].msg);
     for (let k = clientJoin; k < clientMsgs.length; k++) merged.push(clientMsgs[k]);
 
-    return { ok: true, view: merged };
+    // #4241 tailStart is recorded in VIEW domain: the judge indexes its
+    // baseline (judgeBaseline === this rendered view) with it, so it must
+    // count the view rows that precede the first tail row. The client-domain
+    // join (clientJoin) is NOT a valid index into the view — the view prefix
+    // suppressed covered rows, so clientJoin can point past the view's end and
+    // the judge would validate nothing (vacuous clean — the regression that
+    // blinded the #4241 teeth on the T1-consolidation train).
+    const tailCount = clientMsgs.length - clientJoin;
+    return { ok: true, view: merged, tailStart: merged.length - tailCount };
 }
 
 export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], deps: SnapshotRenderDeps): BiliMessage[] {
+    // #4241: the judge reads this to know whether THIS turn's outbound prefix is
+    // server-rendered. Clear unconditionally so presence ⟺ this call rendered a
+    // live view — every early-return / degrade / shadow path leaves it unset,
+    // which is exactly when the outbound is raw client bytes (legacy I1/I2 applies).
+    delete session.metadata["snapshotRenderTailStart"];
     if (deps.pluginMode) return clientMsgs; // plugin lane: client-authoritative by design, not a degradation
     const live = featureEnabled("snapshotRender");
     const shadow = !live && shadowLaneEnabled();
@@ -314,6 +414,7 @@ export function maybeSnapshotView(session: Session, clientMsgs: BiliMessage[], d
     if (live) {
         if (!r.ok) return legacyFor(session, deps, clientMsgs, r.reason);
         delete session.metadata["snapshotRenderDegradeReason"];
+        session.metadata["snapshotRenderTailStart"] = r.tailStart;
         noteRender(session, deps);
         return r.view;
     }

@@ -301,6 +301,15 @@ export type CompressSettings = {
      *  wins; across levels the deeper level wins regardless of which name it
      *  uses. */
     minCompressRange?: number;
+    /** Hard character cap on ONE generated summary; longer replies are
+     *  rejected whole by the kernel and the external-summary executor. Maps to
+     *  kernel `compress.maxSummaryLength` (default 20000; 0 = unbounded).
+     *  #3635: external summarizers are told this exact cap up front. */
+    maxSummaryLength?: number;
+    /** Character floor for generated summaries; shorter replies are rejected
+     *  whole. Maps to kernel `compress.minSummaryLength` (default 50;
+     *  0 = disabled). #3635. */
+    minSummaryLength?: number;
     /** Enable multi-tier (T2/T3) distillation (kernel `tiers.enabled`). */
     tiers?: boolean;
     /** Tool-name patterns whose LATEST tool-call + paired result are never
@@ -773,6 +782,11 @@ export type ProxyOptions = {
     port: number;
     host: string;
     upstream: string;
+    /** #4571: set by the inline lane at boot (startInlineEngine) — true when
+     *  these options belong to the in-process engine instead of a spawned
+     *  proxy server. Display-only downstream (the status panel appends
+     *  " · inline"), never read for control flow. */
+    inlineLane?: boolean;
     routes: ProviderRoutes;
     /** Named dialing recipes from the providers table (pi/opencode idiom) —
      *  referenced by `compress.externalSummary.targets` ("glm/glm-4.9-flash").
@@ -942,6 +956,21 @@ interface DshFileSettings {
      *  the 0.1.203 dogfood window; `false` or env `BILI_DSH_AUTHORED_COMPACTION=0`
      *  restores the #1729 refusal path). */
     authoredCompaction?: boolean;
+    /** #4237: register the per-session Context tab (conversation.view slot)
+     *  in the official dsh client. ON by default (= today's behavior);
+     *  `false` (or env `BILI_DSH_CONTEXT_TAB=0`) hides the tab. Hiding only
+     *  removes the top-bar entry — compression is untouched, and the ledger
+     *  stays reachable through the settings section, the plugin bundle config
+     *  face, the Web UI and /acp. Resolved per page load by the host half and
+     *  shipped to the browser half through the __BILI__ snapshot /
+     *  /bili/origin route. */
+    contextTab?: boolean;
+    /** #4237: custom label for that tab (display preference, file-only per
+     *  #2030 — no env tier). Trimmed non-empty string wins over the built-in
+     *  localized "上下文"/"Context"; empty/absent/non-string keeps it. The
+     *  rename exists for machines where another plugin occupies the same name
+     *  (dsh-context ships its own "上下文"). */
+    contextTabLabel?: string;
 }
 
 /** The routing fields a provider entry can carry — exactly what
@@ -1047,6 +1076,26 @@ function warnInertMitmLaneKeys(routes: ProviderRoutes, env: NodeJS.ProcessEnv): 
             `providers."${key}" is inert for MITM-lane traffic to ${u.host} — CONNECT traffic looks up "${twin}", which has no entry, so these settings never apply to proxy-routed clients. Add a "${twin}" entry to cover them (the https:// entry still serves /bili/-embedded requests).`,
         );
     }
+}
+
+/** #3675: compress-block keys written on the ROUTE ROOT (URL lane or named
+ *  entry) are silently dropped by parseRouteEntry — the same silent-inert
+ *  class as the #1469 routing fields, one level down. Recognition is
+ *  COMPRESS_SETTING_FIELDS (defined below; kept in sync with
+ *  parseCompressSettings): every member is inert at a route root, and none of
+ *  them may be added to parseRouteEntry's whitelist while this warning exists.
+ *  Dialing recipes are skipped — their own parser rejects unknown root fields
+ *  loudly (parseNamedProviderRecipe throws → chain disabled with a warning),
+ *  so a second signal here would only add noise. */
+function warnCompressOnlyFieldsAtRouteRoot(key: string, obj: Record<string, unknown> | null): void {
+    if (!obj) return;
+    if (obj.baseUrl !== undefined || obj.api !== undefined) return;
+    const misplaced = Object.keys(obj).filter((f) => obj[f] !== undefined && COMPRESS_SETTING_FIELDS.has(f));
+    if (misplaced.length === 0) return;
+    warnNamedProviderOnce(
+        `route-root-compress:${key}:${misplaced.join(",")}`,
+        `providers."${key}" carries compress-block keys [${misplaced.join(", ")}] at the route root — they are inert there (move them under providers."${key}".compress to apply)`,
+    );
 }
 
 /** True when the providers-map key is itself a URL lane (http/https/mitm
@@ -1233,6 +1282,10 @@ export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes
         if (!route) return;
         const obj = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
         const urlLike = isUrlLikeKey(key);
+        // Before the bind branch on purpose: these keys are inert even on a
+        // validly bound alias — parseRouteEntry never parses them, so the
+        // fold onto the target lane cannot carry them.
+        warnCompressOnlyFieldsAtRouteRoot(key, obj);
         if (obj && "bind" in obj) {
             const bind = obj.bind;
             if (typeof bind !== "string") {
@@ -1850,11 +1903,22 @@ type FileConfig = {
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
      *  deprecated fallback, read only while this section is absent.
-     *  `inline` (#3278): run the pi lane's compression IN-PROCESS (no spawned
-     *  proxy) — the config-file home of the BILI_PI_INLINE knob, resolved
-     *  env > file > default(off); BILI_PI_INLINE=0/false explicitly disables
-     *  it over the file. */
+     *  `inline` (#3278, OPT-IN — default stays the spawned proxy, #4687
+     *  reverts the #4571 default flip): run the pi lane's compression
+     *  IN-PROCESS — no proxy server spawned. Enable with `true` (or
+     *  BILI_PI_INLINE=1/on/yes/TRUE). Resolved env > file; an explicit
+     *  inline choice beats an announced attach target (launcher-set
+     *  BILLION_CONTEXT_PROXY/ATTACH); when unset the lane behaves exactly
+     *  as before (attach/spawn). */
      pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
+    /** Built-in opencode-lane inline switch (#3278 port, OPT-IN — default
+     *  stays the spawned proxy, per owner decision on #4687): run the
+     *  opencode lane's compression IN-PROCESS — no proxy server spawned.
+     *  Enable with `true` (or BILI_OPENCODE_INLINE=1/on/yes/TRUE). Resolved
+     *  env > file; an explicit inline choice beats an announced attach
+     *  target (launcher-set BILLION_CONTEXT_PROXY/ATTACH); when unset the
+     *  lane behaves exactly as before (attach/spawn). */
+    opencode?: { inline?: boolean };
     /** Feature rollout (canary) block (#3062, resolved by src/rollout.ts):
      *  per-feature overrides of the version's baked-in rollout plan
      *  (ROLLOUT_FEATURES). `installId` pins the bucketing identity instead of
@@ -1985,6 +2049,20 @@ type FileConfig = {
         replayRetryMax?: number;
         /** Replay backoff base delay (was BILI_REPLAY_RETRY_BASE_MS; default 1500). */
         replayRetryBaseMs?: number;
+        /** Egress-side 429 throttle governor master switch (#4204; was env-only BILI_THROTTLE_429; default true).
+         *  After consecutive upstream 429s, further sends to that origin+credential are answered locally
+         *  (429 + Retry-After, then a terminal 424) instead of being forwarded, so host-driven retry loops
+         *  cannot pin a concurrency-style provider limit. false restores the legacy always-forward behavior. */
+        throttle429Enabled?: boolean;
+        /** Consecutive upstream 429s before the hold turns terminal — local 424 answers outside every known
+         *  client-SDK retry set, so hosts stop re-driving (#4204; was env-only BILI_THROTTLE_429_MAX_CONSECUTIVE; default 5). */
+        throttle429MaxConsecutive?: number;
+        /** 429-hold backoff base delay in ms — exponential ×2 per consecutive 429, jittered, capped by
+         *  throttle429MaxDelayMs (#4204; was env-only BILI_THROTTLE_429_BASE_DELAY_MS; default 2000). */
+        throttle429BaseDelayMs?: number;
+        /** 429-hold backoff ceiling in ms; also the probe cadence once the hold is terminal (#4204;
+         *  was env-only BILI_THROTTLE_429_MAX_DELAY_MS; default 30000). */
+        throttle429MaxDelayMs?: number;
         /** Per-compress shrink steering factor in (0,1] (was BILI_MAX_SHRINK_PER_COMPRESS; default unset). */
         maxShrinkPerCompress?: number;
         /** Outbound proxy keep-alive ceiling, 0 for one-shot (was BILI_PROXY_KEEPALIVE_MAX_MS; default 55000). */
@@ -2007,6 +2085,8 @@ type FileConfig = {
         outboundBodyBytes?: number;
         /** Soft egress byte budget for the WebSocket lane (#3701; default 10 MiB, 0 disables). Above it, older non-protected images are shed from the outbound copy before sending. Env BILI_WS_OUTBOUND_BYTES wins. */
         wsOutboundBytes?: number;
+        /** Soft egress byte budget for the plain/proxy/pi-native HTTP relay lane (#3909; default 10 MiB, 0 disables). Above it, older non-protected images are shed from the outbound copy before sending, because an image-dense session can carry tens of MiB of base64 that upstreams reject on raw bytes / pixel-decode CPU (Cloudflare Worker 503) while token-space folding stays below its trigger. Applies only when no managed transport is installed (the spawned relay); the WS lane uses wsOutboundBytes and managed HTTP transports (inline-engine / dsh-inline) are never shed here (#3701 Finding 1). Env BILI_HTTP_OUTBOUND_BYTES wins. */
+        httpOutboundBytes?: number;
         /** Extra root-CA PEM bundle trusted by bili's OWN outbound upstream fetch (#3776): for security
          *  software doing HTTPS/encrypted-connection scanning (Kaspersky, enterprise DLP) or a corporate
          *  MITM proxy whose re-signed upstream cert Node's default trust rejects with
@@ -2169,7 +2249,9 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
-    "reconcile", "streamSummary",
+    "reconcile", "streamSummary", "externalSummary",
+    // #3635: summary-length caps — previously accepted nowhere, silently dropped.
+    "maxSummaryLength", "minSummaryLength",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -2310,9 +2392,11 @@ function warnRemovedDshAllowKey(obj: Record<string, unknown>): void {
     }
     const d = obj.dsh;
     if (d !== null && typeof d === "object" && !Array.isArray(d)) {
-        // authoredCompaction (#3723/#3901) is the one LIVE key in the section —
-        // everything else found here is removed/unknown and gets named.
-        for (const key of Object.keys(d as Record<string, unknown>)) if (key !== "authoredCompaction") hits.push(`dsh.${key}`);
+        // authoredCompaction (#3723/#3901), contextTab + contextTabLabel
+        // (#4237) are the LIVE keys in the section — everything else found
+        // here is removed/unknown and gets named.
+        const live = new Set(["authoredCompaction", "contextTab", "contextTabLabel"]);
+        for (const key of Object.keys(d as Record<string, unknown>)) if (!live.has(key)) hits.push(`dsh.${key}`);
     }
     hits.sort();
     const sig = hits.join(",");
@@ -2830,6 +2914,15 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     }
     for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange", "minCompressRangeChars"] as const) {
         takeNumber(key);
+    }
+    // #3635: summary-length caps map onto kernel compress.{max,min}SummaryLength.
+    // 0 is meaningful (unbounded cap / disabled floor), negative is not — so
+    // validate stricter than takeNumber instead of reusing it.
+    for (const key of ["maxSummaryLength", "minSummaryLength"] as const) {
+        if (!(key in obj)) continue;
+        const v = obj[key];
+        if (typeof v !== "number" || !Number.isFinite(v) || v < 0) ok = false;
+        else (out as Record<string, unknown>)[key] = v;
     }
     // #2228: the decision side-call budget must be positive — 0/negative would
     // starve the call, so validate stricter than takeNumber.

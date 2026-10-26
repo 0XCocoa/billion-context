@@ -3,24 +3,27 @@ import type { CompressionCore, Config, CoreMessage, NudgeDecision, PackSurface, 
 import { renderNudgeText, viableRanges } from "acp-kernel";
 import { coreToGoogle, googleToCore, normalizeGoogleUserPartOrder, type BiliMessage, type GoogleContent, type GoogleRequestBody, type GoogleSystemInstruction, type GoogleTool } from "acp-kernel/wire";
 import type { ProxyOptions } from "../config.js";
+import { pluginAgentHeader } from "../plugin.js";
 import { currentCalibrationFactor } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
+import { storedMessagesFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { recordConflict } from "../conflict-watch.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
-import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_GOOGLE, RULE_TOOL_GOOGLE, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_GOOGLE, RULE_TOOL_GOOGLE, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, imageRescaleToolArmed, retrieveToolName } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
-import { autoFoldEngaged, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
+import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { reconcileSystemAnchor } from "../system-anchor.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
@@ -86,6 +89,7 @@ export async function prepareGoogle(
     let systemInstruction: GoogleSystemInstruction | undefined = parsed.systemInstruction;
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let judgeBaseline: readonly CoreMessage[] | undefined;
     let nudge: NudgeDecision | undefined;
     let nudgeOutcome: Prepared["nudgeOutcome"];
     let rebuiltContents: GoogleContent[] = Array.isArray(parsed.contents) ? parsed.contents : [];
@@ -101,7 +105,7 @@ export async function prepareGoogle(
     const injectTools = shouldInject && !pluginMode;
     // #3417: surface gating lives in lane-decisions (observed reachability
     // overrides the dsh default, #3401); alias kept for the remaining reads.
-    const laneDecisions = resolveLaneDecisions({ protocol: "google", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject });
+    const laneDecisions = resolveLaneDecisions({ protocol: "google", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject, pluginHeaderPresent: pluginAgentHeader(req.headers) !== undefined });
     // #2483: this lane used to ignore renderNone entirely (hardcoded "text-only"
     // in processTurn, Prepared and countTokens) — the knob was dead config on /v1beta.
     const renderStrategy = knobRenderNone() ? "none" : "text-only";
@@ -132,6 +136,10 @@ export async function prepareGoogle(
         // thoughtSignature — so only tokenCount + processTurn consume the
         // render view, unlike the openai/responses lanes' third consumer.)
         const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #4241: the render lane replaced the view (reference-inequality is the
+        // discriminator — maybeSnapshotView returns the SAME array when idle),
+        // so the judged baseline is the rendered transcript, not the inbound.
+        judgeBaseline = renderMsgs !== msgs ? renderMsgs : undefined;
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
         const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
@@ -174,7 +182,8 @@ export async function prepareGoogle(
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
-        reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount });
+        const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
+        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs) });
         if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
@@ -220,7 +229,7 @@ export async function prepareGoogle(
         // advisory punches through per 3 consecutive decision failures.
         const decideTier1Arm = decide !== undefined && !!turn.nudge && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && laneDecisions.compressSurfaceOn && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig));
+        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && laneDecisions.compressSurfaceOn && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)));
         // #3461: pressure admitted by every standing gate but held by the backoff
         // is still an active nudge round — self-heal credit (#2155/#3004) must
         // not starve because we chose not to re-inject this round.
@@ -238,7 +247,7 @@ export async function prepareGoogle(
             suppressionBypassed: !nudgeSuppressed(session) || decideFallbackOverride,
             breakerArmed: compressBreakerArmed(session),
             autoFoldEngaged: autoFoldEngaged(loopConfig, session),
-            growthFoldingArmed: growthFoldingArmed(loopConfig),
+            growthFoldingArmed: growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)),
             modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
         });
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
@@ -247,8 +256,13 @@ export async function prepareGoogle(
         // as an announced /compact boundary — syncBlocks above has already
         // deactivated the blocks whose sources left the context.
         {
-            const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id));
-            if (rewrite.detected) {
+            const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id), reconcileOutcome);
+            if (rewrite.churnExplained) {
+                // #4131: cross-build id re-mint (#3642) — fold-reconcile found every
+                // covered id on the wire; adopt instead of destroying.
+                recordConflict(session, "id-churn-adoption", `${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known; fold-reconcile re-anchored every covered id (0 unmatched) — bili-side id re-mint across builds (#3642), not a client rewrite — no compaction boundary (#4131)`);
+                log("info", `[${sessionId}] cross-build id churn adopted: hash-identity collapse (${rewrite.knownIncoming}/${rewrite.incomingTotal} pre-turn refs of ${rewrite.knownBefore} known) explained by fold-reconcile full re-anchor (0 unmatched) — skipping compaction boundary (#4131/#3642)`);
+            } else if (rewrite.detected) {
                 log("warn", `[${sessionId}] unannounced client history rewrite detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001)`);
                 recordConflict(session, "unannounced-rewrite", `${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known`);
                 markCompactionBoundary(session);
@@ -272,12 +286,16 @@ export async function prepareGoogle(
         // constants, so the system anchor stays identical across normal turns
         // and round-2 re-requests — skipping them here would fork the prefix
         // at every fold and collapse the upstream cache hit.
-        if (laneDecisions.compressSurfaceOn) sysParts.push(withProjectAttribution(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers)));
+        let acpStandingPushed = false;
+        if (laneDecisions.compressSurfaceOn) { sysParts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect))); acpStandingPushed = true; }
         else if (!isTitleGen && renderStrategy !== "none") {
             // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
             const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
-            if (tagsOnly) sysParts.push(tagsOnly);
+            if (tagsOnly) { sysParts.push(tagsOnly); acpStandingPushed = true; }
         }
+        // #4305: standing generation-boundary note — rides the ACP standing block,
+        // byte-stable once detected; never on a view that carries no ACP surface.
+        if (acpStandingPushed && detectGenerationBoundary(session, processedMessages, log)) sysParts.push(GENERATION_BOUNDARY_NOTE);
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         googleOutboundSystem = sysParts.join("\n\n");
         // Untouched when nothing was added beyond the client's own text: the
@@ -371,7 +389,7 @@ export async function prepareGoogle(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, protocol: "google", stream, compressInjected: injectTools, pluginMode, nudge, nudgeOutcome, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: renderStrategy } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, processedMessages, originalMessages, judgeBaseline, protocol: "google", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, google: { system: googleClientSystem, model }, systemNotes: sysNotes, renderTags: renderStrategy } as Prepared;
 }
 
 /** `POST /v1beta/models/<model>:countTokens` — the fold-prune twin of

@@ -13,18 +13,20 @@ import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
+import { storedMessagesFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, foldCoverage, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
 import { recordConflict } from "../conflict-watch.js";
-import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, BILI_ACP_TOOLS_RESPONSES, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RULE_TOOL_RESPONSES, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressHybridSystemPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, imageRescaleToolArmed, retrieveToolName } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
-import { autoFoldEngaged, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
+import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js";
 import { hoistTrappedToolItems } from "../tool-pair-order.js";
@@ -33,12 +35,14 @@ import { reconcileSystemAnchor } from "../system-anchor.js";
 import { buildPromptForgeBody, buildTriggerForgeBody, carriesCodexLocalCompactionSummary, codexCompactGate, codexCompactGatePre, codexCompactMode, hasCompactionPrompt, hasCompactionTrigger, isCodexClient, isCodexHost, mergeForgedSummaries, replaceBiliCompactionItems, stripBiliCompactionItems, CODEX_COMPACT_HEALTH_RATIO, CODEX_LOCAL_COMPACTION_MIN_MISSING } from "../codex-compact.js";
 import type { ConversationIdentity } from "../session-id.js";
 import { pckKeyAbated } from "../pck-probe.js";
+import { reconcilePluginFoldCallIds } from "../plugin.js";
 import { logRawStripCounts, markerArtifactCount, stripRawStage } from "../marker/engine.js";
 import { imageRescaleMaxDim, keepResponseId as knobKeepResponseId, noCompressPrompt as knobNoCompressPrompt, noInjectTool as knobNoInjectTool, renderNone as knobRenderNone } from "../knobs.js";
 import { applyImageRescaleItems } from "../image-rescale.js";
 import { clampOutgoingOutput, countLoadedToolTokens, countSystemAndToolsTokens, dshLedgerFloorTokens, emergencyNudge, emergencyNudgeArmed, modelVisibleTools } from "./budget.js";
 import { FORCE_TEXT_PROTOCOL, injectResponsesTool, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
+import { pluginAgentHeader } from "../plugin.js";
 
 export async function prepareResponses(
     parsed: ResponsesRequestBody,
@@ -90,6 +94,7 @@ export async function prepareResponses(
 
     let processedMessages: CoreMessage[] = [];
     let originalMessages: CoreMessage[] = [];
+    let judgeBaseline: readonly CoreMessage[] | undefined;
     let nudge: NudgeDecision | undefined;
     let nudgeOutcome: Prepared["nudgeOutcome"];
     let responsesProjection: ResponsesProjection | undefined;
@@ -127,7 +132,7 @@ export async function prepareResponses(
     const injectTools = shouldInject && !pluginMode;
     // #3417: surface gating lives in lane-decisions (observed reachability
     // overrides the dsh default, #3401).
-    const laneDecisions = resolveLaneDecisions({ protocol: "responses", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject });
+    const laneDecisions = resolveLaneDecisions({ protocol: "responses", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject, pluginHeaderPresent: pluginAgentHeader(req.headers) !== undefined });
     // Effective gate for the standing prompt + nudge: DSH reads as injectTool-off so it takes the same
     // stable tags-only developer slot as any non-injecting session (prefix cache stays append-stable).
     const compressSurfaceOn = laneDecisions.compressSurfaceOn;
@@ -214,6 +219,10 @@ export async function prepareResponses(
         // client's bytes. No-op when the lane is inactive/degraded; the
         // reconcile call below still observes the CLIENT view.
         const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #4241: the render lane replaced the view (reference-inequality is the
+        // discriminator — maybeSnapshotView returns the SAME array when idle),
+        // so the judged baseline is the rendered transcript, not the inbound.
+        judgeBaseline = renderMsgs !== msgs ? renderMsgs : undefined;
         if (opts.debug) {
             log("info", `[${sessionId}] input items: ${Array.isArray(parsed.input) ? parsed.input.map((i: ResponseInputItem) => i.type).join(",") : "(string)"}`);
         }
@@ -280,10 +289,14 @@ export async function prepareResponses(
         // boundary (#395) against this pre-turn set. Mirrors the anthropic/openai/
         // google lanes — the responses lane was the only one missing the consumer.
         const activeBefore = new Set(session.state.blocks.filter((b) => b.active).map((b) => b.blockId));
+        // #3587: keep native Pi compress carrier identity — plugin lanes re-send
+        // their own compress call pairs; reconcile their ids before the re-anchor.
+        if (pluginMode && !isCompactionTrigger && !hasCompactionPrompt(parsed.input)) reconcilePluginFoldCallIds(session, msgs);
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
         // re-serialization stay covered (src/fold-reconcile.ts).
-        reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount });
+const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
+reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs) });
         if (!isCompactionTrigger) {
             noteSystemPromptFingerprint(session, responsesClientSystem, { sessionId, log });
             // #2867: the mode-independent twin — lets the ledger classify a
@@ -341,7 +354,7 @@ export async function prepareResponses(
         // advisory punches through per 3 consecutive decision failures.
         const decideTier1Arm = decide !== undefined && !!turn.nudge && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && compressSurfaceOn && !isCompactionTrigger && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined));
+        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && compressSurfaceOn && !isCompactionTrigger && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined, autoFoldFloor(session)));
         // #3461: pressure admitted by every standing gate but held by the backoff
         // is still an active nudge round — self-heal credit (#2155/#3004) must
         // not starve because we chose not to re-inject this round.
@@ -358,7 +371,7 @@ export async function prepareResponses(
             suppressionBypassed: !nudgeSuppressed(session) || decideFallbackOverride,
             breakerArmed: compressBreakerArmed(session),
             autoFoldEngaged: autoFoldEngaged(loopConfig, session),
-            growthFoldingArmed: growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined),
+            growthFoldingArmed: growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined, autoFoldFloor(session)),
             modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
         });
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
@@ -392,9 +405,13 @@ export async function prepareResponses(
         const tagsOnlyPrompt = !compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt() && !knobRenderNone()
             ? buildAcpTagsOnlyPrompt(responsesTextProtocol ? "hybrid" : "function", prompts, surface?.promptSections)
             : "";
+        // #4305: standing generation-boundary note — byte-stable once detected;
+        // never on a compaction-trigger passthrough (renderTags="none" there).
+        const genBoundaryActive = detectGenerationBoundary(session, processedMessages, log);
         if (compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt()) {
-            const prompt = withProjectAttribution(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, surface?.promptSections) : buildCompressSystemPrompt(prompts, surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers));
+            const prompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))) : buildCompressSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect));
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
+            if (genBoundaryActive) devParts.push(GENERATION_BOUNDARY_NOTE);
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
             const devContent = devParts.join("\n\n---\n\n");
             responsesDevContent = devContent;
@@ -410,7 +427,7 @@ export async function prepareResponses(
                     : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...(ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), ...respExtra] : (ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), surface?.toolPrompts, externalSummaryEnabled(config));
             }
         } else if (tagsOnlyPrompt !== "" || projection.systemParts.length > 0 || forgedSummaries.length > 0) {
-            const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : [])].join("\n\n---\n\n");
+            const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])].join("\n\n---\n\n");
             responsesDevContent = devContent;
             if (forgedSummaries.length > 0) log("debug", `[${sessionId}] [inject] ${forgedSummaries.length} captured summary block(s) re-injected into developer message`);
             rebuiltInput = injectResponsesDeveloperMessage(rebuiltInput, devContent);
@@ -648,12 +665,14 @@ export async function prepareResponses(
         session,
         processedMessages,
         originalMessages,
+        judgeBaseline,
         responsesProjection,
         systemNotes: sysNotes,
         protocol: "responses",
         stream,
         compressInjected: injectTools && !isCompactionTrigger,
         pluginMode,
+        mcpDialectNote: laneDecisions.mcpDialect,
         responsesTextProtocol,
         nudge,
         nudgeOutcome,

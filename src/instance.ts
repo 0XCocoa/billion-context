@@ -254,6 +254,27 @@ export function classifySameLanePeer(
     return undefined;
 }
 
+/** #4341: a registry twin is safe to adopt before persistence initialization
+ * only after the listener proves the same pid + instance identity. A stale
+ * marker, pid reuse, or foreign listener must fall through to the existing
+ * bind/EADDRINUSE policy instead of causing a false adopt. */
+export async function findVerifiedSameLaneTwin(
+    entries: RegistryEntry[],
+    port: number,
+    lane: string | undefined,
+    ownFingerprint: string | undefined,
+    sameShape: (e: RegistryEntry) => boolean,
+    healthOf: (origin: string) => Promise<{ pid?: number; instanceId?: string } | undefined>,
+): Promise<RegistryEntry | undefined> {
+    for (const entry of entries) {
+        const peer = classifySameLanePeer([entry], port, lane, ownFingerprint, sameShape);
+        if (peer?.kind !== "twin") continue;
+        const health = await healthOf(peer.entry.origin);
+        if (health?.pid === peer.entry.pid && health.instanceId === peer.entry.instanceId) return peer.entry;
+    }
+    return undefined;
+}
+
 /** #1225: content identity of a bili entry script (sha256 of its bytes).
  *  The spawned child records this for ITS script; an attaching launcher
  *  compares it against the hash of the script it would spawn — so "same
@@ -417,6 +438,29 @@ export function isPidAlive(pid: number): boolean {
         return true;
     } catch (err) {
         return (err as NodeJS.ErrnoException).code === "EPERM";
+    }
+}
+
+export interface PidProbe {
+    alive: boolean;
+    /** Errno code of the failed kill-0 (e.g. "ESRCH"); undefined when the
+     *  probe succeeded or no probe ran at all (invalid pid). */
+    errCode?: string;
+}
+
+/** #3890: kill-0 with errno visibility. On Windows Node maps every
+ *  OpenProcess failure other than ERROR_ACCESS_DENIED to ESRCH, so a LIVE
+ *  process can read dead with no way to tell which Win32 error caused it.
+ *  Callers that act destructively on a dead verdict log errCode on first
+ *  sight so field episodes can be attributed. */
+export function probePid(pid: number): PidProbe {
+    if (!Number.isInteger(pid) || pid <= 0) return { alive: false };
+    try {
+        process.kill(pid, 0);
+        return { alive: true };
+    } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        return { alive: code === "EPERM", errCode: code };
     }
 }
 

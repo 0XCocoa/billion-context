@@ -69,6 +69,17 @@ export interface HostProfile {
 
 const PROFILES: Record<string, HostProfile> = {
     dsh: { identity: "dsh", toolsHostScopedByDefault: true, wantsBillingBlock: true, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, compactsClientSide: true },
+    // #4344: zcode reaches the ACP tools ONLY through its MCP bridge
+    // (mcp__bili__* names), and bridge delivery is environmental — zcode's
+    // agent modes gate MCP tools, and the degraded shim path serves an EMPTY
+    // tool list when no healthy proxy is found (src/zcode/mcp-entry.ts
+    // serveDegraded). So reachability is OBSERVED per request, never assumed:
+    // a healthy bridge declares mcp__bili__compress (dialect-aware, #4344
+    // fix) and the surface stays on; a broken/idle bridge declares nothing
+    // and the surface goes silent instead of advertising a tool the model
+    // cannot call (the #4344 shape: nudges armed at 21-29% usage, 0
+    // compressions — #3177's "unknown tool" discipline, applied to zcode).
+    zcode: { identity: "zcode", toolsHostScopedByDefault: true, wantsBillingBlock: false, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, compactsClientSide: false },
     pi: { identity: "pi", toolsHostScopedByDefault: false, wantsBillingBlock: false, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, compactsClientSide: false },
     omp: { identity: "omp", toolsHostScopedByDefault: false, wantsBillingBlock: false, stampsBodyPromptCacheKey: true, coworkTransportPossible: true, instructionsFingerprintKeyed: false, compactsClientSide: false },
     opencode: { identity: "opencode", toolsHostScopedByDefault: false, wantsBillingBlock: false, stampsBodyPromptCacheKey: false, coworkTransportPossible: false, instructionsFingerprintKeyed: false, compactsClientSide: false },

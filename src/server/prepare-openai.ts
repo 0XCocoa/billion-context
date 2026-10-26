@@ -6,22 +6,25 @@ import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
+import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
+import { storedMessagesFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
 import { applyCompactionArchive, coveredRealHistoryIds, detectUnannouncedHistoryRewrite, foldCoverage, markCompactionBoundary, markDirty, markNativeCompactionBoundary, reconcileNativeCompactionBoundary, REWRITE_MIN_INCOMING_TOTAL, snapshotMessages, type PendingRetrieval, type Session } from "../session.js";
 import { carriesDshLocalCompactionSummary, DSH_LOCAL_COMPACTION_MIN_MISSING } from "./dsh-compaction-guard.js";
 import { carriesBiliSnapshotCheckpoint } from "./dsh-authored-compaction.js";
-import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
+import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, absorbToolsFor, buildAbsorbSystemPrompt, buildAcpTagsOnlyPrompt, buildCompressSystemPrompt, retrieveToolsFor, withFirstSightDrain, withMarkerIntegrityNote, withMcpDialectNote, withSummaryBudgetNote, withProjectAttribution } from "../compress-tool.js";
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
-import { autoFoldEngaged, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
+import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
 import { estimateCoreMessages, estimateCoreMessagesUpper } from "../preflight.js";
 import { dshNativeCompactionWitness, recordConflict } from "../conflict-watch.js";
@@ -68,6 +71,7 @@ export async function prepareOpenai(
     let attachedRetrievals: PendingRetrieval[] = [];
     let attachedRetrievalNoteIds: string[] = [];
     let originalMessages: CoreMessage[] = [];
+    let judgeBaseline: readonly CoreMessage[] | undefined;
     let nudge: NudgeDecision | undefined;
     let nudgeOutcome: Prepared["nudgeOutcome"];
     let rebuiltMessages = parsed.messages;
@@ -95,7 +99,7 @@ export async function prepareOpenai(
     // keep it — their extensions expose the tools to the agent.
     // #3417: that judgement now lives in lane-decisions (observed reachability
     // overrides the dsh default — #3401); alias kept for the remaining reads.
-    const laneDecisions = resolveLaneDecisions({ protocol: "openai", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject });
+    const laneDecisions = resolveLaneDecisions({ protocol: "openai", pluginMode, pluginAgent: typeof session.metadata["pluginAgent"] === "string" ? session.metadata["pluginAgent"] as string : undefined, parsed, shouldInject, pluginHeaderPresent: pluginAgentHeader(req.headers) !== undefined });
 
     const markerCounts = stripRawStage(parsed, "openai");
     logRawStripCounts(markerCounts, log, sessionId);
@@ -122,6 +126,10 @@ export async function prepareOpenai(
         // No-op returns `msgs` when the lane is inactive/degraded.
         // reconcileFoldCoverage below still observes the CLIENT view.
         const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #4241: the render lane replaced the view (reference-inequality is the
+        // discriminator — maybeSnapshotView returns the SAME array when idle),
+        // so the judged baseline is the rendered transcript, not the inbound.
+        judgeBaseline = renderMsgs !== msgs ? renderMsgs : undefined;
         // #1001: pre-turn snapshot — processTurn below assigns fresh refs to every
         // previously-unknown id, which would make rewrite detection read 1.0.
         const knownRefsBefore = new Set(Object.keys(session.state.messageRefs.byRaw));
@@ -181,8 +189,12 @@ export async function prepareOpenai(
         }
         // [#1921] re-anchor fold coverage onto churned-but-same messages
         // before the #1195 snapshot, so covered ids surviving a client
-        // re-serialization stay covered (src/fold-reconcile.ts).
-        reconcileFoldCoverage(session, msgs, { mode: resolveFoldReconcileMode(process.env, opts.compress.reconcile), sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount });
+        // re-serialization stay covered (src/fold-reconcile.ts). The verdict
+        // feeds the #4131 rewrite gate below (explained churn ≠ destruction).
+        // #3301: stored decompositions for pre-#2644 anchors whose wire-side
+        // backfill can never fire after a wire-shape flip.
+        const foldMode = resolveFoldReconcileMode(process.env, opts.compress.reconcile);
+        const reconcileOutcome = reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStripped: markerArtifactCount(markerCounts), inboundMessageCount, storedMessages: foldMode === "off" ? undefined : storedMessagesFor(session, sessionId, msgs) });
         if (!isTitleGen) noteSystemPromptFingerprint(session, systemText, { sessionId, log });
         // #1195: pre-turn snapshot of the fold's covered ids — syncBlocks inside
         // processTurn may deactivate fully-drifted blocks, erasing them.
@@ -239,7 +251,7 @@ export async function prepareOpenai(
         // counter on the same round, so at most ONE legacy advisory punches
         // through per DECIDE_FALLBACK_THRESHOLD consecutive decision failures.
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && laneDecisions.compressSurfaceOn && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig));
+        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && laneDecisions.compressSurfaceOn && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)));
         // #3461: pressure admitted by every standing gate but held by the backoff
         // is still an active nudge round — self-heal credit (#2155/#3004) must
         // not starve because we chose not to re-inject this round.
@@ -257,7 +269,7 @@ export async function prepareOpenai(
             suppressionBypassed: !nudgeSuppressed(session) || decideFallbackOverride,
             breakerArmed: compressBreakerArmed(session),
             autoFoldEngaged: autoFoldEngaged(loopConfig, session),
-            growthFoldingArmed: growthFoldingArmed(loopConfig),
+            growthFoldingArmed: growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)),
             modelWantsIt: turn.nudge !== undefined && (turn.nudge.shouldInject || emergencyNudgeArmed(session, turn.nudge, loopConfig.compress.minCompressRange, tokenCount, loopConfig.nudge.growthFloor)),
         });
         log("info", diagNudge(turn, sessionId, tokenCount, config.modelContextLimit, parsed.model, willInjectNudge, decideTier1Arm && !decideFallbackOverride, surfaceOffDetail(laneDecisions, opts.compress.injectTool)));
@@ -270,8 +282,13 @@ export async function prepareOpenai(
         // a second "unannounced-rewrite" entry beside it would present the
         // substrate destruction as "another compressor fighting you".
         if (!dshRebased) {
-            const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id));
-            if (rewrite.detected) {
+            const rewrite = detectUnannouncedHistoryRewrite(session, knownRefsBefore, msgs.map((m) => m.id), reconcileOutcome);
+            if (rewrite.churnExplained) {
+                // #4131: cross-build id re-mint (#3642) — fold-reconcile found every
+                // covered id on the wire; adopt instead of destroying.
+                recordConflict(session, "id-churn-adoption", `${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known; fold-reconcile re-anchored every covered id (0 unmatched) — bili-side id re-mint across builds (#3642), not a client rewrite — no compaction boundary (#4131)`);
+                log("info", `[${sessionId}] cross-build id churn adopted: hash-identity collapse (${rewrite.knownIncoming}/${rewrite.incomingTotal} pre-turn refs of ${rewrite.knownBefore} known) explained by fold-reconcile full re-anchor (0 unmatched) — skipping compaction boundary (#4131/#3642)`);
+            } else if (rewrite.detected) {
                 // #2709: attribute a framing-absent rewrite to client-native compaction when bili witnessed the client's own compaction being refused — stops the phantom-second-compressor errand.
                 const dshWitness = dshNativeCompactionWitness(session, { incomingTotal: rewrite.incomingTotal, knownBefore: rewrite.knownBefore });
                 log("warn", `[${sessionId}] ${dshWitness !== undefined ? "client-native compaction landing (framing absent; attributed from refusal ledger)" : "unannounced client history rewrite"} detected (${rewrite.knownIncoming}/${rewrite.incomingTotal} incoming message(s) carry pre-turn refs of ${rewrite.knownBefore} known) — marking compaction boundary (#1001${dshWitness !== undefined ? "/#2709" : ""})`);
@@ -311,12 +328,16 @@ export async function prepareOpenai(
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
-        if (laneDecisions.compressSurfaceOn) sysParts.push(withProjectAttribution(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, surface?.promptSections), externalSummaryEnabled(config)), visibilityMarkers)));
+        let acpStandingPushed = false;
+        if (laneDecisions.compressSurfaceOn) { sysParts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect))); acpStandingPushed = true; }
         else if (!isTitleGen && !knobRenderNone()) {
             // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
             const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
-            if (tagsOnly) sysParts.push(tagsOnly);
+            if (tagsOnly) { sysParts.push(tagsOnly); acpStandingPushed = true; }
         }
+        // #4305: standing generation-boundary note — rides the ACP standing block,
+        // byte-stable once detected; never on a view that carries no ACP surface.
+        if (acpStandingPushed && detectGenerationBoundary(session, processedMessages, log)) sysParts.push(GENERATION_BOUNDARY_NOTE);
         if (absorbActive) sysParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
         rebuiltMessages = injectOpenaiSystem(rebuiltMessages, sysParts);
         if (sysNotes.length > 0) {
@@ -476,7 +497,7 @@ export async function prepareOpenai(
     }
     snapshotMessages(session, originalMessages);
     markDirty(session);
-    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, protocol: "openai", stream, compressInjected: injectTools, pluginMode, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
+    return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, protocol: "openai", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, openaiSystemText, systemNotes: sysNotes, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }
 
 /** Append the ephemeral nudge to a Gemini `contents` array. Gemini is

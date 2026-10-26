@@ -136,10 +136,11 @@ import { simhashHex, hammingHex } from "./affinity-simhash.js";
 import { reapDestroyedSubstrate, type Session } from "./session.js";
 import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
 import { dshNativeCompactionWitness, recordConflict } from "./conflict-watch.js";
+import { log as loggerLog } from "./logger.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
 
-const METADATA_ANCHORS = "foldAnchors";
+export const METADATA_ANCHORS = "foldAnchors";
 const METADATA_ORDER = "foldAnchorOrder";
 /** #2480: positional identity copy — canonical fingerprint per message,
  *  aligned 1:1 with foldAnchorOrder (same rolling window, same cap, written
@@ -369,6 +370,10 @@ interface ReconciliationPlan {
      *  caller's write-back (foldAnchorOrder / foldPositions rolling copy). */
     newOrder: string[];
     nextCanon: string[] | undefined;
+    /** #4390 p3: stored positional copy present with matching lengths but ids
+     *  not 1:1 aligned with the order backbone → Pass 0 self-disabled. Flagged
+     *  for the caller to log (the planner core stays pure). */
+    pass0Desync?: boolean;
     /** #3641 census of the RESIDUAL unmatched (after every claim pass,
      * including the shape pass): `absentEverywhere` = no unclaimed inbound
      * candidate carries loose word evidence (the content is truly off the
@@ -389,7 +394,7 @@ interface ReconciliationPlan {
     claimedChurnTokens?: number;
 }
 
-interface FoldReconcileResult {
+export interface FoldReconcileResult {
     kind: "off" | "noop" | "resend" | "reanchored" | "unmatched";
     missing: number;
     claims: number;
@@ -534,6 +539,42 @@ function turnKeyOfSeamless(reasoning: string | undefined, text: string | undefin
     return h.digest("hex").slice(0, 16);
 }
 
+/** #3301: split tagged thinking-merge text (host metadata refresh re-serializes
+ *  split-form turns as tagged reasoning spliced into content). MIRRORS
+ *  kernel/src/wire/demoted-thinking.ts FORMS + splitDemotedThinking in lockstep
+ *  (not exported from the kernel root) — keep both lists in sync. Offset-0 tag
+ *  start is the only position demotion renderers produce. Auxiliary evidence
+ *  for turn-key derivation ONLY — never identity minting. */
+const THINKING_MERGE_FORMS: readonly { open: string; close: string }[] = [
+    { open: "\x3cthink\x3e\n", close: "\n\x3c/think\x3e" },
+    { open: "\x3cthinking\x3e\n", close: "\n\x3c/thinking\x3e" },
+    { open: "```thinking\n", close: "\n```" },
+];
+
+export function extractThinkingMerge(text: string | undefined): { reasoning: string; text: string } | null {
+    if (text === undefined || text === "") return null;
+    let rest = text;
+    const parts: string[] = [];
+    for (;;) {
+        let matched = false;
+        for (const form of THINKING_MERGE_FORMS) {
+            if (!rest.startsWith(form.open)) continue;
+            const end = rest.indexOf(form.close, form.open.length);
+            if (end < 0) continue;
+            const inner = rest.slice(form.open.length, end);
+            if (inner.length === 0) continue;
+            parts.push(inner);
+            rest = rest.slice(end + form.close.length);
+            if (rest.startsWith("\n")) rest = rest.slice(1);
+            matched = true;
+            break;
+        }
+        if (!matched) break;
+    }
+    if (parts.length === 0) return null;
+    return { reasoning: parts.join("\n"), text: rest };
+}
+
 /** Turn context for the anchor seed loop: per assistant-core id, the turn
  *  key(s) and (for split-form turns) the sibling core id. Built lazily — a
  *  steady-state pass reuses stored anchors and never pays this. */
@@ -558,7 +599,18 @@ export function turnContexts(msgs: CoreMessage[]): Map<string, TurnCtx> {
             const prev = msgs[i - 1];
             if (prev === undefined || prev.id === undefined || prev.role !== "assistant" || prev.contentType !== "reasoning" ||
                 (prev.toolCallId !== undefined && prev.toolCallId !== "")) {
-                ctx.set(m.id, { p: turnKeyOf(undefined, m.text) });
+                // #3301: merged-form core — its text may be tagged reasoning + reply.
+                // The extracted pair key bridges anchors seeded from the split form
+                // (same turn, different wire shape); the raw full-text key stays for
+                // identical resends of this exact form.
+                const ex = extractThinkingMerge(m.text);
+                if (ex !== null) {
+                    const key = turnKeyOf(ex.reasoning, ex.text);
+                    const seamless = turnKeyOfSeamless(ex.reasoning, ex.text);
+                    ctx.set(m.id, seamless !== key ? { p: key, p2: seamless } : { p: key });
+                } else {
+                    ctx.set(m.id, { p: turnKeyOf(undefined, m.text) });
+                }
             }
         }
     }
@@ -706,6 +758,8 @@ interface BlockLike {
     active?: boolean;
     effectiveMessageIds?: string[];
     directMessageIds?: string[];
+    /** Host-decompressed block — the kernel keeps it inactive by design. */
+    expanded?: boolean;
 }
 
 /** #2297: only LIVE blocks count as covered. The kernel deactivates a block
@@ -714,9 +768,42 @@ interface BlockLike {
  *  those dead-lineage ids can never re-anchor and would sit in `missing`
  *  permanently, inflating the drift warn ~2x (#2293). Delegates to
  *  coveredRealHistoryIds so the single real-history caliber (#2627) is
- *  implemented exactly once. */
+ *  implemented exactly once. reconcileFoldCoverage additionally feeds the
+ *  retained view-deactivated lineage back in via recoveryCandidateIds
+ *  (#4050) — different question, same file; this caliber stays active-only. */
 function coveredIdsOf(blocks: BlockLike[]): Set<string> {
     return coveredRealHistoryIds(blocks);
+}
+
+/** #4050: coverage of RETAINED folds that are inactive only because the last
+ *  view skipped their span (kernel syncBlocks deactivation after a short
+ *  request, #3844/#3845). That lineage is RECOVERABLE, not dead: the span's
+ *  bytes may come back under churned ids (client re-serialization), and only
+ *  the claim ladder can re-key them — but it never runs if they stay out of
+ *  `covered` (coveredRealHistoryIds skips inactive blocks → covered.size===0
+ *  → noop → stale ids never re-anchor → syncBlocks can never find them again
+ *  → permanent coverage loss, folded originals re-sent every turn). The claim
+ *  ladder decides PER CELL with multi-channel corroboration, so nothing is
+ *  restored blindly: corroborated cells get re-keyed (syncBlocks then
+ *  re-activates the block on the next pipeline run), non-corroborated cells
+ *  stay honestly unmatched and complete the existing lifecycle (z-streak reap
+ *  for verified substrates #2695, truncation suppression, epoch verdict
+ *  #3641). Excluded: `expanded` blocks — the host decompressed them ON PURPOSE
+ *  (the originals ride the wire verbatim and a fresh compress creates a NEW
+ *  block, kernel/src/sync.ts), so there is nothing to restore and including
+ *  their ids would feed #2293-style missing inflation when the whole wire
+ *  re-serializes. Consumed (merged-away) blocks need no exclusion: their ids
+ *  duplicate the surviving parent's ids, which the Set dedupes, and they stay
+ *  inactive regardless via the consumed guard in kernel/src/sync.ts. */
+function recoveryCandidateIds(blocks: ReadonlyArray<BlockLike>): Set<string> {
+    const ids = new Set<string>();
+    for (const block of blocks) {
+        if (block.active || block.expanded === true) continue;
+        for (const id of block.effectiveMessageIds ?? []) {
+            if (!isResponsesTurnSeparatorId(id)) ids.add(id);
+        }
+    }
+    return ids;
 }
 
 /** Pure core: plan the reconciliation between the previous pass order and the
@@ -747,9 +834,16 @@ export function planReconciliation(
     // Pass 0's old-side coordinate system is only valid when the stored copy's
     // ids align 1:1 with the order backbone. Self-contained storage makes the
     // check exact: a desync (backbone semantics drift, partial write) disables
-    // Pass 0 instead of silently misaligning fingerprints.
-    const stored = positions !== undefined && positions.ids.length === oldOrder.length && positions.canon.length === oldOrder.length
-        && positions.ids.every((id, i) => id === oldOrder[i]) ? positions.canon : undefined;
+    // Pass 0 instead of silently misaligning fingerprints. #4390 p3: flag it —
+    // the caller logs; this core stays pure.
+    let stored: string[] | undefined;
+    if (positions !== undefined && positions.ids.length === oldOrder.length && positions.canon.length === oldOrder.length) {
+        if (positions.ids.every((id, i) => id === oldOrder[i])) {
+            stored = positions.canon;
+        } else {
+            plan.pass0Desync = true;
+        }
+    }
     const canon: string[] = [];
     const newOrder: string[] = [];
     const byId = new Map<string, CoreMessage>();
@@ -1021,10 +1115,20 @@ export function planReconciliation(
             if (claimedCandidates.has(cand.id)) continue;
             if (!isBareAssistantCore(cand.message)) continue;
             if (cand.message.contentType === "text") {
-                const key = turnKeyOf(undefined, cand.message.text);
-                const bucket = singleTurnKeys.get(key);
-                if (bucket === undefined) singleTurnKeys.set(key, [cand.id]);
-                else bucket.push(cand.id);
+                // #3301: a merged-form core stands in for the whole turn —
+                // register the raw full-text key AND the extracted pair key(s)
+                // so anchors seeded from either wire form match.
+                const keys = new Set<string>([turnKeyOf(undefined, cand.message.text)]);
+                const ex = extractThinkingMerge(cand.message.text);
+                if (ex !== null) {
+                    keys.add(turnKeyOf(ex.reasoning, ex.text));
+                    keys.add(turnKeyOfSeamless(ex.reasoning, ex.text));
+                }
+                for (const key of keys) {
+                    const bucket = singleTurnKeys.get(key);
+                    if (bucket === undefined) singleTurnKeys.set(key, [cand.id]);
+                    else bucket.push(cand.id);
+                }
             } else if (cand.message.contentType === "reasoning") {
                 const next = byPos.get(cand.pos + 1);
                 if (next !== undefined && !claimedCandidates.has(next.id) && isBareAssistantCore(next.message) && next.message.contentType === "text") {
@@ -1490,6 +1594,13 @@ export interface ReconcileOptions {
     /** Inbound wire items before codec expansion; auxiliary requests can
      *  project a few items into dozens of cores without carrying history. */
     inboundMessageCount?: number;
+    /** #3301: stored message decompositions for anchors that predate turn-key
+     *  backfill (pre-#2644) — after a wire-shape flip the wire-side backfill
+     *  can never fire (the old id is gone from the wire), so eligible anchors
+     *  are rebuilt from these rows BEFORE the reconciliation plan runs and the
+     *  flip pass itself claims. Latest-seq-per-id, neighbors included;
+     *  undefined = no source available (legacy-only mode). */
+    storedMessages?: CoreMessage[];
 }
 
 /** Entry point wired into the four wire sites, immediately BEFORE the
@@ -1502,7 +1613,11 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         return { kind: "off", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
     }
     const blocks = (session.state?.blocks ?? []) as BlockLike[];
+    // Active coverage first (the anchor cap's survivor order, #2334), then the
+    // retained view-deactivated lineage re-fed into the claim ladder (#4050);
+    // see recoveryCandidateIds for what is excluded and why.
     const covered = coveredIdsOf(blocks);
+    for (const id of recoveryCandidateIds(blocks)) covered.add(id);
     if (covered.size === 0) {
         resetFoldDriftState(session);
         return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
@@ -1522,7 +1637,7 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     }
     if (!session.metadata) return { kind: "noop", missing: 0, claims: 0, byPos: 0, byTool: 0, byTwin: 0, bySim: 0, byOrder: 0, byNorm: 0, byTurn: 0, byImage: 0, byShape: 0, reaped: 0, unmatched: 0 };
 
-    const anchors: Record<string, FoldAnchor> =
+    let anchors: Record<string, FoldAnchor> =
         (session.metadata[METADATA_ANCHORS] as Record<string, FoldAnchor> | undefined) ?? {};
     const oldOrder: string[] = (session.metadata[METADATA_ORDER] as string[] | undefined) ?? [];
     // #2480: self-contained positional copy {ids, canon} (#2487's storage
@@ -1538,7 +1653,39 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         positions = { ids: storedRaw.ids as string[], canon: storedRaw.canon as string[] };
     }
 
+    const byId = new Map<string, CoreMessage>();
+    for (const m of msgs) if (m.id !== undefined) byId.set(m.id, m);
+    // #3301: a wire-shape flip puts legacy (pre-#2644, no p/x) ids off the wire
+    // on the FIRST post-flip pass — and this same pass rolls the order backbone
+    // forward without them, so any backfill landing later can never claim (the
+    // claim passes only iterate ids still in the backbone). Rebuild eligible
+    // anchors from the stored decomposition BEFORE the plan runs so the flip
+    // pass itself can claim. Wire bytes always win: an id present on this pass
+    // keeps its live-bytes path untouched.
+    if (opts.storedMessages !== undefined && opts.storedMessages.length > 0) {
+        const sById = new Map<string, CoreMessage>();
+        for (const m of opts.storedMessages) if (m.id !== undefined) sById.set(m.id, m);
+        const sCtx = turnContexts(opts.storedMessages);
+        let changed = false;
+        const upgraded: Record<string, FoldAnchor> = {};
+        for (const [id, a] of Object.entries(anchors)) {
+            if (a.p === undefined && a.r === "assistant" && a.t === undefined && !byId.has(id)) {
+                const sm = sById.get(id);
+                if (sm !== undefined) {
+                    upgraded[id] = anchorFrom(sm, sCtx.get(id));
+                    changed = true;
+                    continue;
+                }
+            }
+            upgraded[id] = a;
+        }
+        if (changed) anchors = upgraded;
+    }
+
     const plan = planReconciliation(oldOrder, anchors, msgs, covered, positions);
+    if (plan.pass0Desync) {
+        loggerLog("warn", `[fold-reconcile] Pass 0 disabled: stored positional copy desynced from order backbone (session=${session.id}, copyIds=${positions?.ids.length ?? -1}, backbone=${oldOrder.length})`);
+    }
     if (process.env.FOLD_RECONCILE_DEBUG === "1") {
         const active = blocks.filter((b) => b.active).length;
         const sample = msgs.slice(0, 6).map((m) => `${m.role}/${m.contentType ?? "-"}/${m.id ?? "?"}`);
@@ -1549,8 +1696,6 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
     // freshly claimed ones — the next churn must re-anchor from post-churn
     // bytes), prune anchors for ids no longer covered, and roll the order
     // backbone forward to this pass.
-    const byId = new Map<string, CoreMessage>();
-    for (const m of msgs) if (m.id !== undefined) byId.set(m.id, m);
     // #2636: turn keys for freshly seeded anchors — built lazily so
     // steady-state passes (no churn) never pay the per-core normalization
     // (#2334). Only bare assistant cores can carry a turn key
@@ -1727,141 +1872,6 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             && witness.slice(0, commonPrefix.length).every((id) => inboundSet.has(id))
             && plan.newOrder.slice(0, commonPrefix.length).every((id) => witnessSet.has(id));
     }
-    const prevCov = (session.metadata[METADATA_FOLD_COVERAGE] as Record<string, FoldBlockCoverage> | undefined) ?? {};
-    const nextCov: Record<string, FoldBlockCoverage> = {};
-    let covCount = 0;
-    for (const block of blocks) {
-        const bid = block.blockId;
-        if (bid === undefined || bid === "") continue;
-        // #2627: evidence counts REAL history only — separator ids can never
-        // be present or claimed, so including them in `t` would stall the
-        // ledger's p+r>=t accrual for polluted blocks forever.
-        const ids = (block.effectiveMessageIds ?? []).filter((id) => !isResponsesTurnSeparatorId(id));
-        if (ids.length === 0) continue;
-        let p = 0, r = 0;
-        for (const id of ids) {
-            if (byId.has(id)) p++;
-            else if (plan.claims.has(id)) r++;
-        }
-        const rec: FoldBlockCoverage = { p, r, t: ids.length };
-        if (prevCov[bid]?.e === 1 || p + r > 0) rec.e = 1;
-        // #2695: zombie streak — strict majority of covered ids absent, only
-        // for VERIFIED substrates (e === 1). Never-represent substrates keep
-        // their #2202 structural-absence semantics (no streak, no reap).
-        // #2732: sanctioned reasoning drops (drop-keep model switches)
-        // permanently remove thinking cores from the resent history while
-        // their text/tool siblings ride verbatim. Those ids must never read
-        // as substrate loss, so the majority test runs on the non-reasoning
-        // covered ids only; a span with no non-reasoning ids at all never
-        // reads as gone (safe side — real fold spans carry user turns).
-        const hardIds = ids.filter((id) => anchors[id]?.c !== "reasoning");
-        const gone = hardIds.length > 0 && 2 * (p + r) < hardIds.length;
-        // #3641: every absent hard id absent with ZERO word evidence anywhere
-        // while the session still carries other substrate = sanctioned
-        // truncation (client dropped old history), not zombie substrate. The
-        // #2695 reap streak would destroy the last remaining snapshot of
-        // history the host legitimately deleted from ITS view — bili keeps it
-        // (the fold IS the session's memory of the covered span).
-        const absentHard = hardIds.filter((id) => !byId.has(id) && !plan.claims.has(id));
-        // #3724: tail truncation (host rewind) is the same sanctioned-deletion
-        // class as head truncation for reap purposes — a fully-rewound span's
-        // absence is user deletion, not zombie substrate, so suppress the
-        // streak here too or the #2695 arm reaps the last snapshot of history
-        // the host legitimately rewound away. (Same global-signal residual as
-        // wireContinuity above: it self-corrects on the next stable pass.)
-        const structurallyAbsent = absentHard.length > 0 && absentHard.every((id) => absentSet.has(id)) && (wireContinuity || tailTruncated);
-        if (gone && !structurallyAbsent) {
-            if (rec.e === 1) rec.z = (prevCov[bid]?.z ?? 0) + 1;
-        } else {
-            rec.z = 0;
-        }
-        if (covCount >= MAX_ANCHORS) continue;
-        nextCov[bid] = rec;
-        covCount++;
-    }
-
-    // #2695: reap blocks whose covered substrate stayed majority-absent for
-    // FOLD_DRIFT_ESCALATE_PASSES consecutive passes. REMOVAL from
-    // state.blocks — not deactivation: syncBlocks re-activates any block
-    // whose id set still intersects the wire (kernel/src/sync.ts sets
-    // active=true before the stillPresent check), and duplicate-content
-    // re-derivation keeps exactly that intersection alive forever, which is
-    // how the zombie carrier kept rendering (and flapping) every turn.
-    // Proxy mode only (plugin folds legitimately replace covered history —
-    // the agent's own compress runs against its private state); repair mode
-    // only (warn observes). Runs BEFORE the backbone persistence below so
-    // the reaped ids are stripped from the same objects that get stored.
-    let reapedCount = 0;
-    if (mode === "repair" && session.metadata.pluginAgent === undefined) {
-        const ripe = new Set<string>();
-        for (const block of blocks) {
-            const bid = block.blockId;
-            if (bid !== undefined && (nextCov[bid]?.z ?? 0) >= FOLD_DRIFT_ESCALATE_PASSES) ripe.add(bid);
-        }
-        if (ripe.size > 0) {
-            const liveRawIds = new Set(msgs.map((m) => m.id));
-            const reaped = reapDestroyedSubstrate(session, ripe, liveRawIds, opts.log ?? (() => {}));
-            reapedCount = reaped.length;
-            if (reapedCount > 0) {
-                // Strip the reaped blocks from the coverage/backbone records
-                // this pass persists, so nothing seeds or positions their ids
-                // again (nextOrder is the array METADATA_POSITIONS already
-                // references — mutate in place).
-                const deadIds = new Set<string>();
-                for (const block of blocks) {
-                    if (block.blockId === undefined || !ripe.has(block.blockId)) continue;
-                    delete nextCov[block.blockId];
-                    for (const id of block.effectiveMessageIds ?? []) deadIds.add(id);
-                    for (const id of block.directMessageIds ?? []) deadIds.add(id);
-                }
-                for (const id of deadIds) delete nextAnchors[id];
-                for (let i = nextOrder.length - 1; i >= 0; i--) {
-                    if (deadIds.has(nextOrder[i])) nextOrder.splice(i, 1);
-                }
-                const storedPositions = session.metadata[METADATA_POSITIONS] as { ids?: string[] } | undefined;
-                const positionIds = storedPositions?.ids;
-                if (Array.isArray(positionIds) && positionIds !== nextOrder) {
-                    for (let i = positionIds.length - 1; i >= 0; i--) {
-                        if (deadIds.has(positionIds[i])) positionIds.splice(i, 1);
-                    }
-                }
-                recordConflict(session, "orphan-reap", `reaped ${reapedCount} zombie fold block(s) [${reaped.join(", ")}]: covered substrate majority-absent for ${FOLD_DRIFT_ESCALATE_PASSES} consecutive passes (#2695)`);
-            }
-        }
-    }
-    session.metadata[METADATA_FOLD_COVERAGE] = nextCov;
-
-    if (plan.claims.size > 0 && mode === "repair") {
-        rewriteBlocks(blocks, plan.claims);
-        // The kernel pipeline runs reconcileLiveIdsNode (remintCoveredLiveIds)
-        // BEFORE syncBlocks/prune: a live message whose id exactly matches a
-        // covered id but was absent from the previous pass gets its id
-        // re-minted (the verbatim re-send protection) — which would defeat the
-        // rewrite above. Merging the claimed ids into lastPassIds marks them
-        // "already seen live", so remint leaves them and prune strips them as
-        // covered. From this pass on the kernel maintains lastPassIds itself.
-        const prior = new Set(session.state?.lastPassIds ?? []);
-        for (const targets of plan.claims.values()) {
-            for (const newId of targets) prior.add(newId);
-        }
-        (session.state as { lastPassIds?: string[] }).lastPassIds = [...prior];
-    }
-
-    session.metadata[METADATA_ANCHORS] = nextAnchors;
-    session.metadata[METADATA_ORDER] = nextOrder;
-    // The wire sites already schedule a save on every turn (state replacement
-    // + markDirty); the metadata ride that existing save.
-
-    // #2193: escalate persistent TOTAL-loss drift. A single pass with
-    // unmatched ids is ordinary churn (edits, deletions, re-serialization
-    // gaps) — the per-pass warn below covers it. But when covered ids keep
-    // staying missing with ZERO reanchoring across consecutive passes, that
-    // slice of fold state can never recover: consistent with a host-native
-    // compaction landing outside
-    // bili's knowledge (dsh native compaction, #1729/#2193) or a bulk client-
-    // side history rewrite. One error line per episode names it instead of
-    // letting the identical warn print hundreds of times.
-    const tag = opts.sessionId === undefined ? "" : `[${opts.sessionId}] `;
     // #2815: id churn explained by raw-stage marker stripping. Covered ids
     // minted BEFORE the marker engine (or by any client that keeps resending
     // the artifact-laden bytes) hash marker-laden content; once stripRawStage
@@ -1943,6 +1953,145 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
         && tailTruncated;
     const totalDrift = plan.claims.size === 0 && plan.unmatched.length > 0 && !reasoningOnlyDrop && !markerChurnExplained
         && !shapeExplained && !truncationExplained && !tailTruncationExplained;
+    // Classify before reaping: the epoch-confirm gate promises to retain the
+    // snapshot, even on the pass that first reaches the escalation threshold.
+    const epochProtected = session.metadata[METADATA_EPOCH_CONFIRM] === true
+        || (totalDrift && nonReasoningUnmatched >= FOLD_DRIFT_ESCALATE_MIN_UNMATCHED);
+    const prevCov = (session.metadata[METADATA_FOLD_COVERAGE] as Record<string, FoldBlockCoverage> | undefined) ?? {};
+    const nextCov: Record<string, FoldBlockCoverage> = {};
+    let covCount = 0;
+    for (const block of blocks) {
+        const bid = block.blockId;
+        if (bid === undefined || bid === "") continue;
+        // #2627: evidence counts REAL history only — separator ids can never
+        // be present or claimed, so including them in `t` would stall the
+        // ledger's p+r>=t accrual for polluted blocks forever.
+        const ids = (block.effectiveMessageIds ?? []).filter((id) => !isResponsesTurnSeparatorId(id));
+        if (ids.length === 0) continue;
+        let p = 0, r = 0;
+        for (const id of ids) {
+            if (byId.has(id)) p++;
+            else if (plan.claims.has(id)) r++;
+        }
+        const rec: FoldBlockCoverage = { p, r, t: ids.length };
+        if (prevCov[bid]?.e === 1 || p + r > 0) rec.e = 1;
+        // #2695: zombie streak — strict majority of covered ids absent, only
+        // for VERIFIED substrates (e === 1). Never-represent substrates keep
+        // their #2202 structural-absence semantics (no streak, no reap).
+        // #2732: sanctioned reasoning drops (drop-keep model switches)
+        // permanently remove thinking cores from the resent history while
+        // their text/tool siblings ride verbatim. Those ids must never read
+        // as substrate loss, so the majority test runs on the non-reasoning
+        // covered ids only; a span with no non-reasoning ids at all never
+        // reads as gone (safe side — real fold spans carry user turns).
+        const hardIds = ids.filter((id) => anchors[id]?.c !== "reasoning");
+        const gone = hardIds.length > 0 && 2 * (p + r) < hardIds.length;
+        // #3641: every absent hard id absent with ZERO word evidence anywhere
+        // while the session still carries other substrate = sanctioned
+        // truncation (client dropped old history), not zombie substrate. The
+        // #2695 reap streak would destroy the last remaining snapshot of
+        // history the host legitimately deleted from ITS view — bili keeps it
+        // (the fold IS the session's memory of the covered span).
+        const absentHard = hardIds.filter((id) => !byId.has(id) && !plan.claims.has(id));
+        // #3724: tail truncation (host rewind) is the same sanctioned-deletion
+        // class as head truncation for reap purposes — a fully-rewound span's
+        // absence is user deletion, not zombie substrate, so suppress the
+        // streak here too or the #2695 arm reaps the last snapshot of history
+        // the host legitimately rewound away. (Same global-signal residual as
+        // wireContinuity above: it self-corrects on the next stable pass.)
+        const structurallyAbsent = absentHard.length > 0 && absentHard.every((id) => absentSet.has(id)) && (wireContinuity || tailTruncated);
+        if (gone && !structurallyAbsent) {
+            if (rec.e === 1) rec.z = (prevCov[bid]?.z ?? 0) + 1;
+        } else {
+            rec.z = 0;
+        }
+        if (covCount >= MAX_ANCHORS) continue;
+        nextCov[bid] = rec;
+        covCount++;
+    }
+
+    // #2695: reap blocks whose covered substrate stayed majority-absent for
+    // FOLD_DRIFT_ESCALATE_PASSES consecutive passes. REMOVAL from
+    // state.blocks — not deactivation: syncBlocks re-activates any block
+    // whose id set still intersects the wire (kernel/src/sync.ts sets
+    // active=true before the stillPresent check), and duplicate-content
+    // re-derivation keeps exactly that intersection alive forever, which is
+    // how the zombie carrier kept rendering (and flapping) every turn.
+    // Proxy mode only (plugin folds legitimately replace covered history —
+    // the agent's own compress runs against its private state); repair mode
+    // only (warn observes). Runs BEFORE the backbone persistence below so
+    // the reaped ids are stripped from the same objects that get stored.
+    let reapedCount = 0;
+    if (mode === "repair" && session.metadata.pluginAgent === undefined && !epochProtected) {
+        const ripe = new Set<string>();
+        for (const block of blocks) {
+            const bid = block.blockId;
+            if (bid !== undefined && (nextCov[bid]?.z ?? 0) >= FOLD_DRIFT_ESCALATE_PASSES) ripe.add(bid);
+        }
+        if (ripe.size > 0) {
+            const liveRawIds = new Set(msgs.map((m) => m.id));
+            const reaped = reapDestroyedSubstrate(session, ripe, liveRawIds, opts.log ?? (() => {}));
+            reapedCount = reaped.length;
+            if (reapedCount > 0) {
+                // Strip the reaped blocks from the coverage/backbone records
+                // this pass persists, so nothing seeds or positions their ids
+                // again (nextOrder is the array METADATA_POSITIONS already
+                // references — mutate in place).
+                const deadIds = new Set<string>();
+                for (const block of blocks) {
+                    if (block.blockId === undefined || !ripe.has(block.blockId)) continue;
+                    delete nextCov[block.blockId];
+                    for (const id of block.effectiveMessageIds ?? []) deadIds.add(id);
+                    for (const id of block.directMessageIds ?? []) deadIds.add(id);
+                }
+                for (const id of deadIds) delete nextAnchors[id];
+                for (let i = nextOrder.length - 1; i >= 0; i--) {
+                    if (deadIds.has(nextOrder[i])) nextOrder.splice(i, 1);
+                }
+                const storedPositions = session.metadata[METADATA_POSITIONS] as { ids?: string[] } | undefined;
+                const positionIds = storedPositions?.ids;
+                if (Array.isArray(positionIds) && positionIds !== nextOrder) {
+                    for (let i = positionIds.length - 1; i >= 0; i--) {
+                        if (deadIds.has(positionIds[i])) positionIds.splice(i, 1);
+                    }
+                }
+                recordConflict(session, "orphan-reap", `reaped ${reapedCount} zombie fold block(s) [${reaped.join(", ")}]: covered substrate majority-absent for ${FOLD_DRIFT_ESCALATE_PASSES} consecutive passes (#2695)`);
+            }
+        }
+    }
+    session.metadata[METADATA_FOLD_COVERAGE] = nextCov;
+
+    if (plan.claims.size > 0 && mode === "repair") {
+        rewriteBlocks(blocks, plan.claims);
+        // The kernel pipeline runs reconcileLiveIdsNode (remintCoveredLiveIds)
+        // BEFORE syncBlocks/prune: a live message whose id exactly matches a
+        // covered id but was absent from the previous pass gets its id
+        // re-minted (the verbatim re-send protection) — which would defeat the
+        // rewrite above. Merging the claimed ids into lastPassIds marks them
+        // "already seen live", so remint leaves them and prune strips them as
+        // covered. From this pass on the kernel maintains lastPassIds itself.
+        const prior = new Set(session.state?.lastPassIds ?? []);
+        for (const targets of plan.claims.values()) {
+            for (const newId of targets) prior.add(newId);
+        }
+        (session.state as { lastPassIds?: string[] }).lastPassIds = [...prior];
+    }
+
+    session.metadata[METADATA_ANCHORS] = nextAnchors;
+    session.metadata[METADATA_ORDER] = nextOrder;
+    // The wire sites already schedule a save on every turn (state replacement
+    // + markDirty); the metadata ride that existing save.
+
+    // #2193: escalate persistent TOTAL-loss drift. A single pass with
+    // unmatched ids is ordinary churn (edits, deletions, re-serialization
+    // gaps) — the per-pass warn below covers it. But when covered ids keep
+    // staying missing with ZERO reanchoring across consecutive passes, that
+    // slice of fold state can never recover: consistent with a host-native
+    // compaction landing outside
+    // bili's knowledge (dsh native compaction, #1729/#2193) or a bulk client-
+    // side history rewrite. One error line per episode names it instead of
+    // letting the identical warn print hundreds of times.
+    const tag = opts.sessionId === undefined ? "" : `[${opts.sessionId}] `;
     const unfoldedDrift = mode === "repair"
         ? Math.max(0, (plan.churnTokens ?? 0) - (plan.claimedChurnTokens ?? 0))
         : (plan.churnTokens ?? 0);

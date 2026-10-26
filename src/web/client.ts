@@ -479,7 +479,7 @@ export const WEB_CLIENT = `(function () {
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
     }
 
-    const PAGES = ["overview", "sessions", "config", "connect", "logs"];
+    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs", "blog"];
     let current = "overview";
     let sessionsCache = [];
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
@@ -629,9 +629,14 @@ export const WEB_CLIENT = `(function () {
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</span></td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td>' + savedTd(s) + '<td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         } else {
             const clientHint = s.clientHint ? String(s.clientHint) : "";
+            // #4571: inline sessions carry a lane chip beside the client hint so
+            // "did this run in-process?" is visible in the list, not just detail.
+            const laneChip = s.engineLane === "inline"
+                ? ' <span class="badge proto" title="' + escapeHtml(t("det.engine_lane_inline")) + '">inline</span>'
+                : s.engineLane === "server" ? ' <span class="badge proto dim" title="' + escapeHtml(t("det.engine_lane_server")) + '">srv</span>' : "";
             const clientCell = clientHint
-                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>"
-                : '<span class="dim">' + t("common.none") + "</span>";
+                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>" + laneChip
+                : '<span class="dim">' + t("common.none") + "</span>" + laneChip;
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td class="client-cell">' + clientCell + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         }
         let navTimer = null;
@@ -645,6 +650,332 @@ export const WEB_CLIENT = `(function () {
         });
         tr.addEventListener("dblclick", () => clearTimeout(navTimer));
         return tr;
+    }
+
+    // #3719: changelog section (overview page, collapsed card) — one fetch per
+    // page load; the server caches with a 10-minute throttle, so this costs at
+    // most one GitHub API hit per 10 minutes fleet-wide.
+    let chlogLoaded = false;
+    // Escaped-plain-text → anchor tags. Function-form replacer on purpose:
+    // URL characters ($, &) would corrupt "string" replacement patterns.
+    function linkifyText(escaped) {
+        return escaped.replace(/(https?:\\/\\/[^\\s<>]+)/g, (u) => '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + u + "</a>");
+    }
+function changelogCatOf(rawLine) {
+        const s = rawLine.replace(/^\\*?\\s*\\[PR\\]\\s*/i, "").trim();
+        if (/^kernel([(:\\s]|$)/i.test(s)) return "cat_kernel";
+        if (/(^|[.(,\\s])(dsh|pi(?:-subagents)?|codex|claude(?:-code)?|opencode(?:v?\\d)?|hermes|kimi|zcode|trae)([):,\\s]|$)/i.test(s)) return "cat_host";
+        const m = s.match(/^([a-z]+)(\\([^)]*\\))?[:\\s]/);
+        if (m) {
+            const p = m[1].toLowerCase();
+            if (p === "feat" || p === "feature" || p === "improve") return "cat_feat";
+            if (p === "fix" || p === "perf") return "cat_fix";
+            if (p === "docs") return "cat_web";
+            if (p === "ci" || p === "build" || p === "test" || p === "chore" || p === "refactor" || p === "style") return "cat_infra";
+        }
+        if (/(persist|storage|session|sqlite|index\\.db|unified)/i.test(s)) return "cat_store";
+        if (/(self-update|auto-update|update policy|release|publish|stagger|version bump)/i.test(s)) return "cat_upd";
+        if (/\\b(web|panel|i18n|changelog|favicon)\\b/i.test(s)) return "cat_web";
+        return "cat_other";
+    }
+    const CHLOG_CATS = ["cat_feat", "cat_fix", "cat_kernel", "cat_host", "cat_store", "cat_upd", "cat_web", "cat_infra", "cat_other"];
+    // One release body → intro (headings/prose) + categorized bullet groups.
+    function changelogBodyHtml(escaped) {
+        const intro = [];
+        let para = [];
+        const flushPara = () => { if (para.length) { intro.push('<div class="cl-p">' + para.map((s)=>s.replace(/\\*\\*([^*]+)\\*\\*/g,"<strong>$1</strong>")).join("<br>") + "</div>"); para = []; } };
+        const cats = {};
+        for (const raw of escaped.split("\\n")) {
+            const tl = raw.trim();
+            const bm = tl.match(/^(?:[-*]|\\d+[.)])\\s+(.*)$/);
+            if (bm) {
+                flushPara();
+                const item = linkifyText(bm[1]);
+                const key = changelogCatOf(bm[1]);
+                if (!cats[key]) cats[key] = [];
+                cats[key].push(item);
+            } else if (/^#{1,6}\\s/.test(tl)) {
+                flushPara();
+                intro.push('<div class="cl-h">' + linkifyText(tl.replace(/^#{1,6}\\s*/, "")) + "</div>");
+            } else if (tl === "") flushPara();
+            else para.push(linkifyText(tl));
+        }
+        flushPara();
+        let html = intro.join("");
+        for (const key of CHLOG_CATS) {
+            const items = cats[key];
+            if (!items) continue;
+            // Inline t() per key: the #1024 scanner counts literal t("…") refs only.
+            const label = { cat_feat: t("sys.changelog_cat_feat"), cat_fix: t("sys.changelog_cat_fix"), cat_kernel: t("sys.changelog_cat_kernel"), cat_host: t("sys.changelog_cat_host"), cat_store: t("sys.changelog_cat_store"), cat_upd: t("sys.changelog_cat_upd"), cat_web: t("sys.changelog_cat_web"), cat_infra: t("sys.changelog_cat_infra"), cat_other: t("sys.changelog_cat_other") }[key];
+            html += '<div class="cl-cat">' + label + ' <span class="dim">' + items.length + "</span></div>" + items.map(function (x) { return '<div class="cl-li">' + x + "</div>"; }).join("");
+        }
+        return html;
+    }
+    // Version-select → scroll that release open and flash it briefly.
+    function focusChangelogRelease(val) {
+        const el = $("changelog-body");
+        if (!el) return;
+        const want = String(val).replace(/^v/, "");
+        const items = el.querySelectorAll("details.cl-item");
+        if (typeof items.forEach !== "function") return;
+        items.forEach((it) => {
+            const hit = String(it.getAttribute("data-tag") || "").replace(/^v/, "") === want;
+            try { it.open = hit; } catch (_) { /* harness */ }
+            it.classList.remove("cl-flash");
+        });
+        const target = el.querySelector('details.cl-item[data-tag="' + want.replace(/"/g, "") + '"]');
+        if (!target) return;
+        try { target.open = true; } catch (_) { /* harness */ }
+        target.classList.add("cl-flash");
+        if (target.scrollIntoView) target.scrollIntoView({ behavior: "smooth", block: "start" });
+        setTimeout(() => target.classList.remove("cl-flash"), 2500);
+    }
+    function renderChangelog(d) {
+        const el = $("changelog-body");
+        if (!el) return;
+        const rels = (d && typeof d === "object" && Array.isArray(d.releases)) ? d.releases : [];
+        if (!rels.length) {
+            el.textContent = (d && d.error) ? t("sys.changelog_offline") : t("sys.changelog_empty");
+            return;
+        }
+        let html = "";
+        rels.forEach((r, i) => {
+            const tagRaw = String(r.tag || "");
+            const tag = escapeHtml(tagRaw);
+            const dataTag = tagRaw.replace(/^v/, "").replace(/"/g, "");
+            const name = (typeof r.name === "string" && r.name !== r.tag) ? escapeHtml(r.name) + " · " : "";
+            const latest = i === 0 ? ' <span class="badge cl-latest">' + t("sys.changelog_latest") + "</span>" : "";
+            const date = r.publishedAt ? ' <span class="dim">' + escapeHtml(String(r.publishedAt).slice(0, 10)) + "</span>" : "";
+            const view = '<a href="' + escapeHtml(String(r.url || "")) + '" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_view") + "</a>";
+            const body = typeof r.body === "string" && r.body.trim() ? '<div class="cl-body">' + changelogBodyHtml(escapeHtml(r.body)) + '<div class="cl-foot">' + view + "</div></div>" : view;
+            html += '<details class="cl-item" data-tag="' + dataTag + (i === 0 ? '" open>' : '">' ) + '<summary><span class="cl-tag">' + tag + "</span>" + name + latest + date + "</summary>" + body + "</details>";
+        });
+        html += '<div class="cl-actions"><button class="btn sm" id="cl-expand-all" type="button">' + t("up.cl_expand_all") + '</button><button class="btn sm" id="cl-collapse-all" type="button">' + t("up.cl_collapse_all") + '</button><a class="btn sm" href="https://github.com/ranxianglei/billion-context/releases" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_all") + "</a></div>";
+        el.innerHTML = html;
+        const expandAll = $("cl-expand-all");
+        const collapseAll = $("cl-collapse-all");
+        if (expandAll) expandAll.addEventListener("click", () => el.querySelectorAll("details.cl-item").forEach((it) => { try { it.open = true; } catch (_) { /* harness */ } }));
+        if (collapseAll) collapseAll.addEventListener("click", () => el.querySelectorAll("details.cl-item").forEach((it) => { try { it.open = false; } catch (_) { /* harness */ } }));
+    }
+    async function loadChangelog() {
+        if (chlogLoaded) return;
+        const el = $("changelog-body");
+        if (!el) return;
+        chlogLoaded = true;
+        el.textContent = t("sys.changelog_loading");
+        try {
+            renderChangelog(await json(API_ROOT + "/changelog"));
+        } catch (e) {
+            // The endpoint itself never errors (fail-soft); reaching here means
+            // the PROXY is unreachable — same offline wording either way.
+            renderChangelog({ releases: [], error: "offline" });
+        }
+    }
+
+    // #3719 phase 2: dedicated 更新/Updates tab — self-update state, pushed
+    // notices, and install/rollback actions. All writes go through the
+    // admin-gated POST /__bili/update/* routes (same json() pattern as
+    // putCfg); one shared in-flight flag keeps ALL action buttons disabled
+    // while any action runs (the server dedupes a second call too).
+    let upBusyAction = false;
+    let upReleases = [];
+    function upSetButtons(on) {
+        [$("up-check"), $("up-upgrade-now"), $("up-install")].forEach((b) => {
+            if (!b) return;
+            b.classList.toggle("busy", on);
+            b.disabled = on;
+        });
+        // Install-selected additionally needs an actual selection.
+        const ins = $("up-install");
+        const sel = $("up-select");
+        if (ins) ins.disabled = on || !(sel && sel.value);
+    }
+    function showUpdateResult(msg, ok) {
+        const el = $("up-result");
+        if (!el || !msg) return;
+        el.hidden = false;
+        el.textContent = msg;
+        el.style.color = ok ? "var(--green)" : "var(--red)";
+    }
+    // Loose numeric compare on major/minor/patch — enough to decide the
+    // rollback confirm without pulling semver into the panel.
+    function upVerParts(v) {
+        return String(v || "").replace(/^v/i, "").split(/[.+]/).slice(0, 3).map((p) => parseInt(p, 10));
+    }
+    function upCmpVer(a, b) {
+        const x = upVerParts(a);
+        const y = upVerParts(b);
+        for (let i = 0; i < 3; i++) {
+            const d = (x[i] || 0) - (y[i] || 0);
+            if (d !== 0) return d < 0 ? -1 : 1;
+        }
+        return 0;
+    }
+    function renderNotices(items) {
+        const el = $("up-notices");
+        if (!el) return;
+        if (!items.length) { el.textContent = t("up.notice_empty"); return; }
+        let html = "";
+        items.slice().reverse().forEach((n) => {
+            const tier = n.tier === "critical" ? "critical" : (n.tier === "recommended" ? "recommended" : "routine");
+            // Fully literal keys below: the i18n dead-key scanner (#1024)
+            // greps t() call sites and would flag a dynamically built
+            // tier-prefix key.
+            const tierLabel = tier === "critical" ? t("up.tier_critical") : (tier === "recommended" ? t("up.tier_recommended") : t("up.tier_routine"));
+            // #3719 item4: locale-aware summary — zh picks summaryZh when the
+            // entry carries one; every other locale (and legacy payloads)
+            // falls back to the English one-liner.
+            const summaryText = (locale === "zh-CN" && typeof n.summaryZh === "string" && n.summaryZh) ? n.summaryZh : String(n.summary || "");
+            html += '<div class="ntc-item"><span class="badge' + (tier === "routine" ? " disk" : " ntc-" + tier) + '">' + escapeHtml(tierLabel) + "</span><span class='mono'>" + escapeHtml(String(n.version || "")) + "</span>" + (n.date ? ' <span class="dim">' + escapeHtml(String(n.date)) + "</span>" : "") + "<br>" + escapeHtml(summaryText) + "</div>";
+        });
+        el.innerHTML = html;
+    }
+    // Newest release known to the panel: the newest pushed notice wins, the
+    // changelog tag list is the fallback (tags arrive newest-first, capped at
+    // what the endpoint returns). Leading "v" is stripped before install —
+    // the updater takes plain semver.
+    function upNewestVersion(notices) {
+        if (notices && notices.length) return String(notices[notices.length - 1].version || "");
+        return String(upReleases[0] || "").replace(/^v/, "");
+    }
+    function applyUpdateButtons(st) {
+        const now = $("up-upgrade-now");
+        const target = upNewestVersion(st && st.notices);
+        if (now) {
+            const lbl = $("up-upgrade-now-label");
+            if (lbl) lbl.textContent = target ? t("up.upgrade_now", { v: target }) : t("up.upgrade_none");
+            now.disabled = upBusyAction || !target;
+        }
+    }
+    function renderUpdateState(st) {
+        if (!st || typeof st !== "object") return;
+        const set = (id, text) => { const el = $(id); if (el) el.textContent = text; };
+        set("up-running", st.running || "?");
+        set("up-disk", st.disk || t("common.none"));
+        set("up-latest", upNewestVersion(st.notices) || t("common.none"));
+        set("up-last-check", st.lastCheckAt ? new Date(st.lastCheckAt).toLocaleString() : t("common.none"));
+        const hint = $("up-pending-hint");
+        if (hint) hint.hidden = !st.pendingRestart;
+        renderNotices(Array.isArray(st.notices) ? st.notices : []);
+        const sel = $("up-select");
+        if (sel) {
+            const cur = sel.value;
+            let opt = '<option value="">' + t("up.select_placeholder") + "</option>";
+            upReleases.forEach((tag) => { opt += '<option value="' + escapeHtml(tag) + '">' + escapeHtml(tag) + "</option>"; });
+            sel.innerHTML = opt;
+            if (cur) sel.value = cur;
+        }
+        applyUpdateButtons(st);
+        // A check/install started from another tab of this process shows in
+        // the snapshot — keep the buttons held down until it settles.
+        if (st.checking || st.installing) upSetButtons(true);
+    }
+    // #4587: panel-embedded blog & articles — the server renders the bundled
+    // markdown with web/markdown.ts (escaped by construction), so this side only
+    // lays out cards and expands bodies. Language rides the page-level locale;
+    // switching languages reloads the page, so no incremental re-render hook.
+    let blogCache = null;
+    async function loadBlog(sub) {
+        const host = $("bl-list");
+        if (!host) return;
+        let data = blogCache;
+        if (!data) {
+            try {
+                data = blogCache = await json(API_ROOT + "/blog");
+            } catch (e) {
+                host.innerHTML = "";
+                toast(t("toast.failed", { msg: e.message }), "err");
+                return;
+            }
+        }
+        const items = (data && Array.isArray(data.items)) ? data.items : [];
+        const zhOn = locale === "zh-CN";
+        if (sub) {
+            const item = items.find((x) => String(x.id) === String(sub)) || null;
+            if (!item) {
+                host.innerHTML = '<div class="card"><div class="card-b"><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a> " + escapeHtml(t("bl.nf")) + "</div></div>";
+                return;
+            }
+            const kindLabel = item.kind === "post" ? t("bl.kind_post") : t("bl.kind_article");
+            const title = zhOn && item.titleZh ? item.titleZh : (item.title || "");
+            const html = zhOn ? (item.htmlZh || item.html || "") : (item.html || "");
+            host.innerHTML = '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a></div>"
+                + '<h3 class="bl-h">' + escapeHtml(title) + "</h3>"
+                + '<div class="card-b post-body">' + html + "</div></div>";
+            return;
+        }
+        if (!items.length) {
+            const wrap = document.createElement("div");
+            wrap.className = "card";
+            const box = document.createElement("div");
+            box.className = "card-b";
+            box.textContent = t("bl.empty");
+            wrap.appendChild(box);
+            host.innerHTML = "";
+            host.appendChild(wrap);
+            return;
+        }
+        host.innerHTML = '<div class="card">' + items.map((it) => {
+            const title = zhOn && it.titleZh ? it.titleZh : (it.title || "");
+            const alt = zhOn ? (it.title || "") : (it.titleZh || "");
+            let kindLabel;
+            if (it.kind === "post") kindLabel = t("bl.kind_post");
+            else kindLabel = t("bl.kind_article");
+            return '<a class="bl-row" href="#/blog/' + encodeURIComponent(String(it.id)) + '">'
+                + '<span class="mono bl-date">' + escapeHtml(it.date || "\u2014") + '</span>'
+                + '<span class="badge">' + escapeHtml(kindLabel) + '</span>'
+                + '<span class="bl-title">' + escapeHtml(title) + (alt ? ' <span class="bl-title-alt">' + escapeHtml(alt) + "</span>" : "") + "</span>"
+                + '<span class="bl-arrow">&#8594;</span></a>';
+        }).join("") + "</div>";
+    }
+    async function loadUpdates() {
+        try {
+            const [st, cl] = await Promise.all([json(API_ROOT + "/update/state"), json(API_ROOT + "/changelog")]);
+            upReleases = (cl && Array.isArray(cl.releases)) ? cl.releases.map((r) => String(r.tag || "")).filter(Boolean) : [];
+            renderUpdateState(st);
+        } catch (e) {
+            // Both endpoints are fail-soft 200s; reaching here = proxy unreachable.
+            toast(t("toast.failed", { msg: e.message }), "err");
+        }
+    }
+    async function upInstall(version) {
+        if (upBusyAction || !version) return;
+        const running = $($("up-running") && "up-running") ? $("up-running").textContent.replace(/^v/i, "") : "";
+        if (upCmpVer(version, running) < 0 && !window.confirm(t("up.rollback_confirm", { v: version }))) return;
+        upBusyAction = true;
+        upSetButtons(true);
+        showUpdateResult(t("up.installing", {}), true);
+        try {
+            const r = await json(API_ROOT + "/update/install", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: version }) });
+            if (r.already) showUpdateResult(t("up.already_in_flight"), true);
+            else if (r.ok) showUpdateResult(t("up.installed", { v: version }), true);
+            else showUpdateResult(String(r.error || t("toast.failed", { msg: "install failed" })), false);
+        } catch (e) {
+            showUpdateResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
+    function upUpgradeNow() { upInstall(upNewestVersion(null).replace(/^v/, "")); }
+    function upInstallSelected() { const sel = $("up-select"); if (sel && sel.value) upInstall(String(sel.value).replace(/^v/, "")); }
+    async function upCheckNow() {
+        if (upBusyAction) return;
+        upBusyAction = true;
+        upSetButtons(true);
+        try {
+            const r = await json(API_ROOT + "/update/check", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+            if (r.already) showUpdateResult(t("up.already_in_flight"), true);
+            else if (r.ok) showUpdateResult(t("up.check_ok"), true);
+            else showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+        } catch (e) {
+            showUpdateResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
     }
 
     async function loadOverview(silent) {
@@ -688,6 +1019,7 @@ export const WEB_CLIENT = `(function () {
                 pb.appendChild(tr);
             });
             $("sys-version").textContent = d.version ? (d.commit ? d.version + " (" + d.commit + ")" : d.version) : "?";
+            $("sys-lane").textContent = d.origin || t("common.none");
             $("sys-disk-version").textContent = d.diskVersion || t("common.none");
             $("sys-inflight").textContent = String(d.inFlight || 0);
             const bt = d.blindTunnels || {};
@@ -718,10 +1050,36 @@ export const WEB_CLIENT = `(function () {
                 // carries the MINIMUM fixed version, so each locale can say
                 // "v{version} 或更新版本" / "v{version} or newer" separately.
                 const vars = { version: u.version, summary: u.summary || "" };
+                // #3719 item3: locale-aware summary — zh gets summaryZh when
+                // the entry carries one (release-notes bilingual support).
+                if (locale === "zh-CN" && typeof u.summaryZh === "string" && u.summaryZh) vars.summary = u.summaryZh;
                 const line = u.kind === "ready" ? t("sys.update_ready", vars) : t("sys.update_available", vars);
                 ub.hidden = false;
                 ub.classList.add("show");
                 ub.innerHTML = "<strong>" + t("sys.update") + "</strong> " + escapeHtml(line);
+                // #3719 item3: one-click upgrade straight from the banner when
+                // the fix is still "available" (ready = already on disk, just
+                // restart). Reuses the phase-2 install endpoint + its safety
+                // chain; feedback stays inside the banner.
+                if (u.kind === "available") {
+                    const btn = document.createElement("button");
+                    btn.type = "button";
+                    btn.className = "banner-upgrade-now";
+                    btn.textContent = t("sys.update_now", { version: u.version });
+                    btn.addEventListener("click", async () => {
+                        btn.disabled = true;
+                        btn.textContent = t("sys.updating", {});
+                        try {
+                            const r = await json(API_ROOT + "/update/install", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: u.version }) });
+                            if (r && (r.ok || r.already)) btn.textContent = t("sys.update_done", { version: u.version });
+                            else { btn.textContent = String((r && r.error) || "install failed"); btn.disabled = false; }
+                        } catch (e) {
+                            btn.textContent = String((e && e.message) || e);
+                            btn.disabled = false;
+                        }
+                    });
+                    ub.appendChild(btn);
+                }
             } else {
                 ub.hidden = true;
                 ub.classList.remove("show");
@@ -829,6 +1187,69 @@ export const WEB_CLIENT = `(function () {
                 sh.hidden = true;
                 sh.classList.remove("show");
                 sh.innerHTML = "";
+            }
+        }
+        const spb = $("storage-second-process-banner");
+        if (spb) {
+            const sg2 = d.storage;
+            const sp = sg2 && typeof sg2 === "object" ? sg2.secondProcess : null;
+            if (sp && typeof sp.pid === "number") {
+                spb.hidden = false;
+                spb.classList.add("show");
+                // #3923/#3959: a known bili instance of a DIFFERENT lane sharing
+                // the machine-global sessions dir is the supported topology —
+                // informational styling, not a corruption alarm.
+                if (sp.benign === true) {
+                    spb.classList.remove("warn");
+                    spb.classList.add("info");
+                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_cross_lane_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_cross_lane", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
+                } else {
+                    spb.classList.remove("info");
+                    spb.classList.add("warn");
+                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
+                }
+            } else {
+                spb.hidden = true;
+                spb.classList.remove("show");
+                spb.innerHTML = "";
+            }
+        }
+        const sbb = $("split-brain-banner");
+        if (sbb) {
+            // #3923/#3959: a REAL contest — session id + title + both sides'
+            // pid/lane, with a dismiss action that clears the surfaced entry.
+            const sb = d.storage && typeof d.storage === "object" ? d.storage.splitBrain : null;
+            if (sb && typeof sb.sessionId === "string" && sb.self && typeof sb.self.pid === "number" && sb.peer && typeof sb.peer.pid === "number") {
+                sbb.hidden = false;
+                sbb.classList.add("show");
+                const laneOf = (x) => (x && typeof x.lane === "string" && x.lane ? x.lane : t("sys.split_brain_lane_undeclared"));
+                sbb.innerHTML = "<strong>" + escapeHtml(t("sys.split_brain_title")) + "</strong> "
+                    + escapeHtml(t("sys.split_brain", {
+                        title: typeof sb.title === "string" && sb.title ? sb.title : sb.sessionId.slice(0, 8),
+                        sid: sb.sessionId.slice(0, 8),
+                        selfPid: String(sb.self.pid),
+                        selfLane: laneOf(sb.self),
+                        peerPid: String(sb.peer.pid),
+                        peerLane: laneOf(sb.peer),
+                    }))
+                    + '<div style="margin-top:8px"><button id="split-brain-ack-btn" class="btn sm">' + escapeHtml(t("sys.split_brain_ack_btn")) + "</button></div>";
+                const ackBtn = $("split-brain-ack-btn");
+                if (ackBtn) ackBtn.addEventListener("click", async () => {
+                    busy(ackBtn, true);
+                    try {
+                        await json(API_ROOT + "/storage/split-brain/ack", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sb.sessionId }) });
+                        toast(t("sys.split_brain_acked"), "ok");
+                        await loadOverview(true);
+                    } catch (e) {
+                        toast(e instanceof Error ? e.message : String(e), "err");
+                    } finally {
+                        busy(ackBtn, false);
+                    }
+                });
+            } else {
+                sbb.hidden = true;
+                sbb.classList.remove("show");
+                sbb.innerHTML = "";
             }
         }
         const pt = $("passthrough-banner");
@@ -1499,7 +1920,7 @@ export const WEB_CLIENT = `(function () {
     }
     const chartZooms = [];   // live instances — Esc resets any zoomed chart (#2489 behavior)
     function makeChartZoom(cfg) {
-        // cfg: { elId, statusId, resetId, render(lines, folds, seams) -> svg }
+        // cfg: { elId, statusId, resetId, render(lines, folds, seams) -> svg, link?: { members } }
         const z = { range: null, drag: null, state: null, cfg };
         z.visible = function visible() {
             if (!z.state) return null;
@@ -1547,8 +1968,15 @@ export const WEB_CLIENT = `(function () {
             updateStatus(v);
         };
         z.setRange = function setRange(r) {
-            z.range = r && r[1] > r[0] ? [r[0], r[1]] : null;
+            const nr = r && r[1] > r[0] ? [r[0], r[1]] : null;
+            const same = (nr === null && z.range === null) || (nr !== null && z.range !== null && nr[0] === z.range[0] && nr[1] === z.range[1]);
+            if (same) return;
+            z.range = nr;
             z.render();
+            // #4317: linked charts share ONE brush window — a selection or reset on either
+            // re-renders its peers over the same sample indices. The length guard keeps a
+            // stale peer bound to another session's ledger out of the propagation.
+            if (cfg.link && z.state) cfg.link.members.forEach((m) => { if (m !== z && m.state && m.state.lines.length === z.state.lines.length) m.setRange(nr); });
         };
         function localX(wrap, ev) {
             const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
@@ -1614,11 +2042,15 @@ export const WEB_CLIENT = `(function () {
             z.render();
         };
         chartZooms.push(z);
+        if (cfg.link) cfg.link.members.push(z);
         return z;
     }
     const trajAux = { win: 0, baseIn: 0 };
-    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
-    const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
+    // #4317: both detail charts plot the SAME request timeline in two projections —
+    // one shared brush window keeps them in lockstep (select on either, both follow).
+    const detailChartLink = { members: [] };
+    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", link: detailChartLink, render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
+    const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", link: detailChartLink, render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
     function bindTrajectoryBrush(d) {
         const ledger = d.ledger || {};
         const lines = (ledger.lines || []).filter((l) => Boolean(l));
@@ -1637,6 +2069,7 @@ export const WEB_CLIENT = `(function () {
     window.bili_hitSvg = hitRateSvg;
     window.bili_causes = classifyLineCauses;
     window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => trajZoom.visible(), range: () => trajZoom.range };
+    window.bili_hitZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => hitZoom.visible(), range: () => hitZoom.range };
     function blockTopic(b) {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
@@ -1674,20 +2107,33 @@ export const WEB_CLIENT = `(function () {
         if (lp < 0) return null;
         return { kind: kind, name: nameId.slice(0, lp), cid: nameId.slice(lp + 1), text: line.slice(mark + tailLen) };
     }
+    // Terminates the reasoning cell of a reply: _reasoning_: has no end
+    // marker, so the handoff renderer would otherwise fold the answer that
+    // follows into the collapsed thinking box. Mirrored in HANDOFF_THINK_END.
+    const HANDOFF_THINK_END = "<!-- /reasoning -->";
     function splitHandoffBody(bodyLines) {
         const segs = [];
-        for (const raw of bodyLines) {
+        let thinkClosed = false;
+        for (let i = 0; i < bodyLines.length; i++) {
+            const raw = bodyLines[i];
             if (raw.trim() === "" && !(segs.length && segs[segs.length - 1].type === "out")) continue;
+            const activeThink = segs[segs.length - 1];
+            if (raw.trim() === HANDOFF_THINK_END && activeThink && activeThink.type === "think" && !thinkClosed) {
+                if (bodyLines[i + 1] === raw) { activeThink.lines.push(raw); i++; }
+                else thinkClosed = true;
+                continue;
+            }
             const tool = parseToolLine(raw);
             if (tool) { segs.push({ type: "tool", kind: tool.kind, name: tool.name, cid: tool.cid, lines: [tool.text] }); continue; }
             if (raw.indexOf("_reasoning_: ") === 0) {
                 const lastT = segs[segs.length - 1];
-                if (!lastT || lastT.type !== "think") segs.push({ type: "think", lines: [] });
+                if (!lastT || lastT.type !== "think" || thinkClosed) segs.push({ type: "think", lines: [] });
                 segs[segs.length - 1].lines.push(raw.slice("_reasoning_: ".length));
+                thinkClosed = false;
                 continue;
             }
             const last = segs[segs.length - 1];
-            if (last && (last.type === "out" || last.type === "think")) last.lines.push(raw);
+            if (last && (last.type === "out" || (last.type === "think" && !thinkClosed))) last.lines.push(raw);
             else segs.push({ type: "out", lines: [raw] });
         }
         return segs;
@@ -1823,90 +2269,168 @@ export const WEB_CLIENT = `(function () {
         });
         return { children: children, roots: roots };
     }
-    // #3917: at-a-glance view of the same folds. Layered top-down (roots on top,
-    // each fold one level below the block that absorbed it), edges drawn as
-    // beziers — a knowledge-graph-ish shape for reading structure, while the
-    // list view stays the place to read concrete messages. A wide tree is scaled
-    // to fit the card rather than hiding nodes behind a horizontal scroll.
-    const GRAPH_NODE_W = 118;
-    const GRAPH_NODE_H = 36;
-    const GRAPH_GAP_X = 16;
-    const GRAPH_LEVEL_H = 84;
-    const GRAPH_FIT_W = 1120;
-    function blockGraphLayout(blocks) {
+    // #4608: geometry for the collapsible-tree reading of the blocks pane.
+    // (The flame-chart reading was cut at owner request — the pane keeps
+    // the tree plus the classic folded-block list instead.)
+    const TREE_W = 200;          // collapsible-tree node box
+    const TREE_H = 44;
+    const TREE_GAP_X = 22;       // column spacing (depth axis)
+    const TREE_GAP_Y = 10;
+    // Collapsible depth-column tree: roots always show, a branch appears only
+    // while its parent carries the expand mark; the "+N" chip counts the whole
+    // hidden subtree so a deep collapse still says how much hides behind it.
+    function collapSubtreeSize(blocks) {
+        const byId = {};
+        blocks.forEach(function (b) { byId[b.blockId] = true; });
+        const childIds = {};
+        blocks.forEach(function (b) {
+            const pid = b.parentBlockId;
+            if (pid && pid !== b.blockId && byId[pid]) (childIds[pid] = childIds[pid] || []).push(b.blockId);
+        });
+        const memo = {};
+        const size = function (id, trail) {
+            if (memo[id] != null) return memo[id];
+            if (trail.indexOf(id) >= 0) return 1;
+            trail.push(id);
+            const total = 1 + (childIds[id] || []).reduce(function (acc, k) { return acc + size(k, trail); }, 0);
+            trail.pop();
+            memo[id] = total;
+            return total;
+        };
+        blocks.forEach(function (b) { size(b.blockId, []); });
+        return memo;
+    }
+    function collapTreeLayout(blocks, expanded) {
         const shape = blockTreeShape(blocks);
-        const nodes = [];
-        const links = [];
-        let cursor = 0;
-        let maxDepth = 0;
+        const sizes = collapSubtreeSize(blocks);
+        const nodes = [], links = [];
+        let cursor = 0, maxDepth = 0;
         const place = function (b, depth) {
             if (depth > 40) return null;
-            const kids = shape.children[b.blockId] || [];
-            const childNodes = [];
-            kids.forEach(function (k) {
-                const kid = place(k, depth + 1);
-                if (kid) childNodes.push(kid);
-            });
-            let x;
-            if (!childNodes.length) {
-                x = cursor;
-                cursor += GRAPH_NODE_W + GRAPH_GAP_X;
-            } else {
-                x = (childNodes[0].x + childNodes[childNodes.length - 1].x) / 2;
-            }
-            const node = { b: b, x: x, y: depth * GRAPH_LEVEL_H };
+            const node = { b: b, x: depth, y: 0 };
+            const ys = [];
+            if (expanded && expanded[b.blockId])
+                (shape.children[b.blockId] || []).forEach(function (k) {
+                    const kn = place(k, depth + 1);
+                    if (kn) { ys.push(kn.y); links.push([node, kn]); }
+                });
+            if (ys.length) node.y = (ys[0] + ys[ys.length - 1]) / 2;
+            else { node.y = cursor; cursor += TREE_H + TREE_GAP_Y; }
             nodes.push(node);
             if (depth > maxDepth) maxDepth = depth;
-            childNodes.forEach(function (c) { links.push([node, c]); });
             return node;
         };
-        const roots = shape.roots.length ? shape.roots : blocks;
-        roots.forEach(function (r) { place(r, 0); });
-        if (!nodes.length) return { nodes: [], links: [], width: 0, height: 0 };
-        return { nodes: nodes, links: links, width: cursor - GRAPH_GAP_X, height: maxDepth * GRAPH_LEVEL_H + GRAPH_NODE_H };
+        (shape.roots.length ? shape.roots : blocks).forEach(function (r) { place(r, 0); });
+        if (!nodes.length) return { nodes: nodes, links: links, cols: 1, height: 0, sizes: sizes };
+        return { nodes: nodes, links: links, cols: maxDepth + 1, height: cursor - TREE_GAP_Y + TREE_H, sizes: sizes };
     }
-    function buildGraphSvg(blocks) {
-        const layout = blockGraphLayout(blocks);
-        if (!layout.nodes.length) return "";
-        const pad = 14;
-        const half = GRAPH_NODE_W / 2;
-        const W = Math.ceil(layout.width + pad * 2);
-        const H = Math.ceil(layout.height + pad * 2);
-        const fit = W > GRAPH_FIT_W ? GRAPH_FIT_W / W : 1;
-        const parts = [];
-        parts.push('<svg class="g-svg" viewBox="0 0 ' + W + " " + H + '" width="' + Math.round(W * fit) + '" height="' + Math.round(H * fit) + '" preserveAspectRatio="xMidYMid meet" role="img">');
-        layout.links.forEach(function (l) {
-            const x1 = l[0].x + pad + half;
-            const y1 = l[0].y + pad + GRAPH_NODE_H;
-            const x2 = l[1].x + pad + half;
-            const y2 = l[1].y + pad;
-            const my = (y1 + y2) / 2;
-            parts.push('<path class="g-edge" d="M' + x1 + " " + y1 + " C" + x1 + " " + my + " " + x2 + " " + my + " " + x2 + " " + y2 + '" fill="none"/>');
+    function renderCollapSvg(blocks, expanded, selectedBid) {
+        const lay = collapTreeLayout(blocks, expanded || {});
+        if (!lay.nodes.length) return { html: "" };
+        const colW = TREE_W + TREE_GAP_X;
+        const W = 12 + lay.cols * colW + 4;
+        const H = lay.height + 12;
+        const sel = selectedBid || "";
+        const p = [];
+        p.push('<svg class="g-svg g-svg-v" viewBox="0 0 ' + W + " " + H + '" width="' + W + '" height="' + H + '" preserveAspectRatio="xMinYMin meet" role="img">');
+        lay.links.forEach(function (l) {
+            const x1 = l[0].x * colW + 12 + TREE_W, y1 = l[0].y + 6 + TREE_H / 2;
+            const x2 = l[1].x * colW + 12, y2 = l[1].y + 6 + TREE_H / 2;
+            const mx = (x1 + x2) / 2;
+            p.push('<path class="g-edge" fill="none" d="M' + x1.toFixed(1) + " " + y1.toFixed(1) + " C" + mx.toFixed(1) + " " + y1.toFixed(1) + " " + mx.toFixed(1) + " " + y2.toFixed(1) + " " + x2.toFixed(1) + " " + y2.toFixed(1) + '"></path>');
         });
-        layout.nodes.forEach(function (n) {
+        lay.nodes.forEach(function (n) {
             const b = n.b;
             const tierNum = Number(b.tier) || 1;
-            const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive");
-            const ratio = b.compressedTokens > 0 && b.summaryTokens > 0 ? (100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%" : "";
-            const meta = fmtW(b.compressedTokens) + " → " + fmtW(b.summaryTokens) + (ratio ? " " + ratio : "");
-            parts.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x + pad) + "," + (n.y + pad) + ')">'
-                + "<title>" + escapeHtml(b.blockId + " · T" + tierNum + " · " + blockTopic(b)) + "</title>"
-                + '<rect width="' + GRAPH_NODE_W + '" height="' + GRAPH_NODE_H + '" rx="9"></rect>'
-                + '<text class="g-id" x="10" y="15">' + escapeHtml(b.blockId + " · T" + tierNum) + "</text>"
-                + '<text class="g-meta" x="10" y="28">' + escapeHtml(meta) + "</text>"
-                + "</g>");
+            const hidden = (lay.sizes[b.blockId] || 1) - 1;
+            const isOpen = !!(expanded && expanded[b.blockId]);
+            const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive") + (sel === b.blockId ? " fsel" : "");
+            let topic = blockTopic(b);
+            const maxCh = Math.floor((TREE_W - 52) / 7);
+            if (topic.length > maxCh) topic = topic.slice(0, Math.max(1, maxCh - 1)) + "...";
+            const rr = refRangeOf(b);
+            p.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x * colW + 12).toFixed(1) + "," + (n.y + 6).toFixed(1) + ')">');
+            p.push('<rect width="' + TREE_W + '" height="' + TREE_H + '" rx="9"><title>' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + blockTopic(b)) + "</title></rect>");
+            p.push('<text class="g-id" x="10" y="17">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "")) + "</text>");
+            p.push('<text class="g-topic" x="10" y="34">' + escapeHtml(topic) + "</text>");
+            if (hidden > 0)
+                p.push('<g class="tchip" data-toggle="' + escapeHtml(b.blockId) + '" transform="translate(' + (TREE_W - 34) + ',13)">' + '<rect width="28" height="18" rx="9"></rect><text x="14" y="13">' + (isOpen ? "−" : "+" + hidden) + '</text></g>');
+            p.push("</g>");
         });
-        parts.push("</svg>");
-        return parts.join("");
+        p.push("</svg>");
+        return { html: p.join("") };
     }
     function refRangeOf(b) {
         if (!b.startRef) return "";
         return b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : String(b.startRef);
     }
-    function blockNodeHtml(b, shape, idx, depth) {
+    // #4608: one pre-rendered detail panel per fold block — hidden until its
+    // bar/node is selected, so the drawings stay light while the summary, the
+    // kernel's own accounting and the lazy raw-content endpoints all live next
+    // to the thing you clicked.
+    function sidePanelHtml(b, idx) {
+        const tierNum = Number(b.tier) || 1;
+        const badge = b.active
+            ? '<span class="badge ok">' + t("det.block_active") + "</span>"
+            : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
+        const extBadge = b.external ? '<span class="badge ext">' + t("det.block_external") + "</span>" : "";
+        const meta = ["T" + tierNum, fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens)];
+        if (b.compressedTokens > 0 && b.summaryTokens > 0) meta.push((100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%");
+        meta.push(fmtB(b.summaryBytes));
+        if (b.effectiveMessageCount) meta.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
+        const rr = refRangeOf(b);
+        if (rr) meta.push(rr);
+        meta.push(timeAgo(b.createdAt));
+        // Same contract as the old list row: long summaries open as five
+        // clamped lines behind a show-all button; the clamp only survives
+        // measurement if it actually cut anything.
+        const sumLong = String(b.summary || "").trim().length > 64;
+        let bodyInner = renderBlockMd(b.summary || "");
+        if (sumLong) {
+            bodyInner = '<div class="blk-sum clamp">' + bodyInner + "</div>"
+                + '<button type="button" class="btn sm blk-sum-toggle">' + t("det.tree_sum_more") + "</button>";
+        }
+        const bid = escapeHtml(b.blockId);
+        let html = '<div class="bd-panel" data-bid="' + bid + '" hidden><div class="bd-head"><span class="mono">' + bid + "</span>" + badge + extBadge
+            + '<button class="btn sm blk-copy" data-bi="' + idx + '">' + t("common.copy") + "</button></div>"
+            + '<div class="topic">' + escapeHtml(blockTopic(b)) + "</div>"
+            + '<div class="meta mono">' + escapeHtml(meta.join(" \u00b7 ")) + "</div>"
+            + '<div class="body md">' + bodyInner + "</div>"
+            + '<div class="blk-content-bar">'
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="one">' + t("det.tree_orig_one") + "</button>"
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="full">' + t("det.tree_orig_full") + "</button>"
+            + '<span class="dim small">' + escapeHtml(t("det.tree_direct", { n: Number(b.directMessageCount) || 0 })) + "</span>"
+            + "</div>"
+            + '<div class="blk-content" data-blkbox hidden></div>';
+        // The messages this block folded — preview only, bytes arrive lazily
+        // (#3917) through the very same endpoint the old list rows used.
+        const msgs = b.directMessages || [];
+        if (msgs.length) {
+            html += '<ul class="blk-msgs">';
+            msgs.forEach(function (m) {
+                if (m.missing) {
+                    html += '<li><div class="msg-row missing"><span class="mref mono">' + escapeHtml(m.ref) + '</span><span class="mprev">' + t("det.tree_msg_gone") + "</span></div></li>";
+                    return;
+                }
+                const tags = m.toolName ? '<span class="badge">' + escapeHtml(m.toolName) + "</span>" : "";
+                html += '<li><button class="msg-row" data-ref="' + escapeHtml(m.ref) + '">'
+                    + '<span class="mref mono">' + escapeHtml(m.ref) + "</span>"
+                    + '<span class="badge">' + escapeHtml(m.role || "") + "</span>" + tags
+                    + '<span class="mprev">' + escapeHtml(m.preview || "") + "</span></button>"
+                    + '<div class="msg-body" hidden></div></li>';
+            });
+            html += "</ul>";
+        } else if (Number(b.directMessageCount) > 0) {
+            html += '<div class="dim small" style="margin:2px 0 8px">' + t("det.tree_msgs_unavailable") + "</div>";
+        }
+        return html + "</div>";
+    }    function blockNodeHtml(b, shape, idx, depth) {
         const kids = shape.children[b.blockId] || [];
         const tierNum = Number(b.tier) || 1;
-        const openAttr = depth < 2 || (b.active && depth < 3) ? " open" : "";
+        // #4173 review: rows start COLLAPSED — a 200-block session must not
+        // open as a wall of expanded cards. The tree-map click opens the
+        // target row for you; <summary> expands any row on demand.
+        const openAttr = "";
         const badge = b.active
             ? '<span class="badge ok">' + t("det.block_active") + "</span>"
             : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
@@ -1918,6 +2442,15 @@ export const WEB_CLIENT = `(function () {
         if (b.effectiveMessageCount) meta.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
         if (refRange) meta.push(refRange);
         meta.push(timeAgo(b.createdAt));
+        // #4173 review: long summaries open as five clamped lines + a show-all
+        // button. Closed <details> rows have no layout, so whether the clamp
+        // actually cut anything is measured once on first expand (below).
+        const sumLong = String(b.summary || "").trim().length > 64;
+        let bodyInner = renderBlockMd(b.summary || "");
+        if (sumLong) {
+            bodyInner = '<div class="blk-sum clamp">' + bodyInner + '</div>'
+                + '<button type="button" class="btn sm blk-sum-toggle">' + t("det.tree_sum_more") + "</button>";
+        }
         const bid = escapeHtml(b.blockId);
         let html = '<details class="block-item block-node tier-' + (tierNum > 3 ? "n" : String(tierNum)) + '" data-bid="' + bid + '"' + openAttr + ">"
             + '<summary><span class="bid">' + bid + "</span>" + badge + extBadge
@@ -1925,13 +2458,13 @@ export const WEB_CLIENT = `(function () {
             + '<span class="meta">' + escapeHtml(meta.join(" · ")) + "</span>"
             + '<button class="btn sm blk-copy" data-bi="' + idx + '">' + t("common.copy") + "</button>"
             + "</summary>"
-            + '<div class="body md">' + renderBlockMd(b.summary || "") + "</div>"
+            + '<div class="body md">' + bodyInner + "</div>"
             + '<div class="blk-content-bar">'
             + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="one">' + t("det.tree_orig_one") + "</button>"
             + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="full">' + t("det.tree_orig_full") + "</button>"
             + '<span class="dim small">' + escapeHtml(t("det.tree_direct", { n: Number(b.directMessageCount) || 0 })) + "</span>"
             + "</div>"
-            + '<div class="blk-content" id="blk-content-' + bid + '" hidden></div>';
+            + '<div class="blk-content" data-blkbox hidden></div>';
         // #3917: the messages this block folded, one leaf per mNNNNN ref. The
         // preview is all the tree needs; the bytes arrive on the first click
         // (the lazy endpoint), so a wide session never ships its transcript.
@@ -1957,6 +2490,8 @@ export const WEB_CLIENT = `(function () {
         if (depth < 32) kids.forEach(function (k) { html += blockNodeHtml(k, shape, idx, depth + 1); });
         return html + "</details>";
     }
+
+
     function buildTreePane(blocks) {
         const parts = [];
         parts.push('<div class="card"><div class="card-h"><span>' + t("det.blocks_title") + '</span><span class="hint">' + t("det.blocks_count", { total: blocks.length, active: blocks.filter(function (b) { return b.active; }).length }) + '</span></div><div class="card-b">');
@@ -1964,6 +2499,7 @@ export const WEB_CLIENT = `(function () {
             parts.push('<div class="dim small" style="padding:8px 0">' + t("det.blocks_empty") + "</div></div></div>");
             return parts.join("");
         }
+        window.__biliDetailBlocks = blocks; // consumed by bindTreeModeActions() after insertion
         const stats = blockTreeStats(blocks);
         const tierBits = Object.keys(stats.tiers).sort(function (a, b) { return Number(a) - Number(b); }).map(function (k) { return "T" + k + " ×" + stats.tiers[k]; });
         parts.push('<div class="tree-stats mono small">'
@@ -1973,31 +2509,44 @@ export const WEB_CLIENT = `(function () {
             + (tierBits.length ? "<span>" + escapeHtml(tierBits.join(" · ")) + "</span>" : "")
             + "</div>");
         parts.push('<div class="tree-actions"><button id="blocks-copy" class="btn sm">' + t("det.blocks_copy_md") + '</button><button id="blocks-dl" class="btn sm">' + t("det.blocks_download") + "</button></div>");
+        parts.push('<div class="tree-modes">'
+            + '<button class="btn sm tree-mode active" data-mode="tree">' + t("det.tree_view_graph") + "</button>"
+            + '<button class="btn sm tree-mode" data-mode="list">' + t("det.tree_view_list") + "</button>"
+            + '<button id="tm-expand-all" class="btn sm" hidden>' + t("det.tree_expand_all") + "</button>"
+            + '<button id="tm-collapse-all" class="btn sm" hidden>' + t("det.tree_collapse_all") + "</button>"
+            + '<span class="hint" id="tree-hint">' + t("det.tree_interact") + "</span>"
+            + "</div>");
+        // Left: the two interchangeable readings inside one scrollable frame
+        // (the collapsible tree by default, the classic folded-block list on
+        // demand); right: the selected block, sticky beside the tree.
         const shape = blockTreeShape(blocks);
         const idxOf = {};
         blocks.forEach(function (b, i) { if (idxOf[b.blockId] === undefined) idxOf[b.blockId] = i; });
-        parts.push('<div class="tree-modes"><button class="btn sm tree-mode active" data-mode="list">' + t("det.tree_view_list") + '</button><button class="btn sm tree-mode" data-mode="graph">' + t("det.tree_view_graph") + "</button></div>");
-        parts.push('<div class="tree-list" id="tree-list">');
-        parts.push('<div class="block-tree">');
+        parts.push('<div class="fd-grid"><div class="fd-left">');
+        parts.push('<div class="tm-view" id="tree-graph"><div class="tm-inner"></div></div>');
+        parts.push('<div class="tree-list" id="tree-list" hidden><div class="block-tree">');
         const rootBlocks = shape.roots.length ? shape.roots : blocks;
         rootBlocks.forEach(function (b) { parts.push(blockNodeHtml(b, shape, idxOf[b.blockId] || 0, 0)); });
-        parts.push("</div>");
-        parts.push('<div class="dim small" style="margin-top:10px">' + t("det.tree_hint") + "</div>");
-        parts.push("</div>");
-        parts.push('<div class="tree-graph" id="tree-graph" hidden>' + buildGraphSvg(blocks)
-            + '<div class="dim small" style="margin-top:8px">' + t("det.tree_graph_hint") + " · " + t("det.tree_graph_legend") + "</div></div>");
+        parts.push("</div></div>");
+        parts.push('</div><aside class="fd-side"><div class="card bd-card"><div class="card-h"><span>' + t("det.block_detail_title") + '</span></div><div class="card-b">');
+        parts.push('<div class="dim small" id="bd-empty">' + t("det.block_side_hint") + "</div>");
+        parts.push('<div id="bd-panels">');
+        blocks.forEach(function (b) { parts.push(sidePanelHtml(b, idxOf[b.blockId])); });
+        parts.push("</div></div></div></aside></div>");
         parts.push("</div></div>");
         return parts.join("");
     }
     function buildDetailHtml(d) {
         const parts = [];
+        // Hoisted above the page head so the tab count badge can share the same
+        // array (originally declared further down, inside the tree pane).
+        const blocks = d.blockDetails || [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
         parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(d.title || d.label || d.id) + '">' + escapeHtml(d.title || d.label || d.id.slice(0, 16)) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div></div>");
         parts.push('<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span class="dim small">' + t("det.report_note") + '</span><button id="sessrpt-md" class="btn sm">' + t("det.report_md") + '</button><button id="sessrpt-png" class="btn sm">' + t("det.report_png") + '</button></div>');
         // #3917: the detail page splits into panes — overview (identity, usage,
         // cache economics), the compression tree, and the handoff document. The
         // blocks card moved out of the overview into its own tier-tree pane.
-        const blocks = d.blockDetails || [];
         parts.push('<div class="det-tabs" id="det-tabs">'
             + '<button class="det-tab active" data-pane="overview">' + t("det.tab_overview") + "</button>"
             + '<button class="det-tab" data-pane="blocks">' + t("det.tab_blocks") + (blocks.length ? ' <span class="hint">' + blocks.length + "</span>" : "") + "</button>"
@@ -2010,6 +2559,8 @@ export const WEB_CLIENT = `(function () {
         if (d.label && d.label !== d.id) kv(parts, t("common.label"), d.label);
         kv(parts, t("common.protocol"), d.protocol || null, true);
         kv(parts, t("det.client_hint"), d.clientHint || null, true);
+        // #4571: engine lane — in-process (inline) vs standalone proxy process.
+        kv(parts, t("det.engine_lane"), d.engineLane === "inline" ? t("det.engine_lane_inline") : d.engineLane === "server" ? t("det.engine_lane_server") : null, true);
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
         // #2740: session-level notice — auto-mode verdicts here are bili-local, not model judgments.
         if (d.autoModeForge) kv(parts, t("det.auto_mode_forge"), t("det.auto_mode_forge_local") + " · " + d.autoModeForge.count + "×" + (d.autoModeForge.lastVariant || "?") + " · " + timeAgo(d.autoModeForge.lastAt), true);
@@ -2091,6 +2642,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             parts.push('<div class="dim small" style="margin-top:10px">' + t("common.context") + ctxMark + ": " + fmtW(ctxVal) + "</div>");
         }
         if ((d.retrieveCalls || 0) > 0) parts.push('<div class="dim small" style="margin-top:10px">' + t("det.ccr") + ' · <span class="mono">' + t("det.ccr_detail", { calls: d.retrieveCalls, hits: d.retrieveHits || 0, misses: d.retrieveMisses || 0 }) + "</span></div>");
+        if ((d.wholeBlockRestores || 0) > 0 || (d.rangeRestores || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.decompress") + ' · <span class="mono">' + t("det.decompress_detail", { blocks: d.wholeBlockRestores || 0, precise: d.wholeBlockRestoresPreciseAvailable || 0, ranges: d.rangeRestores || 0 }) + "</span></div>");
         if ((d.storedBytes || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.store") + ' · <span class="mono">' + fmtB(d.storedBytes) + ((d.storeBytesSaved || 0) > 0 ? " / " + fmtB(d.storeBytesSaved) + " " + t("common.saved") : "") + "</span></div>");
         parts.push("</div></div>");
         const ledger = d.ledger || {};
@@ -2166,7 +2718,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (seamActive && seam.events.length > 0) {
             const evHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + '</th><th>' + t("det.seam_col_div") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.seam_events_tip")) + '"><b>' + t("det.seam_events", { n: seam.events.length }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + evHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + evHead + "</thead><tbody>");
             seam.events.forEach((ev) => {
                 const cli = ev.client ? ' · <span style="color:#0969da">' + t("det.attr_client") + " @" + ev.client.idx + " (" + ev.client.role + "/" + ev.client.cls + ", " + fmtB(ev.client.len || 0) + ")</span>" : "";
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + fmtB(ev.lcpBytes || 0) + " @ " + t("det.seam_msg", { i: ev.msgIndex != null ? ev.msgIndex : "?", prev: ev.prevMsgs != null ? ev.prevMsgs : "?", cur: ev.curMsgs != null ? ev.curMsgs : "?" }) + cli + "</td></tr>");
@@ -2179,7 +2731,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (keySw && keySw.count > 0 && keySw.events && keySw.events.length > 0) {
             const kHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.key_fp") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.key_events_tip")) + '"><b>' + t("det.key_events", { n: keySw.count }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + kHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + kHead + "</thead><tbody>");
             keySw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
@@ -2191,7 +2743,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (promptSw && promptSw.count > 0 && promptSw.events && promptSw.events.length > 0) {
             const pHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.prompt_fp") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.prompt_events_tip")) + '"><b>' + t("det.prompt_events", { n: promptSw.count }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + pHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + pHead + "</thead><tbody>");
             promptSw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
@@ -2202,7 +2754,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (projSw && projSw.count > 0 && projSw.events && projSw.events.length > 0) {
             const jHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.proj_fp") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.proj_events_tip")) + '"><b>' + t("det.proj_events", { n: projSw.count }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + jHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + jHead + "</thead><tbody>");
             projSw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
@@ -2292,7 +2844,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             // numeric headers align with their columns; long lists just scroll.
             const foldHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.fold_s") + '</th><th class="num">' + t("det.fold_sigma") + '</th><th class="num">' + t("det.fold_h") + '</th><th class="num">' + t("det.fold_t") + "</th></tr>";
             const foldRow = (f, i) => '<tr><td class="num">' + (f.seq != null ? f.seq : i + 1) + '</td><td class="num">' + (f.at ? fmtDT(f.at) : t("common.none")) + '</td><td class="num">' + fmtW(f.S) + '</td><td class="num">' + fmtW(f.sigma) + '</td><td class="num">' + (f.hPct == null ? t("common.none") : f.hPct.toFixed(1) + "%") + '</td><td class="num">' + fmtW(f.T) + "</td></tr>";
-            parts.push('<div class="fold-scroll"><table class="data"><thead>' + foldHead + '</thead><tbody>');
+            parts.push('<div class="fold-scroll"><table class="data fold-table"><thead>' + foldHead + '</thead><tbody>');
             folds.forEach((f, i) => parts.push(foldRow(f, i)));
             parts.push("</tbody></table></div>");
         }
@@ -2559,6 +3111,26 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
     // #3917: lazy raw-content loader per block — the tree ships summary + numbers
     // only; the conversation bytes behind a block come on demand. "one" is what
     // decompress(block) hands back, "full" is the whole covered span.
+    // A summary clamp can only be measured once its card has layout —
+    // side panels get checked on selection, classic list rows on first
+    // expand. If the five-line clamp cut nothing, it is removed outright.
+    function fixSumClamp(pn) {
+        const body = pn.querySelector(":scope > .body.md");
+        if (!body || body.__sumChk) return;
+        body.__sumChk = 1;
+        let sum = null, btn = null;
+        for (let i = 0; i < body.children.length; i++) {
+            const c = body.children[i];
+            if (c.classList.contains("blk-sum")) sum = c;
+            if (c.classList.contains("blk-sum-toggle")) btn = c;
+        }
+        if (!sum || !btn) return;
+        if (sum.scrollHeight <= sum.clientHeight + 2) { sum.classList.remove("clamp"); btn.remove(); return; }
+        btn.addEventListener("click", function () {
+            const clamped = sum.classList.toggle("clamp");
+            btn.textContent = clamped ? t("det.tree_sum_more") : t("det.tree_sum_less");
+        });
+    }
     function bindBlockContentActions(d) {
         document.querySelectorAll(".blk-content-btn").forEach((btn) => {
             btn.addEventListener("click", async (ev) => {
@@ -2566,8 +3138,16 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 ev.stopPropagation();
                 const bid = btn.getAttribute("data-bid") || "";
                 const view = btn.getAttribute("data-view") === "full" ? "full" : "one";
-                const box = $("blk-content-" + bid);
+                // #4608: classic list rows and the side panels share the
+                // .blk-content class, so resolve the target box inside the
+                // button's own card — getElementById would grab whichever
+                // card happens to come first.
+                const hostEl = btn.closest(".bd-panel") || btn.closest(".block-item");
+                const box = hostEl ? hostEl.querySelector(":scope > .blk-content") : null;
                 if (!box) return;
+                // #4173 review: pressing the same button again collapses the
+                // raw view (it used to be one-way, so users were stuck).
+                if (!box.hidden && box.getAttribute("data-view") === view) { box.hidden = true; return; }
                 if (box.getAttribute("data-state") === "ok" && box.getAttribute("data-view") === view) { box.hidden = false; return; }
                 box.hidden = false;
                 box.setAttribute("data-state", "loading");
@@ -2614,42 +3194,127 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 }
             });
         });
+        // #4173 review: classic list rows start collapsed — measure each
+        // row's clamp once on first expand (panels get the same treatment
+        // on selection).
+        document.querySelectorAll("#tree-list .block-node").forEach((row) => {
+            row.addEventListener("toggle", () => { if (row.open) fixSumClamp(row); });
+        });
     }
-    // #3917: the compression pane carries two readings of the same data — the
-    // list (read concrete messages) and the graph (read the overall shape).
-    // Clicking a graph node jumps back to that block's expanded row in the list.
+    // #4608: master-detail pane binder — the left frame shows the
+    // collapsible tree (default) or the classic folded-block list; in tree
+    // mode the right side is the selected block's panel. Click selects;
+    // chips (+N/−) expand or collapse a branch; Esc collapses back to the
+    // roots. All hits are point-tested because the poller may have swapped
+    // innerHTML under a pressed finger (same trick as the #4173 live map).
+    let treeViewState = null;
+    let treeViewRender = null;
     function bindTreeModeActions() {
-        const list = $("tree-list");
-        const graph = $("tree-graph");
-        if (!list || !graph) return;
+        const graphView = $("tree-graph");
+        const listView = $("tree-list");
+        if (!graphView || !listView) return;
+        const blocks = window.__biliDetailBlocks || [];
         const btns = Array.prototype.slice.call(document.querySelectorAll(".tree-mode"));
-        const setMode = function (mode) {
-            const g = mode === "graph";
-            list.hidden = g;
-            graph.hidden = !g;
-            btns.forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-mode") === mode); });
-        };
+        const expBtn = $("tm-expand-all");
+        const colBtn = $("tm-collapse-all");
+        const gridEl = graphView.closest(".fd-grid");
+        const sideEl = gridEl ? gridEl.querySelector(".fd-side") : null;
+        const hintEl = $("tree-hint");
+        let mode = "tree";
+        try { mode = sessionStorage.getItem("bili-tree-mode") === "list" ? "list" : "tree"; } catch (e) {}
+        const st = { mode: mode, selected: "", expanded: {} };
+        treeViewState = st;
+        function renderTree() {
+            const inner = graphView.querySelector(".tm-inner");
+            if (inner) inner.innerHTML = renderCollapSvg(blocks, st.expanded, st.selected).html;
+        }
+        treeViewRender = renderTree;
+        function select(bid) {
+            st.selected = bid;
+            document.querySelectorAll("#tree-graph [data-bid]").forEach(function (el) {
+                el.classList.toggle("fsel", el.getAttribute("data-bid") === bid);
+            });
+            let found = null;
+            document.querySelectorAll("#bd-panels .bd-panel").forEach(function (pn) {
+                const on = pn.getAttribute("data-bid") === bid;
+                pn.hidden = !on;
+                if (on) found = pn;
+            });
+            const empty = $("bd-empty");
+            if (empty) {
+                empty.style.display = found ? "none" : "";
+                if (!found) empty.textContent = bid ? t("det.block_side_live") : t("det.block_side_hint");
+            }
+            if (found) fixSumClamp(found);
+        }
+        function hitEl(e) {
+            let el = e.target;
+            try { el = document.elementFromPoint(e.clientX, e.clientY) || el; } catch (err) {}
+            return el;
+        }
+        function setMode(m) {
+            st.mode = m;
+            try { sessionStorage.setItem("bili-tree-mode", m); } catch (e) {}
+            graphView.hidden = m !== "tree";
+            listView.hidden = m !== "list";
+            if (expBtn) expBtn.hidden = m !== "tree";
+            if (colBtn) colBtn.hidden = m !== "tree";
+            if (gridEl) gridEl.classList.toggle("list-mode", m === "list");
+            if (sideEl) sideEl.hidden = m !== "tree";
+            if (hintEl) hintEl.textContent = m === "tree" ? t("det.tree_interact") : t("det.tree_list_hint");
+            btns.forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-mode") === m); });
+        }
         btns.forEach(function (b) {
-            b.addEventListener("click", function (ev) {
-                ev.preventDefault();
-                setMode(b.getAttribute("data-mode") === "graph" ? "graph" : "list");
-            });
+            b.addEventListener("click", function (ev) { ev.preventDefault(); setMode(b.getAttribute("data-mode") === "list" ? "list" : "tree"); });
         });
-        graph.querySelectorAll(".g-node").forEach(function (n) {
-            n.addEventListener("click", function () {
-                const bid = n.getAttribute("data-bid");
-                if (!bid) return;
-                setMode("list");
-                const row = document.querySelector('.block-node[data-bid="' + bid + '"]');
-                if (!row) return;
-                row.open = true;
-                row.classList.add("flash");
-                row.scrollIntoView({ block: "center", behavior: "smooth" });
-                setTimeout(function () { row.classList.remove("flash"); }, 1600);
-            });
+        if (expBtn) expBtn.addEventListener("click", function () {
+            blocks.forEach(function (b) { st.expanded[b.blockId] = true; });
+            renderTree();
         });
+        if (colBtn) colBtn.addEventListener("click", function () { st.expanded = {}; renderTree(); });
+        const pressAt = { on: false, x: 0, y: 0 };
+        function down(e) { if (e.button !== 0) return; pressAt.on = true; pressAt.x = e.clientX; pressAt.y = e.clientY; }
+        function up(e) {
+            if (!pressAt.on) return null;
+            const moved = Math.abs(e.clientX - pressAt.x) > 3 || Math.abs(e.clientY - pressAt.y) > 3;
+            pressAt.on = false;
+            if (moved || e.button !== 0) return null;
+            return hitEl(e);
+        }
+        graphView.addEventListener("pointerdown", down);
+        graphView.addEventListener("pointercancel", function () { pressAt.on = false; });
+        graphView.addEventListener("pointerup", function (e) {
+            const el = up(e);
+            if (!el) return;
+            const chip = el.closest ? el.closest("[data-toggle]") : null;
+            if (chip) {
+                const bid = chip.getAttribute("data-toggle");
+                if (st.expanded[bid]) delete st.expanded[bid]; else st.expanded[bid] = true;
+                renderTree();
+                return;
+            }
+            const n = el.closest ? el.closest("[data-bid]") : null;
+            if (n) select(n.getAttribute("data-bid"));
+        });
+        // One global Esc listener per page life: collapse the tree back to
+        // its roots (only while the tree is the visible reading). The view
+        // and renderer resolve at keypress time, so a re-rendered detail
+        // pane (hash navigation) stays reachable instead of closing over
+        // the first pane's detached nodes.
+        if (!window.__biliTreeEscBound) {
+            window.__biliTreeEscBound = true;
+            window.addEventListener("keydown", function (e) {
+                const gv = $("tree-graph");
+                if (e.key !== "Escape" || !treeViewState || !gv || gv.hidden) return;
+                treeViewState.expanded = {};
+                if (treeViewRender) treeViewRender();
+            });
+        }
+        renderTree();
+        setMode(mode);
     }
-    function bindCacheReportActions(d) {
+
+        function bindCacheReportActions(d) {
         const copyB = $("cacherpt-copy");
         const dlB = $("cacherpt-dl");
         if (!copyB || !dlB) return;
@@ -2941,6 +3606,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
             const m = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
             mitmInp.value = (m && Array.isArray(m.domains)) ? m.domains.filter((x) => typeof x === "string").join(", ") : "";
+            const ds = (draft.dsh && typeof draft.dsh === "object" && !Array.isArray(draft.dsh)) ? draft.dsh : null;
+            dshCtxRow.inp.checked = ds ? ds.contextTab !== false : true;
+            dshLblInp.value = (ds && typeof ds.contextTabLabel === "string") ? ds.contextTabLabel : "";
         }
         function commit(mutate) {
             const fresh = freshDraft();
@@ -3002,6 +3670,25 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         imgHint.className = "dim small";
         imgHint.textContent = t("cfg.q_imgrescale_hint");
         imgRow.ctl.appendChild(imgHint);
+        const dshCtxRow = row("quick-dsh-ctxtab", t("cfg.q_dsh_ctxtab"));
+        qCtrls.push(dshCtxRow.inp);
+        dshCtxRow.inp.addEventListener("change", () => commit((d) => {
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (dshCtxRow.inp.checked) delete ds.contextTab; else ds.contextTab = false;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
+        const dshCtxHint = document.createElement("span");
+        dshCtxHint.className = "dim small";
+        dshCtxHint.textContent = t("cfg.q_dsh_ctxtab_hint");
+        dshCtxRow.ctl.appendChild(dshCtxHint);
+        const dshLblInp = textRow("quick-dsh-ctxtab-label", t("cfg.q_dsh_ctxtab_label"));
+        qCtrls.push(dshLblInp);
+        dshLblInp.addEventListener("change", () => commit((d) => {
+            const v = dshLblInp.value.trim();
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (v.length > 0) ds.contextTabLabel = v; else delete ds.contextTabLabel;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
         const abRow = row("quick-absorb", t("cfg.q_absorb"));
         qCtrls.push(abRow.inp);
         abRow.inp.addEventListener("change", () => commit((d) => {
@@ -3455,15 +4142,19 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const hq = qi < 0 ? "" : hash.slice(qi + 1);
         let name = "overview";
         let detailId = null;
-        const top = hbase.match(new RegExp("^#/(overview|config|connect|logs)$"));
+        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs|blog)$"));
         if (top) {
             name = top[1];
             if (name === "logs" && hq) applyLogFilter(hq);
         } else {
             const ses = hash.match(new RegExp("^#/sessions(?:/(.+))?$")) || hash.match(new RegExp("^#/session/(.+)$"));
+            const blg = hash.match(new RegExp("^#/blog/([A-Za-z0-9_-]+)$"));
             if (ses) {
                 name = "sessions";
                 if (ses[1]) detailId = decodeURIComponent(ses[1]);
+            } else if (blg) {
+                name = "blog";
+                detailId = decodeURIComponent(blg[1]);
             }
         }
         PAGES.forEach((p) => {
@@ -3475,6 +4166,8 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (name === "overview") loadOverview();
         else if (name === "sessions") loadSessions(detailId);
         else if (name === "config") loadConfig();
+        else if (name === "updates") loadUpdates();
+        else if (name === "blog") loadBlog(detailId);
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);
@@ -3513,6 +4206,16 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         if (prev) prev.addEventListener("click", () => goToSessionPage(sesPage - 1));
         const next = $("ses-next");
         if (next) next.addEventListener("click", () => goToSessionPage(sesPage + 1));
+        // #3719 phase 2: 更新/Updates tab actions — check now / upgrade now /
+        // install selected. One shared in-flight flag (see upSetButtons).
+        const uchk = $("up-check");
+        if (uchk) uchk.addEventListener("click", () => upCheckNow());
+        const unow = $("up-upgrade-now");
+        if (unow) unow.addEventListener("click", () => upUpgradeNow());
+        const usel = $("up-select");
+        const unins = $("up-install");
+        if (usel) usel.addEventListener("change", () => { if (unins) unins.disabled = upBusyAction || !usel.value; focusChangelogRelease(usel.value); });
+        if (unins) unins.addEventListener("click", () => upInstallSelected());
         let logTimer = null;
         const lsearch = $("log-search");
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
@@ -3652,8 +4355,44 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         });
     }
 
+    // #4173: keep the in-pane tree panorama live while a session detail is open.
+    // Decorative lane: failures keep the last good frame and never touch the
+    // error strip or the #1937 backoff ladder (always resolves true). Re-renders
+    // only when the block population actually changed; the viewer's zoom
+    // (view.__vm) is restored on top of each rebuild.
+    let mapBusy = false;
+    let lastMapSig = "";
+    async function refreshTreeMap() {
+        if (mapBusy) return true;
+        const view = $("tree-graph");
+        if (!view || view.hidden) return true; // list mode: nothing live to repaint
+        const m = location.hash.match(new RegExp("^#/session/(.+)$"));
+        if (!m) return true;
+        mapBusy = true;
+        try {
+            const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(m[1]) + "/tree");
+            if (r && Array.isArray(r.blocks)) {
+                const sig = r.blocks.map(function (b) { return b.blockId + String(b.tier) + (b.active ? "a" : "") + ":" + (b.directBlockIds || []).join(","); }).join("|");
+                if (sig !== lastMapSig) {
+                    lastMapSig = sig;
+                    // #4608: repaint only the tree drawing — expansion and
+                    // selection survive the tick (the list is static DOM).
+                    const inner = view.querySelector(".tm-inner");
+                    const stv = treeViewState || { expanded: {}, selected: "" };
+                    if (inner) inner.innerHTML = renderCollapSvg(r.blocks, stv.expanded, stv.selected).html;
+                }
+            }
+        } catch (e) {
+            /* decorative lane — keep the stale frame */
+        } finally {
+            mapBusy = false;
+        }
+        return true;
+    }
+
     hydrate();
     initStaticHandlers();
+    loadChangelog();
     route();
     // #1937: failures back off exponentially (5s → 10s → … cap 60s) with a
     // persistent error strip instead of silent toast-spam retries, and a slow
@@ -3670,6 +4409,8 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             // A paged-down or searched list must not be clobbered by the background refresh.
             if (current === "sessions" && $("session-detail-view").hidden && sesPage === 1 && !hasActiveFilters()) ok = (await refreshSessions(false, 1)) && ok;
             else if (current === "logs") ok = (await loadLogs()) && ok;
+            // #4173: session DETAIL view → keep the in-pane tree panorama live.
+            else if (current === "sessions") ok = (await refreshTreeMap()) && ok;
             if (ok) { pollFailures = 0; nextPollAt = 0; hideDataError(); }
             else {
                 pollFailures += 1;

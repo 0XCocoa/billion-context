@@ -164,8 +164,10 @@ export function usageTotals(
         const read = num(usage["cache_read_input_tokens"]);
         const creation = num(usage["cache_creation_input_tokens"]);
         const any = fresh !== undefined || read !== undefined || creation !== undefined;
+        // #4128: delegate to promptInputTotal so the split-vs-inclusive decision
+        // has ONE home; `fresh ?? 0` keeps the read/creation-only degenerate case.
         return {
-            total: any ? (fresh ?? 0) + (read ?? 0) + (creation ?? 0) : undefined,
+            total: any ? promptInputTotal("anthropic", fresh ?? 0, read, creation, declaredInclusiveFromUsage(usage)) : undefined,
             cached: read,
         };
     }
@@ -197,6 +199,24 @@ export function usageTotals(
     };
 }
 
+/** #4128: read the upstream's self-declared input-token semantics from the
+ *  optional `billing_usage` sidecar. A real Anthropic response never carries it;
+ *  an anthropic-wire relay over an OpenAI backend stamps
+ *  `billing_usage.semantic="openai"` alongside the raw OpenAI usage block. Returns
+ *  true (input INCLUSIVE of cache_read), false (explicit split), or undefined
+ *  (undeclared — caller falls back to heuristics). */
+export function declaredInclusiveFromUsage(usage: Record<string, unknown>): boolean | undefined {
+    const bu = usage["billing_usage"];
+    if (bu && typeof bu === "object") {
+        const b = bu as Record<string, unknown>;
+        if (b["semantic"] === "openai") return true;
+        if (b["semantic"] === "anthropic") return false;
+        const oai = b["openai_usage"];
+        if (oai && typeof oai === "object" && typeof (oai as Record<string, unknown>)["prompt_tokens"] === "number") return true;
+    }
+    return undefined;
+}
+
 /** #408: input-side total from a protocol-native input/cached pair.
  *  OpenAI/Responses report the TOTAL (cached already included); Anthropic
  *  reports fresh-only. Some OpenAI-wire upstreams violate that and report
@@ -207,19 +227,37 @@ export function usageTotals(
  *  cached_tokens:26278} is a real ~26284-token prompt, not 6).
  *  #790: under split semantics the Anthropic cache-WRITE segment
  *  (`cache_creation_input_tokens`) is a third additive piece — part of the
- *  context size, but NOT a cache hit. */
+ *  context size, but NOT a cache hit.
+ *  #4128: an anthropic-LANE relay over an OpenAI backend reports input_tokens
+ *  INCLUSIVE of cache_read (the mirror of the #408 violation). The signal is the
+ *  billing_usage stamp (declaredInclusive=true). We deliberately do NOT infer it
+ *  from the numbers: per-object, `input >= cached` cannot distinguish an inclusive
+ *  relay from a genuine Anthropic turn whose fresh input happens to exceed the
+ *  cached prefix, so any numeric heuristic would silently under-count real
+ *  Anthropic traffic. Without an explicit stamp the lane keeps split semantics.
+ *  When inclusive, the read segment is already inside input and must not be added
+ *  back; the cache-creation piece stays additive on the Anthropic lane then too
+ *  (total = input + creation). */
 export function promptInputTotal(
     protocol: WireProtocol | undefined,
     input: number | undefined,
     cached: number | undefined,
     creation?: number,
+    declaredInclusive?: boolean,
 ): number {
     if (input === undefined) return 0;
-    const includesCached = protocol === "openai" || protocol === "responses" || protocol === "google";
-    const splitSemantics = !includesCached || (typeof cached === "number" && input < cached);
+    const wireInclusive = protocol === "openai" || protocol === "responses" || protocol === "google";
+    // Pre-existing decision, byte-for-byte unchanged for every non-Anthropic lane.
+    const baseSplit = !wireInclusive || (typeof cached === "number" && input < cached);
+    // #4128: the ONLY lane whose default can flip to inclusive here, and ONLY on an
+    // explicit upstream declaration — never inferred from the numbers (see above).
+    const anthropicInclusive = protocol === "anthropic" && declaredInclusive === true;
+    const splitSemantics = baseSplit && !anthropicInclusive;
     const additive =
         (splitSemantics && typeof cached === "number" ? cached : 0) +
-        (splitSemantics && typeof creation === "number" ? creation : 0);
+        // #790 additive piece; kept on the Anthropic lane even when the read
+        // segment is inclusive (#4128: total = input + creation, not + read).
+        ((splitSemantics || protocol === "anthropic") && typeof creation === "number" ? creation : 0);
     return input + additive;
 }
 
@@ -260,6 +298,15 @@ export interface ContextOverflowInfo {
      *  provider bills OUTPUT against the same wall as input, so preflight
      *  must fold against window − reservation. */
     requestedCompletion?: number;
+    /** #4124: per-prompt IMAGE-COUNT hard cap stated in the error body
+     *  ("Too many images in request: 165 > 30"). A COUNT, not tokens — it must
+     *  never ride the window/lastInputTokens channel (toTokenNumber rejects
+     *  sub-1000 numbers, and that channel drives TOKEN-space shrink). Presence
+     *  marks an image-count overflow; isOverflow stays token/context-only. */
+    imageCountCap?: number;
+    /** #4124: the request's own image count as the upstream counted it ("165")
+     *  — cross-check/log evidence only; bili counts occurrences itself. */
+    imageCountSeen?: number;
     /** Truncated error-body text, for logging. */
     message: string;
 }
@@ -330,6 +377,45 @@ function toTokenNumber(s: string): number | undefined {
     // A plausible window is at least a few thousand tokens; smaller numbers in
     // the message (e.g. "5 inputs", a request id) are not the window.
     return Number.isFinite(n) && n >= 1000 ? n : undefined;
+}
+
+// #4124: per-prompt IMAGE-COUNT walls — a different dimension from the token
+// patterns above. vLLM (--limit-mm-per-prompt) and gateway equivalents reject
+// by COUNT of images, so a payload far under its token window still 400s on
+// every round: images meter into tokens, but no fold decision ever looks at
+// count. The cap is small (tens), which is exactly why it cannot ride the
+// token-window channel (toTokenNumber rejects <1000; that channel drives
+// token-space shrink). Known shapes:
+//   vLLM: "Too many images in request: 165 > 30" — gateways re-serialize error
+//         bodies with HTML-style escapes, so the wire form of ">" is "\u003e"
+//         (#4124 field log); both spellings must match. $1 = the request's own
+//         count (cross-check only), $2 = the cap.
+//   generic: "At most N image(s) may be provided" — cap only.
+const IMAGE_COUNT_OVERFLOW_PATTERNS: RegExp[] = [
+    /too many images in request:\s*(\d+)\s*(?:>|\\u003e)\s*(\d+)/i,
+    /at most\s+(\d+)\s+images?\s+may be provided/i,
+];
+
+/** #4124: extract the per-prompt image-count cap (+ the request's own count,
+ *  when the body states both) from an error body. Returns an empty object
+ *  unless a positive finite cap is present — a wrong guess would shed images
+ *  the upstream actually accepts. */
+function parseImageCountCap(text: string): { cap?: number; seen?: number } {
+    let m = text.match(IMAGE_COUNT_OVERFLOW_PATTERNS[0]);
+    if (m) {
+        const seen = Number(m[1]);
+        const cap = Number(m[2]);
+        if (Number.isFinite(cap) && cap > 0) {
+            return { cap, ...(seen > 0 ? { seen } : {}) };
+        }
+        return {};
+    }
+    m = text.match(IMAGE_COUNT_OVERFLOW_PATTERNS[1]);
+    if (m) {
+        const cap = Number(m[1]);
+        if (Number.isFinite(cap) && cap > 0) return { cap };
+    }
+    return {};
 }
 
 /** Best-effort extraction of the real context window from an overflow error
@@ -416,16 +502,40 @@ export function inspectContextOverflow(status: number, bodyText: string): Contex
     if (!plausible) return { isOverflow: false, message };
     if (!bodyText) return { isOverflow: false, message };
     const isOverflow = CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
-    if (!isOverflow) return { isOverflow: false, message };
+    // #4124: the image-count wall is checked INDEPENDENTLY of the token markers
+    // — a "Too many images" body matches none of them (and must not arm any
+    // token-space machinery), yet every call site sees ONE inspection result.
+    const imageCount = parseImageCountCap(bodyText);
+    if (!isOverflow && imageCount.cap === undefined) return { isOverflow: false, message };
     const counts = parseOverflowCounts(bodyText);
     return {
-        isOverflow: true,
-        window: parseOverflowWindow(bodyText),
-        ...(counts.total !== undefined ? { requestedTotal: counts.total } : {}),
-        ...(counts.messages !== undefined ? { requestedMessages: counts.messages } : {}),
-        ...(counts.completion !== undefined ? { requestedCompletion: counts.completion } : {}),
+        isOverflow,
+        ...(imageCount.cap !== undefined ? { imageCountCap: imageCount.cap } : {}),
+        ...(imageCount.seen !== undefined ? { imageCountSeen: imageCount.seen } : {}),
+        ...(isOverflow
+            ? {
+                window: parseOverflowWindow(bodyText),
+                ...(counts.total !== undefined ? { requestedTotal: counts.total } : {}),
+                ...(counts.messages !== undefined ? { requestedMessages: counts.messages } : {}),
+                ...(counts.completion !== undefined ? { requestedCompletion: counts.completion } : {}),
+            }
+            : {}),
         message,
     };
+}
+
+// #4452: an intermediate gateway that rewrites EVERY rejection into one generic
+// body (Cherry Studio et al. strip the token counts / window from each overflow
+// 400) makes inspectContextOverflow return isOverflow:false even when the payload
+// really overflows — so bili's whole overflow self-heal (#1195 same-request
+// refold, armOverflowShrink, window learn) keys off a marker that is never there
+// and silently never engages, starving the route of calibration. This predicate
+// names exactly that shape — a 4xx overflow-SHAPED reject whose body matches no
+// pattern — so the relay can log it loudly instead of the opaque `← upstream 400`
+// line. Deliberately EXCLUDES 5xx (those already self-heal via the local estimate,
+// #604) and any body that DOES carry a marker (self-heal engages normally then).
+export function isMarkerlessOverflowReject(status: number, bodyText: string): boolean {
+    return (status === 400 || status === 413) && !CONTEXT_OVERFLOW_PATTERNS.some((p) => p.test(bodyText));
 }
 
 /** Default cap on the output-headroom reservation, as a fraction of the
@@ -565,19 +675,77 @@ export function appendSystemText(
     return base ? `${base}\n\n---\n\n${added}` : added;
 }
 
+/** #4205/#3900: positive evidence that an anthropic-wire route enforces its
+ *  input limit INDEPENDENTLY of max_tokens (separate output budget — reserving
+ *  headroom there would just shift every band down for no safety gain). Two
+ *  shapes carry that evidence: the canonical Anthropic API host (direct Claude
+ *  Code / SDK traffic), or a claude-* model id on the wire (gateway / Bedrock /
+ *  Vertex fronts of real Claude — their billing keeps the separate output
+ *  budget too). Wrapper providers on the anthropic wire (DeepSeek /anthropic)
+ *  bill completion against the SAME window and 400'd at the wall (#3900:
+ *  1,070,269 + 128,000 vs 1,048,576) — they carry no evidence here, so they
+ *  reserve. A claude-named model on a mis-billing wrapper keeps the documented
+ *  first-shot residual: one 400 per fresh baseline, then the self-heal (#4093)
+ *  and the proven-share learning (#3973) correct it. Evidence-permitlist
+ *  discipline (KDD#9): extend with traffic evidence, never wholesale. */
+const ANTHROPIC_API_HOST = "api.anthropic.com";
+const CLAUDE_MODEL_ID_PREFIX = "claude-";
+
+export function hasSeparateOutputBudgetEvidence(origin: string | undefined, modelId: string | undefined): boolean {
+    if (origin !== undefined) {
+        try {
+            if (new URL(origin).hostname.toLowerCase() === ANTHROPIC_API_HOST) return true;
+        } catch { /* unparseable origin — no evidence */ }
+    }
+    if (typeof modelId === "string" && modelId.length > CLAUDE_MODEL_ID_PREFIX.length && modelId.toLowerCase().startsWith(CLAUDE_MODEL_ID_PREFIX)) return true;
+    return false;
+}
+
 /**
- * Whether the OUTPUT budget should be reserved from the context window at all.
- * #3900: reserve on EVERY wire, including Anthropic. An over-full context degrades
- * attention everywhere, so paying up to headroomCap × window of reservation on
- * Claude routes is worth removing the "provider counts completion against the
- * window" class of 400s (DeepSeek /anthropic counted it: 1,070,269 + 128,000 vs
- * a 1,048,576 wall). Real-Claude routes — where the input limit IS enforced
- * independently of max_tokens — can recover the band once #3973 persists the
- * per-provider wall fact; until then every protocol gets the safe default. The
- * parameter stays for call-site stability across that follow-up.
+ * Whether the OUTPUT budget should be reserved from the context window for
+ * THIS request. Every wire reserves by default — unknown/other protocols
+ * included (conservative: a missed reservation at worst overflows once and
+ * the self-heal corrects it). The Anthropic Messages API family is the one
+ * whose canonical routes enforce the input limit INDEPENDENTLY of max_tokens,
+ * so only routes carrying positive separate-wall evidence
+ * (hasSeparateOutputBudgetEvidence) are exempt; everything else on the wire
+ * reserves (#4205: the blanket protocol exemption was what let wrapper
+ * providers on that wire 400 at the wall, #3900). Absent origin/model
+ * evidence the call degrades to "reserve", never to "exempt". Proven-share
+ * overrides (#3973) compose at the call site: live overflow evidence can
+ * force a reservation even on an exempt route.
  */
-export function shouldReserveOutputHeadroom(_protocol?: string): boolean {
+export function shouldReserveOutputHeadroom(protocol: string | undefined, origin?: string, modelId?: string): boolean {
+    if (protocol === "anthropic") return !hasSeparateOutputBudgetEvidence(origin, modelId);
     return true;
+}
+
+/**
+ * The completion share an upstream PROVED it bills inside the context wall for
+ * one (origin, model) pair, or 0 when this request cannot claim that proof.
+ *
+ * #3450 learns the share from a rejected request but books it on the one-shot
+ * overflow arm, which retires on the next usage report (#1110) — the wrong
+ * lifetime for "this endpoint counts max_tokens inside the window", a PROVIDER
+ * fact that survives the fold which recovered the turn. Dropping it re-judges
+ * every later turn on the declared window, so an anthropic-wire host that bills
+ * completion inside the wall (DeepSeek's /anthropic: 1048576 stated,
+ * "requested 1370540 (1114540 in the messages, 256000 in the completion)")
+ * over-fills, 400s, and pays a new emergency fold each time.
+ *
+ * Scoped: a route or model change returns 0 and falls back to the plain
+ * protocol rule, never silently reserving on an unrelated upstream.
+ */
+export function provenCompletionReserve(
+    stats: { provenCompletionWall?: number; provenCompletionWallOrigin?: string; provenCompletionWallModel?: string } | undefined,
+    origin: string | undefined,
+    model: string | undefined,
+): number {
+    const wall = stats?.provenCompletionWall;
+    if (typeof wall !== "number" || !Number.isFinite(wall) || wall <= 0) return 0;
+    if (origin === undefined || origin === "" || stats?.provenCompletionWallOrigin !== origin) return 0;
+    if (model === undefined || model === "" || stats?.provenCompletionWallModel !== model) return 0;
+    return wall;
 }
 
 /** System-carrier texts of a parsed request body, covering all four wire shapes:

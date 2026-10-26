@@ -18,6 +18,7 @@ import { _resetSessionsForTest, getSession, markDirty } from "../src/session.ts"
 import { _setForTest } from "../src/registry.ts";
 import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
 import { contentStoreOf } from "../src/store.ts";
+import { closeServers } from "./server-close-guard.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-fork-"));
@@ -113,7 +114,7 @@ async function harness(persist = false, seedParent = true, compressExtra: Record
         assert.equal(r.status, 200);
         await r.text();
     }
-    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); await closeServers([proxy, upstream], "plugin-fork harness"); } };
 }
 
 test("plain proxy panel snapshots do not change raw-history persistence", { timeout: 60_000 }, async () => {
@@ -746,12 +747,27 @@ test("HTTP fork revision and originals survive a new proxy process", { timeout: 
     let child: ReturnType<typeof spawn> | undefined;
     try {
         await compress(h);
+        // CI-only race (#4599): the compress fold lands in the live session
+        // state asynchronously after the tool response (#3573 replay
+        // semantics). On slow runners flushSync below would otherwise persist
+        // the pre-fold state and the cold load reports "0 block(s)
+        // (compressions=0)". Bounded-wait for the fold first.
+        for (let i = 0; i < 100 && !(resolveConversation("parent").session?.state.blocks?.length ?? 0); i++) {
+            await new Promise((r) => setTimeout(r, 50));
+        }
         const parent = resolveConversation("parent").session!;
         parent.metadata.effectiveCcr = { ...DEFAULT_CCR_CONFIG, enabled: true };
         parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
         parent.contentStoreDirty = true;
         assert(h.store.flushSync(parent));
-        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), JSON.parse(JSON.stringify(parent.state)));
+        // #4316 PR3/3: cold load runs the one-time ledger alignment, but only
+        // when the unified store is available — config-clean machines (CI) run
+        // legacy mode where the alignment is an honest skip and the loaded
+        // state never carries refLedgerAligned. Mirror the mode in the
+        // expectation instead of asserting the flag unconditionally.
+        const persistedState = JSON.parse(JSON.stringify(parent.state));
+        if (h.store.replicasAvailable()) persistedState.refLedgerAligned = true;
+        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), persistedState);
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
         const req = forkRequest(snapshot);
         const fork = await h.request("/__bili/plugin/fork", req);
