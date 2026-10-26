@@ -589,7 +589,7 @@ class ResponsesWsResponse extends http.ServerResponse {
 // transport with its continuation checkpoints, and the SSE response sink that
 // re-frames pipeline output for the client.
 
-class ResponsesWsSession implements WsBridgeSession {
+export class ResponsesWsSession implements WsBridgeSession {
     private readonly transport: ResponsesWsUpstream;
     private readonly history = new ResponsesWsHistory();
     private active?: ResponsesWsResponse;
