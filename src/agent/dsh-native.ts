@@ -718,6 +718,12 @@ async function bootstrap(): Promise<string | undefined> {
     } catch (err) {
         const msg = `proxy bootstrap failed — model traffic goes direct (uncompressed): ${errMessage(err)}`;
         persistClientEvent(msg);
+        // #4811: a one-shot bootstrap failure must not become permanent. Plan-time
+        // arming normally covers this, but this is where the failure IS KNOWN —
+        // arm the recovery driver here so a base-less register always has a
+        // re-spawn loop behind it. Idempotent; the timer clears itself once
+        // healthy again (#4755 clear condition).
+        armRecoveryTimer();
         return undefined;
     }
 }
