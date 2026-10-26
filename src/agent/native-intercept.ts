@@ -600,8 +600,12 @@ function fallbackOversizeRefusal(
     doom: { coreBytes: number; mediaBytes: number; floorTokens: number; window: number; declaredWindow: number },
     reason?: UnavailableReason,
 ): Response {
+    // #4824: "send-failed" reads as died here too — the proxy WAS live and
+    // died mid-session; the give-up reason slot keeps the branch name for the
+    // fire-time consumer (#4125), while this steady-state wording cares only
+    // about died-vs-never-came-up-vs-busy.
     const why =
-        reason === "dead"
+        reason === "dead" || reason === "send-failed"
             ? "the bili proxy died and no replacement came up"
             : reason === "busy-exhausted"
               ? "the bili proxy is alive but unresponsive within the wait budget (#3654)"
