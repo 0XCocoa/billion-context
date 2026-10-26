@@ -1789,6 +1789,25 @@ export function settleUsageReport(
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
+        // #4805 source gate: a usage sample an order of magnitude SMALLER than
+        // the session's current usage-grade anchor is side-lane pollution (a
+        // 2-message auxiliary request under the same session id), not a main-
+        // lane measurement — writing it froze compression until the context
+        // blew the window. Skip the ANCHOR fields (counters and calibration
+        // still run; a later main-lane report restores them). One-directional:
+        // only a far-SMALLER sample is gated. Exempt settles carrying a
+        // compress credit — those are our own post-fold re-requests, whose
+        // shrinkage is the fold's doing, not a lane change.
+        const prevAnchor = session.stats.lastInputTokens;
+        const prevUsageGrade = session.stats.lastInputTokensSource === "usage";
+        const sideLaneSample = prevUsageGrade && prevAnchor > 0
+            && (session.stats.compressCreditTokens ?? 0) <= 0
+            && s.total * 8 < prevAnchor;
+        if (sideLaneSample) {
+            session.stats.inputTokens += s.total;
+            loggerLog("info", `[${session.id}] usage sample ${s.total} tok is ~${Math.round(prevAnchor / Math.max(1, s.total))}× smaller than the ${prevAnchor}-tok anchor — treated as side-lane traffic, anchor kept (#4805)`);
+            return;
+        }
         session.stats.inputTokens += s.total;
         // Net out this turn's compress credit: the post-compress re-request
         // re-sends the unfolded history, so its usage report over-reports the
