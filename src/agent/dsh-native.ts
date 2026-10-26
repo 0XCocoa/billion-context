@@ -1402,7 +1402,6 @@ async function bodyJsonOf(init: RequestInit | undefined): Promise<unknown> {
     }
 }
 
-
 async function maybeForkAdoptBeforeSend(ctx: PluginContext, init: RequestInit | undefined): Promise<void> {
     const child = forkChildVerdict(ctx);
     if (!child.ok) {
