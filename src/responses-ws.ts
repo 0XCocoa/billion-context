@@ -1,7 +1,8 @@
 import http from "node:http";
 import { WebSocket as UpstreamWebSocket, type Dispatcher } from "undici";
 import WebSocket from "ws";
-import { MAX_REQUEST_BYTES, fetchWithTimeout, type FetchOptions } from "./fetch-util.js";
+import { fetchWithTimeout, type FetchOptions } from "./fetch-util.js";
+import { limitsReceiveBytes } from "./knobs.js";
 import { markWsLaneTransport, withFetchTransport } from "./fetch-transport.js";
 import { BILI_HOP_HEADER } from "./server/context-window.js";
 import { connectionNamedHeaders, stripRemoteCompactionBetaFeature, UPSTREAM_HOP_HEADERS } from "./server/headers.js";
@@ -144,6 +145,7 @@ interface Checkpoint {
 class ResponsesWsOutput {
     private items = new Map<number, { item: JsonObject; bytes: number }>();
     private bytes = 0;
+    constructor(private readonly limitBytes = limitsReceiveBytes()) {}
 
     observe(frame: JsonObject): JsonObject | undefined {
         if (frame.type === "response.created") {
@@ -154,7 +156,7 @@ class ResponsesWsOutput {
             const index = frame.output_index as number;
             const bytes = Buffer.byteLength(JSON.stringify(frame.item));
             this.bytes += bytes - (this.items.get(index)?.bytes ?? 0);
-            if (this.bytes > MAX_REQUEST_BYTES) throw new Error("Responses WebSocket checkpoint buffer limit exceeded");
+            if (this.bytes > this.limitBytes) throw new Error("Responses WebSocket checkpoint buffer limit exceeded");
             this.items.set(index, { item: frame.item, bytes });
         }
         if (frame.type !== "response.completed" || !object(frame.response)) return undefined;
@@ -174,6 +176,7 @@ class ResponsesWsOutput {
 
 export class ResponsesWsHistory {
     private checkpoint?: Checkpoint;
+    constructor(private readonly limitBytes = limitsReceiveBytes()) {}
 
     expand(frame: JsonObject): JsonObject {
         const { type: _type, previous_response_id: previous, ...request } = frame;
@@ -206,7 +209,7 @@ export class ResponsesWsHistory {
 
     commit(request: JsonObject, response: unknown): void {
         if (!object(response) || response.status !== "completed" || typeof response.id !== "string" || !Array.isArray(response.output)) return;
-        if (Buffer.byteLength(JSON.stringify(request)) + Buffer.byteLength(JSON.stringify(response.output)) > MAX_REQUEST_BYTES) {
+        if (Buffer.byteLength(JSON.stringify(request)) + Buffer.byteLength(JSON.stringify(response.output)) > this.limitBytes) {
             this.clear();
             return;
         }
@@ -235,7 +238,7 @@ export class ResponsesWsUpstream {
     private history = new ResponsesWsHistory();
     private active?: { fail: (error: Error, reason?: string) => void };
 
-    constructor(private readonly log: DiagnosticLog = () => {}, private readonly requestBytes = MAX_REQUEST_BYTES, private readonly hopStamp?: string, private readonly forwardTransportFields = false) {}
+    constructor(private readonly log: DiagnosticLog = () => {}, private readonly requestBytes = limitsReceiveBytes(), private readonly hopStamp?: string, private readonly forwardTransportFields = false) {}
 
     private resetHistory(reason: string): void {
         this.history.clear();
@@ -420,7 +423,7 @@ export class ResponsesWsUpstream {
             const message = (event: { data: unknown }): void => {
                 if (ended) return;
                 try {
-                    if (typeof event.data !== "string" || Buffer.byteLength(event.data) > MAX_REQUEST_BYTES) throw new Error("Invalid or oversized Responses WebSocket frame");
+                    if (typeof event.data !== "string" || Buffer.byteLength(event.data) > this.requestBytes) throw new Error("Invalid or oversized Responses WebSocket frame");
                     const frame: unknown = JSON.parse(event.data);
                     if (!object(frame) || typeof frame.type !== "string") throw new Error("Invalid Responses WebSocket event");
                     receivedEvents++;
@@ -506,6 +509,7 @@ class ResponsesWsResponse extends http.ServerResponse {
     private sent = false;
     private buffer = "";
     private readonly decoder = new TextDecoder();
+    private readonly limitBytes = limitsReceiveBytes();
     private readonly output = new ResponsesWsOutput();
     response?: JsonObject;
     restoredOutputItems = 0;
@@ -524,11 +528,11 @@ class ResponsesWsResponse extends http.ServerResponse {
         this.sent = true;
         const cb = typeof encoding === "function" ? encoding : callback;
         this.buffer += typeof chunk === "string" ? chunk : this.decoder.decode(chunk, { stream: true });
-        if (this.buffer.length > MAX_REQUEST_BYTES) throw new Error("Responses WebSocket output buffer limit exceeded");
+        if (this.buffer.length > this.limitBytes) throw new Error("Responses WebSocket output buffer limit exceeded");
         this.buffer = normalizeSseLineEndings(this.buffer);
         this.drainSse();
         cb?.();
-        if (this.peer.bufferedAmount > MAX_REQUEST_BYTES) {
+        if (this.peer.bufferedAmount > this.limitBytes) {
             this.peer.close(1013, "Output buffer limit exceeded");
             this.destroy();
         }
@@ -592,6 +596,7 @@ class ResponsesWsResponse extends http.ServerResponse {
 export class ResponsesWsSession implements WsBridgeSession {
     private readonly transport: ResponsesWsUpstream;
     private readonly history = new ResponsesWsHistory();
+    private readonly budget = limitsReceiveBytes();
     private active?: ResponsesWsResponse;
     private busy = false;
 
@@ -613,6 +618,7 @@ export class ResponsesWsSession implements WsBridgeSession {
             peer.send(errorFrame(code, message, status));
         };
         let body: JsonObject;
+        let wire = "";
         try {
             const frame: unknown = JSON.parse(data.toString());
             if (!object(frame) || frame.type !== "response.create") {
@@ -624,9 +630,13 @@ export class ResponsesWsSession implements WsBridgeSession {
                 refuse("invalid_request", `response.create carries unsupported transport option(s): ${unsupported.join(", ")}`, 400);
                 return;
             }
+            // One serialization per turn (#4804): admission measures the same wire
+            // string the envelope pushes below, against the receive budget knob
+            // instead of the fixed 100 MiB cap that killed long sessions pre-dispatch.
             body = { ...this.history.expand(frame), stream: true };
-            if (Buffer.byteLength(JSON.stringify(body)) > MAX_REQUEST_BYTES) {
-                refuse("request_too_large", `response.create exceeds the ${Math.round(MAX_REQUEST_BYTES / (1024 * 1024))} MiB request limit`, 413);
+            wire = JSON.stringify(body);
+            if (Buffer.byteLength(wire) > this.budget) {
+                refuse("request_too_large", `response.create exceeds the ${Math.round(this.budget / (1024 * 1024))} MiB request limit`, 413);
                 return;
             }
         } catch (error) {
@@ -675,7 +685,7 @@ export class ResponsesWsSession implements WsBridgeSession {
                         const { done, value } = await reader.read();
                         if (done) break;
                         buffer += decoder.decode(value, { stream: true });
-                        if (buffer.length > MAX_REQUEST_BYTES) throw new Error("Warmup output buffer limit exceeded");
+                        if (buffer.length > this.budget) throw new Error("Warmup output buffer limit exceeded");
                         for (;;) {
                             const index = buffer.indexOf("\n\n");
                             if (index < 0) break;
@@ -721,7 +731,7 @@ export class ResponsesWsSession implements WsBridgeSession {
         req.url = source.url;
         Object.assign(req.headers, handshakeHeaders);
         req.headers["content-type"] = "application/json";
-        req.push(Buffer.from(JSON.stringify(body)));
+        req.push(Buffer.from(wire));
         req.push(null);
         const res = new ResponsesWsResponse(req, peer);
         res.on("error", () => {});
