@@ -479,7 +479,7 @@ export const WEB_CLIENT = `(function () {
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
     }
 
-    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs"];
+    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs", "blog"];
     let current = "overview";
     let sessionsCache = [];
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
@@ -629,9 +629,14 @@ export const WEB_CLIENT = `(function () {
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</span></td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td>' + savedTd(s) + '<td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         } else {
             const clientHint = s.clientHint ? String(s.clientHint) : "";
+            // #4571: inline sessions carry a lane chip beside the client hint so
+            // "did this run in-process?" is visible in the list, not just detail.
+            const laneChip = s.engineLane === "inline"
+                ? ' <span class="badge proto" title="' + escapeHtml(t("det.engine_lane_inline")) + '">inline</span>'
+                : s.engineLane === "server" ? ' <span class="badge proto dim" title="' + escapeHtml(t("det.engine_lane_server")) + '">srv</span>' : "";
             const clientCell = clientHint
-                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>"
-                : '<span class="dim">' + t("common.none") + "</span>";
+                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>" + laneChip
+                : '<span class="dim">' + t("common.none") + "</span>" + laneChip;
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td class="client-cell">' + clientCell + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         }
         let navTimer = null;
@@ -865,6 +870,64 @@ function changelogCatOf(rawLine) {
         // the snapshot — keep the buttons held down until it settles.
         if (st.checking || st.installing) upSetButtons(true);
     }
+    // #4587: panel-embedded blog & articles — the server renders the bundled
+    // markdown with web/markdown.ts (escaped by construction), so this side only
+    // lays out cards and expands bodies. Language rides the page-level locale;
+    // switching languages reloads the page, so no incremental re-render hook.
+    let blogCache = null;
+    async function loadBlog(sub) {
+        const host = $("bl-list");
+        if (!host) return;
+        let data = blogCache;
+        if (!data) {
+            try {
+                data = blogCache = await json(API_ROOT + "/blog");
+            } catch (e) {
+                host.innerHTML = "";
+                toast(t("toast.failed", { msg: e.message }), "err");
+                return;
+            }
+        }
+        const items = (data && Array.isArray(data.items)) ? data.items : [];
+        const zhOn = locale === "zh-CN";
+        if (sub) {
+            const item = items.find((x) => String(x.id) === String(sub)) || null;
+            if (!item) {
+                host.innerHTML = '<div class="card"><div class="card-b"><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a> " + escapeHtml(t("bl.nf")) + "</div></div>";
+                return;
+            }
+            const kindLabel = item.kind === "post" ? t("bl.kind_post") : t("bl.kind_article");
+            const title = zhOn && item.titleZh ? item.titleZh : (item.title || "");
+            const html = zhOn ? (item.htmlZh || item.html || "") : (item.html || "");
+            host.innerHTML = '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a></div>"
+                + '<h3 class="bl-h">' + escapeHtml(title) + "</h3>"
+                + '<div class="card-b post-body">' + html + "</div></div>";
+            return;
+        }
+        if (!items.length) {
+            const wrap = document.createElement("div");
+            wrap.className = "card";
+            const box = document.createElement("div");
+            box.className = "card-b";
+            box.textContent = t("bl.empty");
+            wrap.appendChild(box);
+            host.innerHTML = "";
+            host.appendChild(wrap);
+            return;
+        }
+        host.innerHTML = '<div class="card">' + items.map((it) => {
+            const title = zhOn && it.titleZh ? it.titleZh : (it.title || "");
+            const alt = zhOn ? (it.title || "") : (it.titleZh || "");
+            let kindLabel;
+            if (it.kind === "post") kindLabel = t("bl.kind_post");
+            else kindLabel = t("bl.kind_article");
+            return '<a class="bl-row" href="#/blog/' + encodeURIComponent(String(it.id)) + '">'
+                + '<span class="mono bl-date">' + escapeHtml(it.date || "\u2014") + '</span>'
+                + '<span class="badge">' + escapeHtml(kindLabel) + '</span>'
+                + '<span class="bl-title">' + escapeHtml(title) + (alt ? ' <span class="bl-title-alt">' + escapeHtml(alt) + "</span>" : "") + "</span>"
+                + '<span class="bl-arrow">&#8594;</span></a>';
+        }).join("") + "</div>";
+    }
     async function loadUpdates() {
         try {
             const [st, cl] = await Promise.all([json(API_ROOT + "/update/state"), json(API_ROOT + "/changelog")]);
@@ -956,6 +1019,7 @@ function changelogCatOf(rawLine) {
                 pb.appendChild(tr);
             });
             $("sys-version").textContent = d.version ? (d.commit ? d.version + " (" + d.commit + ")" : d.version) : "?";
+            $("sys-lane").textContent = d.origin || t("common.none");
             $("sys-disk-version").textContent = d.diskVersion || t("common.none");
             $("sys-inflight").textContent = String(d.inFlight || 0);
             const bt = d.blindTunnels || {};
@@ -2516,6 +2580,8 @@ function changelogCatOf(rawLine) {
         if (d.label && d.label !== d.id) kv(parts, t("common.label"), d.label);
         kv(parts, t("common.protocol"), d.protocol || null, true);
         kv(parts, t("det.client_hint"), d.clientHint || null, true);
+        // #4571: engine lane — in-process (inline) vs standalone proxy process.
+        kv(parts, t("det.engine_lane"), d.engineLane === "inline" ? t("det.engine_lane_inline") : d.engineLane === "server" ? t("det.engine_lane_server") : null, true);
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
         // #2740: session-level notice — auto-mode verdicts here are bili-local, not model judgments.
         if (d.autoModeForge) kv(parts, t("det.auto_mode_forge"), t("det.auto_mode_forge_local") + " · " + d.autoModeForge.count + "×" + (d.autoModeForge.lastVariant || "?") + " · " + timeAgo(d.autoModeForge.lastAt), true);
@@ -4069,15 +4135,19 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const hq = qi < 0 ? "" : hash.slice(qi + 1);
         let name = "overview";
         let detailId = null;
-        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs)$"));
+        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs|blog)$"));
         if (top) {
             name = top[1];
             if (name === "logs" && hq) applyLogFilter(hq);
         } else {
             const ses = hash.match(new RegExp("^#/sessions(?:/(.+))?$")) || hash.match(new RegExp("^#/session/(.+)$"));
+            const blg = hash.match(new RegExp("^#/blog/([A-Za-z0-9_-]+)$"));
             if (ses) {
                 name = "sessions";
                 if (ses[1]) detailId = decodeURIComponent(ses[1]);
+            } else if (blg) {
+                name = "blog";
+                detailId = decodeURIComponent(blg[1]);
             }
         }
         PAGES.forEach((p) => {
@@ -4090,6 +4160,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         else if (name === "sessions") loadSessions(detailId);
         else if (name === "config") loadConfig();
         else if (name === "updates") loadUpdates();
+        else if (name === "blog") loadBlog(detailId);
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);

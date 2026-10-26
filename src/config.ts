@@ -782,6 +782,11 @@ export type ProxyOptions = {
     port: number;
     host: string;
     upstream: string;
+    /** #4571: set by the inline lane at boot (startInlineEngine) — true when
+     *  these options belong to the in-process engine instead of a spawned
+     *  proxy server. Display-only downstream (the status panel appends
+     *  " · inline"), never read for control flow. */
+    inlineLane?: boolean;
     routes: ProviderRoutes;
     /** Named dialing recipes from the providers table (pi/opencode idiom) —
      *  referenced by `compress.externalSummary.targets` ("glm/glm-4.9-flash").
@@ -1073,6 +1078,26 @@ function warnInertMitmLaneKeys(routes: ProviderRoutes, env: NodeJS.ProcessEnv): 
     }
 }
 
+/** #3675: compress-block keys written on the ROUTE ROOT (URL lane or named
+ *  entry) are silently dropped by parseRouteEntry — the same silent-inert
+ *  class as the #1469 routing fields, one level down. Recognition is
+ *  COMPRESS_SETTING_FIELDS (defined below; kept in sync with
+ *  parseCompressSettings): every member is inert at a route root, and none of
+ *  them may be added to parseRouteEntry's whitelist while this warning exists.
+ *  Dialing recipes are skipped — their own parser rejects unknown root fields
+ *  loudly (parseNamedProviderRecipe throws → chain disabled with a warning),
+ *  so a second signal here would only add noise. */
+function warnCompressOnlyFieldsAtRouteRoot(key: string, obj: Record<string, unknown> | null): void {
+    if (!obj) return;
+    if (obj.baseUrl !== undefined || obj.api !== undefined) return;
+    const misplaced = Object.keys(obj).filter((f) => obj[f] !== undefined && COMPRESS_SETTING_FIELDS.has(f));
+    if (misplaced.length === 0) return;
+    warnNamedProviderOnce(
+        `route-root-compress:${key}:${misplaced.join(",")}`,
+        `providers."${key}" carries compress-block keys [${misplaced.join(", ")}] at the route root — they are inert there (move them under providers."${key}".compress to apply)`,
+    );
+}
+
 /** True when the providers-map key is itself a URL lane (http/https/mitm
  *  scheme — mitm:// is the README-documented lookup key for MITM traffic).
  *  Anything else is a NAMED key (provider id): routing-inert on its own,
@@ -1257,6 +1282,10 @@ export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes
         if (!route) return;
         const obj = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
         const urlLike = isUrlLikeKey(key);
+        // Before the bind branch on purpose: these keys are inert even on a
+        // validly bound alias — parseRouteEntry never parses them, so the
+        // fold onto the target lane cannot carry them.
+        warnCompressOnlyFieldsAtRouteRoot(key, obj);
         if (obj && "bind" in obj) {
             const bind = obj.bind;
             if (typeof bind !== "string") {
@@ -1874,11 +1903,22 @@ type FileConfig = {
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
      *  deprecated fallback, read only while this section is absent.
-     *  `inline` (#3278): run the pi lane's compression IN-PROCESS (no spawned
-     *  proxy) — the config-file home of the BILI_PI_INLINE knob, resolved
-     *  env > file > default(off); BILI_PI_INLINE=0/false explicitly disables
-     *  it over the file. */
+     *  `inline` (#3278, OPT-IN — default stays the spawned proxy, #4687
+     *  reverts the #4571 default flip): run the pi lane's compression
+     *  IN-PROCESS — no proxy server spawned. Enable with `true` (or
+     *  BILI_PI_INLINE=1/on/yes/TRUE). Resolved env > file; an explicit
+     *  inline choice beats an announced attach target (launcher-set
+     *  BILLION_CONTEXT_PROXY/ATTACH); when unset the lane behaves exactly
+     *  as before (attach/spawn). */
      pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
+    /** Built-in opencode-lane inline switch (#3278 port, OPT-IN — default
+     *  stays the spawned proxy, per owner decision on #4687): run the
+     *  opencode lane's compression IN-PROCESS — no proxy server spawned.
+     *  Enable with `true` (or BILI_OPENCODE_INLINE=1/on/yes/TRUE). Resolved
+     *  env > file; an explicit inline choice beats an announced attach
+     *  target (launcher-set BILLION_CONTEXT_PROXY/ATTACH); when unset the
+     *  lane behaves exactly as before (attach/spawn). */
+    opencode?: { inline?: boolean };
     /** Feature rollout (canary) block (#3062, resolved by src/rollout.ts):
      *  per-feature overrides of the version's baked-in rollout plan
      *  (ROLLOUT_FEATURES). `installId` pins the bucketing identity instead of
@@ -2207,7 +2247,7 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
-    "reconcile", "streamSummary",
+    "reconcile", "streamSummary", "externalSummary",
     // #3635: summary-length caps — previously accepted nowhere, silently dropped.
     "maxSummaryLength", "minSummaryLength",
 ]);
