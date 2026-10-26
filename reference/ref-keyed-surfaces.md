@@ -16,7 +16,7 @@
 | Surface | Keyed by | Status | Consequence if unmigrated |
 |---|---|---|---|
 | `blocks[].startRef/endRef` | ref strings | **stale after restamp** (display) | nudge block map + decompress receipts print old numbers (`resolveBlockSpan` prefers them) — fix: prefer `startSeq/endSeq`-derived live refs |
-| `state.deadRefs` | ref numbers | **stale** | number-keyed `excludeDeadRefRanges` over-filters the NEW owner of a dead number (safe direction, wrong behavior) — fix: remap in the restamp pass |
+| `state.deadRefs` | ref numbers | migrated by the restamp pass (translate via pre-pass map; tombstones the final map vends as live are dropped — a re-granted number is not a hole; empty ⇒ undefined) | unmigrated, it over-filters the NEW owner of a dead number via `excludeDeadRefRanges` (safe direction, wrong behavior) |
 | `state.hiddenOrphanRefs` | refs | stale | hidden orphan pairs resurrect mid-history (#3769 regression class) |
 | `state.emergencyTruncateLatch[].ref`, `renderDeferredRefs`, `viewLatches`, `pendingOrphanSweepMinRef` | refs/number | stale | latch misses → replay divergence → prefix-cache churn (one-time rewrite) |
 | `messages.ref_num` (unified store rows) | ref number | **index-time, never rewritten** | web leaf hydration + export JSONL query NEW numbers against OLD rows → silent misses for the renumbered band (#4738 family) |

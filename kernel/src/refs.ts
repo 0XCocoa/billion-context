@@ -313,7 +313,14 @@ export function restampRefsToLedger(
     if (block.endRef) block.endRef = translateRef(block.endRef);
   }
   if (state.deadRefs) {
-    state.deadRefs = state.deadRefs.map(translateRef);
+    // Organic tombstones are absent from the PRE-pass map and survive the
+    // translation verbatim — but the pass can still hand such a number to
+    // another message as a seq+1 target, which voids the hole claim (a live
+    // number is not a hole): drop tombstones the final map vends as live,
+    // same collision band as the superseded prune above. Empty ⇒ undefined
+    // per the #3302 discipline.
+    const moved = state.deadRefs.map(translateRef).filter((d) => byRef[d] === undefined);
+    state.deadRefs = moved.length > 0 ? moved : undefined;
   }
 
   state.messageRefs = { byRaw, byRef };

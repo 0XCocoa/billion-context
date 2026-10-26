@@ -68,8 +68,30 @@ test("restamp migrates block startRef/endRef and deadRefs onto the new numbering
     // Block's stored span rides the migration: e's old m6 → e's new m5.
     assert.equal((state.blocks[0] as { startRef?: string }).startRef, "m00005");
     assert.equal((state.blocks[0] as { endRef?: string }).endRef, "m00005");
-    // deadRefs translate to the same id's current number (b: m3 → m2).
-    assert.deepEqual(state.deadRefs, ["m00002"]);
+    // deadRefs: m00003 translates onto b's current number m00002 — but that
+    // number is LIVE post-pass, so the hole claim is void and the entry is
+    // dropped (#4797 collision band; empty ⇒ undefined per the #3302 rule).
+    assert.equal(state.deadRefs, undefined);
+});
+
+test("restamp drops organic tombstones whose number the pass re-grants, keeps free ones (#4797 registry residual)", () => {
+    const { state, seq } = driftedState();
+    // m00002/m00005 are free pre-pass (organic tombstone candidates) and both
+    // become seq+1 targets in this sweep (b→m2, e→m5); m00008 stays free.
+    state.deadRefs = ["m00002", "m00005", "m00008"];
+    restampRefsToLedger(state, seq);
+    assert.deepEqual(
+        state.deadRefs,
+        ["m00008"],
+        "re-granted tombstones dropped, genuinely-free ones kept",
+    );
+});
+
+test("restamp leaves deadRefs undefined when every tombstone was re-granted (#4797 empty discipline)", () => {
+    const { state, seq } = driftedState();
+    state.deadRefs = ["m00002"];
+    restampRefsToLedger(state, seq);
+    assert.equal(state.deadRefs, undefined, "empty ⇒ undefined (#3302 discipline)");
 });
 
 test("refLedgerAligned survives the kernel's own state clones (sync node + applyCompression)", () => {
