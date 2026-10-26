@@ -251,16 +251,17 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
             // #4833: safe per-attempt diagnostics appended to every failure line —
             // elapsed time, configured budgets, wire shape and size estimates, so a
             // deadline abort is distinguishable from a provider rejection at a glance.
-            const diagnosticBits = [
-                `elapsed=${Math.round(performance.now() - startedAt)}ms`,
+            const staticDiagBits = [
                 `budget target=${budget?.targetTimeoutMs ?? "?"}ms total=${budget?.totalTimeoutMs ?? "?"}ms`,
                 `protocol=${plan.protocol}`,
                 `stream=${plan.stream ?? false}`,
                 `payload≈${Buffer.byteLength(body, "utf8")}B`,
                 `input≈${inputTokens}tok`,
             ];
-            if (work.maxSummaryChars !== undefined) diagnosticBits.push(`outCap=${work.maxSummaryChars}ch`);
-            const diagnostics = diagnosticBits.join(", ");
+            if (work.maxSummaryChars !== undefined) staticDiagBits.push(`outCap=${work.maxSummaryChars}ch`);
+            // Elapsed is evaluated at each failure site below — joining it once up
+            // here would freeze it near zero for every attempt of the retry loop.
+            const diagnostics = (): string => [`elapsed=${Math.round(performance.now() - startedAt)}ms`, ...staticDiagBits].join(", ");
             let attempt = 0;
             for (;;) {
                 attempt += 1;
@@ -282,7 +283,7 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
                     if (source === "target-timeout" || source === "batch-deadline") kind = source;
                     else if (source === "cancelled") kind = "client-abort";
                     else { retryable = classifyUpstreamFailure(error, { viaProxy: plan.proxyUrl !== undefined, externalAborted: signal.aborted }); kind = retryable; }
-                    loggerLog("warn", `[external-summary] candidate ${plan.model} attempt ${attempt}/${SUMMARY_MAX_ATTEMPTS} failed before response (${kind}; ${diagnostics}): ${maskUrlsInText(error instanceof Error ? error.message : String(error))}`);
+                    loggerLog("warn", `[external-summary] candidate ${plan.model} attempt ${attempt}/${SUMMARY_MAX_ATTEMPTS} failed before response (${kind}; ${diagnostics()}): ${maskUrlsInText(error instanceof Error ? error.message : String(error))}`);
                     if (retryable !== undefined && attempt < SUMMARY_MAX_ATTEMPTS && !signal.aborted && isFailFastUpstreamKind(retryable)) {
                         await waitBeforeRetry(backoffDelayMs(attempt), signal);
                         continue;
@@ -293,7 +294,7 @@ export function createSummaryHttpCandidate(target: SummaryHttpTarget, maxRespons
                     if (!dispatched.response.ok) {
                         const snippet = await readErrorSnippet(dispatched.response);
                         // Mask only for the log line: the verdict below needs the raw body markers.
-                        loggerLog("warn", `[external-summary] candidate ${plan.model} attempt ${attempt}/${SUMMARY_MAX_ATTEMPTS} rejected: HTTP ${dispatched.response.status} (${diagnostics}) from ${host}${snippet ? ` — ${maskUrlsInText(snippet)}` : ""}`);
+                        loggerLog("warn", `[external-summary] candidate ${plan.model} attempt ${attempt}/${SUMMARY_MAX_ATTEMPTS} rejected: HTTP ${dispatched.response.status} (${diagnostics()}) from ${host}${snippet ? ` — ${maskUrlsInText(snippet)}` : ""}`);
                         if (attempt < SUMMARY_MAX_ATTEMPTS && !signal.aborted && isTransientUpstreamError(dispatched.response.status, snippet)) {
                             await waitBeforeRetry(retryAfterDelayMs(dispatched.response.headers.get("retry-after"), backoffDelayMs(attempt)), signal);
                             continue;

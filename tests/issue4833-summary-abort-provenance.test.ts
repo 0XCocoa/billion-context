@@ -97,6 +97,11 @@ test("issue 4833: a stalled response past the target budget logs target-timeout 
     assert.ok(!failed[0].includes("client-abort"), failed[0]);
     // Ask #2: elapsed time, configured budgets, wire shape and size estimates.
     assert.ok(/elapsed=\d+ms/.test(failed[0]), failed[0]);
+    // #4839 review fix: the value must reflect the real ~200ms hang, not a
+    // pre-dispatch snapshot frozen near zero (timers never fire early).
+    const elapsedMatch = failed[0].match(/elapsed=(\d+)ms/);
+    assert.ok(elapsedMatch, failed[0]);
+    assert.ok(Number(elapsedMatch[1]) >= 150, failed[0]);
     assert.ok(failed[0].includes("budget target=200ms total=5000ms"), failed[0]);
     assert.ok(failed[0].includes("protocol=anthropic"), failed[0]);
     assert.ok(failed[0].includes("stream=false"), failed[0]);
