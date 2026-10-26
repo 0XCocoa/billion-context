@@ -602,48 +602,15 @@ export const ABSORB_TOOL_OPENAI = {
 
 // Gemini native format: flat `{ name, description, parameters }` function
 // declarations (no `{type:"function"}` wrapper), injected as
-// `tools[].functionDeclarations`.
+// `tools[].functionDeclarations`. Since the 2026-10-26 narrowing the
+// parameters are the shared single-string schema: the historical reason
+// for a separate Google shape was `anyOf` rejection by older API
+// revisions, and the narrowed schema no longer uses anyOf at all. The
+// legacy object-array form stays parser-honored (parseCompressInput).
 export const COMPRESS_TOOL_GOOGLE = {
   name: COMPRESS_TOOL_NAME,
   description: COMPRESS_TOOL.description,
-  // `anyOf` is rejected by older API revisions, so `content` declares the
-  // object form; a JSON-encoded string of that array is still accepted by
-  // parseCompressInput, and the line form (a summary whose first line is
-  // 'm00150–m00220 optional topic') is documented in the description.
-  parameters: {
-    type: "object",
-    properties: {
-      topic: {
-        type: "string",
-        description: "Optional short title for the compressed range",
-      },
-      content: {
-        type: "array",
-        description:
-          "One or more ranges to compress into separate summary blocks. Object form: {startId,endId,summary,topic?}. A JSON-encoded string of that array is also accepted; in the line form the summary begins with its own first line 'm00150–m00220 optional topic', the rest being the summary markdown verbatim. REQUIRED — compress without content is invalid.",
-        items: {
-          type: "object",
-          properties: {
-            topic: { type: "string" },
-            startId: {
-              type: "string",
-              description: "mNNNNN ref at the start of the range",
-            },
-            endId: {
-              type: "string",
-              description: "mNNNNN ref at the end of the range",
-            },
-            summary: {
-              type: "string",
-              description: "Self-contained summary replacing the range",
-            },
-          },
-          required: ["startId", "endId", "summary"],
-        },
-      },
-    },
-    required: ["content"],
-  },
+  parameters: COMPRESS_PARAMETERS,
 };
 
 export const DECOMPRESS_TOOL_GOOGLE = {

@@ -308,7 +308,7 @@ export function renderNudgeText(
         triggerLine,
         ...(guidance === null ? [] : [guidance]),
         blockList,
-        `Example: compress({ content: [{ startId: "${startId}", endId: "${endId}", summary: "..." }] })`,
+        `Example: compress({ content: "${startId}–${endId} optional topic\\nsummary markdown..." })`,
         "",
         prompts.howToCompressRules,
         "",
