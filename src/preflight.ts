@@ -2117,8 +2117,21 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // already subtracts imageReserve, while payloadEstimate is total-space
         // (roundText + imageReserve) — a total-to-text comparison subtracts the
         // reserve twice and misses the exit on image lanes.
-        if (roundText < textTarget) {
-            if (baselineFloor >= textTarget) {
+        // EXCEPTION (#1195/#987, the reason the original #4294 was reverted): an
+        // OVERFLOW-ARM baseline is upstream rejection evidence for THIS request —
+        // the provider's own counting rejected this exact payload, so the local
+        // text estimate (which cannot see provider-side counting, cache stamps,
+        // tokenizers that differ from ours) may NOT outrank it. Under an arm the
+        // floored decisionTokens comparator stays: the #1195 in-request rescue
+        // must keep folding until the payload fits the STATED window on the
+        // upstream's scale. The arm is one-shot (#1110) and retires on the next
+        // real usage report, so this exception cannot resurrect the #4288
+        // marathon — that burn was driven by a stale USAGE-sourced baseline
+        // measured under a prior wider-window model, which keeps the floorless
+        // roundText path.
+        const armedBaseline = deps.session.stats.lastInputTokensSource === "overflow-arm";
+        if (armedBaseline ? decisionTokens < textTarget : roundText < textTarget) {
+            if (baselineFloor >= textTarget && !armedBaseline) {
                 deps.log("info", `[preflight] payload fits by its own estimate (~${Math.round(result.payloadEstimate)}/${textTarget} target, window ${limit}); stopping instead of folding further despite a higher usage baseline (~${Math.round(baselineFloor)} tok measured under a prior model/route) — forwarding (#4288)`);
             }
             break;
