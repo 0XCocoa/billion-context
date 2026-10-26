@@ -96,8 +96,8 @@ type Case = {
 
 const DSH_OPTS = { host: "127.0.0.1", port: 8787, debug: false, lane: "dsh" } as const;
 
-function caseDeps(c: Case, spawnCode: number, latePublish = false): { deps: LauncherDeps; childCreations: () => number } {
-    const inst = recordedInstance(c.record);
+function caseDeps(record: Partial<InstanceFile>, spawnCode: number, latePublish = false): { deps: LauncherDeps; childCreations: () => number } {
+    const inst = recordedInstance(record);
     let childCreations = 0;
     let reads = 0;
     const spawnImpl: SpawnFn = () => {
@@ -132,7 +132,7 @@ async function setUpCase(c: Case): Promise<void> {
 
 test("#4850: config passthrough:true instance is attachable by a native host that passed passthrough:false (bug repro)", async () => {
     await setUpCase({ configRaw: '{"passthrough": true}\n', flag: false, record: { passthrough: true } });
-    const { deps, childCreations } = caseDeps({ configRaw: "", flag: false, record: { passthrough: true } }, 1);
+    const { deps, childCreations } = caseDeps({ passthrough: true }, 1);
     const handle = await ensureProxyRunning({ ...DSH_OPTS, passthrough: false }, deps);
     assert.equal(childCreations(), 0, "no second proxy spawned");
     assert.equal(handle.attached, true, "attaches to the config-driven passthrough instance instead of going direct");
@@ -140,7 +140,7 @@ test("#4850: config passthrough:true instance is attachable by a native host tha
 
 test("#4850: inherited ACP_PASSTHROUGH=1 instance is attachable the same way", async () => {
     await setUpCase({ configRaw: "{}\n", envPassthrough: "1", flag: false, record: { passthrough: true } });
-    const { deps, childCreations } = caseDeps({ configRaw: "", envPassthrough: "1", flag: false, record: { passthrough: true } }, 1);
+    const { deps, childCreations } = caseDeps({ passthrough: true }, 1);
     const handle = await ensureProxyRunning({ ...DSH_OPTS, passthrough: false }, deps);
     assert.equal(childCreations(), 0);
     assert.equal(handle.attached, true);
@@ -148,7 +148,7 @@ test("#4850: inherited ACP_PASSTHROUGH=1 instance is attachable the same way", a
 
 test("#4850: baseline — no passthrough anywhere still attaches", async () => {
     await setUpCase({ configRaw: "{}\n", flag: false, record: { passthrough: false } });
-    const { deps, childCreations } = caseDeps({ configRaw: "", flag: false, record: { passthrough: false } }, 1);
+    const { deps, childCreations } = caseDeps({ passthrough: false }, 1);
     const handle = await ensureProxyRunning({ ...DSH_OPTS, passthrough: false }, deps);
     assert.equal(childCreations(), 0);
     assert.equal(handle.attached, true);
@@ -156,7 +156,7 @@ test("#4850: baseline — no passthrough anywhere still attaches", async () => {
 
 test("#4850: explicit --passthrough flag projects to a passthrough record (no config)", async () => {
     await setUpCase({ configRaw: "{}\n", flag: true, record: { passthrough: true } });
-    const { deps, childCreations } = caseDeps({ configRaw: "", flag: true, record: { passthrough: true } }, 1);
+    const { deps, childCreations } = caseDeps({ passthrough: true }, 1);
     const handle = await ensureProxyRunning({ ...DSH_OPTS, passthrough: true }, deps);
     assert.equal(childCreations(), 0);
     assert.equal(handle.attached, true);
@@ -164,7 +164,7 @@ test("#4850: explicit --passthrough flag projects to a passthrough record (no co
 
 test("#4850: mode isolation preserved — flag-on does NOT attach to a non-passthrough instance (#3617 negative)", async () => {
     await setUpCase({ configRaw: "{}\n", flag: true, record: { passthrough: false } });
-    const { deps, childCreations } = caseDeps({ configRaw: "", flag: true, record: { passthrough: false } }, 1);
+    const { deps, childCreations } = caseDeps({ passthrough: false }, 1);
     await assert.rejects(
         ensureProxyRunning({ ...DSH_OPTS, passthrough: true }, deps),
         /exited before becoming healthy|did not become healthy/,
@@ -174,7 +174,7 @@ test("#4850: mode isolation preserved — flag-on does NOT attach to a non-passt
 
 test("#4850: a passthrough record with NO config/env source still mismatches a flag-off host (#3617 negative)", async () => {
     await setUpCase({ configRaw: "{}\n", flag: false, record: { passthrough: true } });
-    const { deps, childCreations } = caseDeps({ configRaw: "", flag: false, record: { passthrough: true } }, 1);
+    const { deps, childCreations } = caseDeps({ passthrough: true }, 1);
     await assert.rejects(
         ensureProxyRunning({ ...DSH_OPTS, passthrough: false }, deps),
         /exited before becoming healthy|did not become healthy/,
@@ -190,7 +190,7 @@ test("#4850: a passthrough record with NO config/env source still mismatches a f
 // config-driven `true` record) and left the host going direct.
 test("#4850: twin adoption after a code-3 child exit recovers when config drives passthrough (log sequence 12:17:41)", async () => {
     await setUpCase({ configRaw: '{"passthrough": true}\n', flag: false, record: { passthrough: true } });
-    const { deps, childCreations } = caseDeps({ configRaw: "", flag: false, record: { passthrough: true } }, TWIN_ADOPT_EXIT_CODE, true);
+    const { deps, childCreations } = caseDeps({ passthrough: true }, TWIN_ADOPT_EXIT_CODE, true);
     const handle = await ensureProxyRunning({ ...DSH_OPTS, passthrough: false }, deps);
     assert.equal(childCreations(), 1, "one spawn attempt hit the twin collision");
     assert.equal(handle.attached, true, "the serving twin is adopted instead of bootstrap failing to direct traffic");
