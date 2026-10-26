@@ -69,6 +69,11 @@ const SEQ_SPAN_QUERY_BATCH = 500;
  *  bounded to one batch. */
 const MYSQL_GC_ZERO_REF_BATCH = 2000;
 
+/** #4796 follow-up: statement size of the lifecycle-scoped zero-ref sweep
+ *  (collectZeroRefIn) — same rationale as the sqlite twin; chunked so each
+ *  IN-list stays a comfortable parameter count. */
+const MYSQL_ZERO_REF_SWEEP_CHUNK = 500;
+
 /** Fresh-install DDL: the schema.ts v7 shape in MySQL dialect. LONGTEXT for
  *  every verbatim JSON/bytes column (byte-exact round-trip; the JSON type
  *  re-orders keys), BIGINT for ms-epoch timestamps and seqs, VARCHAR keys
@@ -921,7 +926,9 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
             await c.query("DELETE FROM sessions WHERE session_id = ?", [sessionId]);
             for (const hash of refs) await this.releaseContent(c, hash);
-            await c.query("DELETE FROM content WHERE refcount <= 0");
+            // #4796 follow-up: scoped collection over this session's own
+            // released hashes (see collectZeroRefIn) — never the whole table.
+            await this.collectZeroRefIn(c, refs);
         });
     }
 
@@ -1286,9 +1293,9 @@ export class MysqlBackend implements StorageBackend {
             await c.query("DELETE FROM session_ext WHERE session_id = ?", [sessionId]);
             await c.query("UPDATE sessions SET status = 'archived' WHERE session_id = ?", [sessionId]);
             for (const hash of rel) await this.releaseContent(c, hash);
-            const [zero] = (await c.query("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0")) as unknown as Row[][];
-            contentRowsDeleted = num(zero[0].n);
-            await c.query("DELETE FROM content WHERE refcount <= 0");
+            // #4796 follow-up: scoped collection (see collectZeroRefIn) —
+            // the reported count is what THIS archive collected.
+            contentRowsDeleted = await this.collectZeroRefIn(c, rel);
         });
         loggerLog("info", `[#3931] archived ${sessionId} → ${exportPath} (${contentRowsDeleted} content rows collected)`);
         return { ok: true, exportPath, contentRowsDeleted };
@@ -1459,6 +1466,30 @@ export class MysqlBackend implements StorageBackend {
         return deleted;
     }
 
+    /** #4796 follow-up (PR #4800 review): lifecycle-scoped zero-ref
+     *  collection — mysql counterpart of UnifiedStore.collectZeroRefIn.
+     *  deleteSession/archiveSession/deleteCheckpoint used to finish with a
+     *  full-table `DELETE ... WHERE refcount <= 0` inside their lifecycle
+     *  transaction (the same giant-commit pathology as the old gc sweep on
+     *  a bloated store). Their own releases already went through
+     *  releaseContent's delete-on-zero, so this only re-asserts the
+     *  invariant over the operation's released-hash set — bounded work,
+     *  atomicity kept. Orphans from other sources stay for gc(). */
+    private async collectZeroRefIn(c: PoolConnection | Pool, hashes: string[]): Promise<number> {
+        const list = [...new Set(hashes)];
+        let deleted = 0;
+        for (let i = 0; i < list.length; i += MYSQL_ZERO_REF_SWEEP_CHUNK) {
+            const chunk = list.slice(i, i + MYSQL_ZERO_REF_SWEEP_CHUNK);
+            const ph = chunk.map(() => "?").join(", ");
+            const [result] = (await c.query(
+                `DELETE FROM content WHERE refcount <= 0 AND hash IN (${ph})`,
+                chunk,
+            )) as unknown as Array<{ affectedRows?: number }>;
+            deleted += num(result.affectedRows ?? 0);
+        }
+        return deleted;
+    }
+
     async contentRefCountOfBody(needle: string): Promise<number> {
         const [rows] = (await this.pool.query(
             "SELECT refcount FROM content WHERE bytes LIKE CONCAT('%', ?, '%') LIMIT 1",
@@ -1544,7 +1575,7 @@ export class MysqlBackend implements StorageBackend {
             if (rows.length === 0) return false;
             await c.query("DELETE FROM checkpoints WHERE cp_id = ?", [cpId]);
             await this.releaseContent(c, str(rows[0].state_hash));
-            await c.query("DELETE FROM content WHERE refcount <= 0");
+            await this.collectZeroRefIn(c, [str(rows[0].state_hash)]);
             return true;
         });
     }

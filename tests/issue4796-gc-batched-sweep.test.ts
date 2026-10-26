@@ -273,3 +273,88 @@ test("#4796 e2e: v8 identity backfill releases wireIndex twins -> gc collects th
         rmDir(dir);
     }
 });
+
+test("#4796 follow-up: lifecycle ops collect only within their own released hashes", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-4796-scope-"));
+    const dbPath = path.join(dir, "index.db");
+    try {
+        const store = UnifiedStore.open(dbPath);
+        try {
+            store.ingestSession(planIngest(mkSession("sess-a", [mkMsg("a1", "alpha-body-one"), mkMsg("a2", "alpha-body-two")])));
+            store.ingestSession(planIngest(mkSession("sess-b", [mkMsg("b1", "beta-body-one")])));
+            // Pre-existing orphans from OTHER sources: the old whole-table
+            // sweep inside these ops wiped them incidentally — that is the
+            // unbounded pathology this pins closed.
+            seedContentRows(rawDb(store), 3, 0, "preexisting");
+            const preCount = (): number =>
+                (rawDb(store).prepare("SELECT COUNT(*) AS n FROM content WHERE CAST(bytes AS TEXT) LIKE 'preexisting-%'").get() as { n: number }).n;
+            assert.equal(preCount(), 3);
+
+            store.deleteSession("sess-a");
+            assert.equal(store.contentRefCountOfBody("alpha-body-one"), 0, "sess-a content released");
+            assert.equal(store.contentRefCountOfBody("alpha-body-two"), 0, "sess-a content released");
+            assert.equal(preCount(), 3, "pre-existing orphans survive deleteSession");
+
+            const res = store.gc({ archiveAfterDays: 0, archiveDir: path.join(dir, "arch"), now: 9_000_000_000_000 });
+            assert.equal(res.contentRowsDeleted, 3, "gc remains the collector of record for other orphans");
+            assert.equal(store.contentZeroRefReport().rows, 0);
+
+            // Fresh orphans present AT the archiveSession call: these are the
+            // ones the old whole-table sweep would have wiped incidentally.
+            seedContentRows(rawDb(store), 3, 0, "preexisting2");
+            const preCount2 = (): number =>
+                (rawDb(store).prepare("SELECT COUNT(*) AS n FROM content WHERE CAST(bytes AS TEXT) LIKE 'preexisting2-%'").get() as { n: number }).n;
+            assert.equal(preCount2(), 3);
+
+            const arch = store.archiveSession("sess-b", { archiveDir: path.join(dir, "arch") });
+            assert.ok(arch.ok, `archive should succeed, got: ${JSON.stringify(arch)}`);
+            // Scoped semantics: the report covers THIS op's own deletions
+            // only (0: releaseContent already deleted them inline; 1 if that
+            // ever stops being true). The old whole-table census reported >= 3.
+            assert.ok(
+                (arch.contentRowsDeleted ?? 0) <= 1,
+                `archiveSession reports only its own scoped deletions (${String(arch.contentRowsDeleted)})`,
+            );
+            assert.equal(preCount2(), 3, "orphans present at call time survive archiveSession");
+        } finally {
+            store.close();
+        }
+    } finally {
+        rmDir(dir);
+    }
+});
+
+test("#4796 follow-up: deleteCheckpoint scopes collection to the checkpoint's own state hash", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-4796-cp-"));
+    const dbPath = path.join(dir, "index.db");
+    try {
+        const store = UnifiedStore.open(dbPath);
+        try {
+            store.ingestSession(planIngest(mkSession("sess-cp", [mkMsg("c1", "checkpoint-session-body")])));
+            const stateJson = JSON.stringify({ frozen: true, marker: "cp-state-body-unique" });
+            store.insertCheckpoint({
+                cpId: "cp-1",
+                sessionId: "sess-cp",
+                seqAt: 1,
+                blockSetHash: "blocks-none",
+                kind: "manual",
+                pinned: false,
+                createdAt: 5_000,
+                stateJson,
+            });
+            seedContentRows(rawDb(store), 1, 0, "unrelated-orphan");
+            assert.ok(store.deleteCheckpoint("cp-1"), "checkpoint deleted");
+            assert.equal(store.contentRefCountOfBody("cp-state-body-unique"), 0, "checkpoint state blob collected");
+            assert.equal(
+                (rawDb(store).prepare("SELECT COUNT(*) AS n FROM content WHERE CAST(bytes AS TEXT) LIKE 'unrelated-orphan-%'").get() as { n: number }).n,
+                1,
+                "unrelated orphan survives deleteCheckpoint",
+            );
+            assert.deepEqual(rawDb(store).prepare("PRAGMA foreign_key_check").all(), [], "no dangling references");
+        } finally {
+            store.close();
+        }
+    } finally {
+        rmDir(dir);
+    }
+});

@@ -47,6 +47,12 @@ const SEQ_SPAN_QUERY_BATCH = 500;
  *  write-lock hold to one batch instead of the whole table. */
 const GC_ZERO_REF_BATCH_SIZE = 2000;
 
+/** #4796 follow-up: statement size of the lifecycle-scoped zero-ref sweep
+ *  (collectZeroRefIn) — well under SQLite's variable-count limit; a
+ *  session's distinct released hashes exceed it only pathologically, and
+ *  the loop simply continues with the next chunk. */
+const ZERO_REF_SWEEP_CHUNK = 500;
+
 export function sha256Hex(bytes: string | Buffer): string {
     return createHash("sha256").update(bytes).digest("hex");
 }
@@ -1465,8 +1471,9 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(sessionId);
             for (const hash of refs) this.releaseContent(hash);
-            // CAS rows at zero refcount are unreferenced garbage — collect.
-            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+            // #4796 follow-up: scoped collection over this session's own
+            // released hashes (see collectZeroRefIn) — never the whole table.
+            this.collectZeroRefIn(refs);
         });
     }
 
@@ -1672,9 +1679,9 @@ export class UnifiedStore {
             this.db.prepare("DELETE FROM session_ext WHERE session_id = ?").run(sessionId);
             this.db.prepare("UPDATE sessions SET status = 'archived' WHERE session_id = ?").run(sessionId);
             for (const hash of rel) this.releaseContent(hash);
-            const zero = this.db.prepare("SELECT COUNT(*) AS n FROM content WHERE refcount <= 0").get() as { n: number };
-            contentRowsDeleted = zero.n;
-            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+            // #4796 follow-up: scoped collection (see collectZeroRefIn) —
+            // the reported count is what THIS archive collected.
+            contentRowsDeleted = this.collectZeroRefIn(rel);
         });
         loggerLog("info", `[#3901] archived ${sessionId} → ${exportPath} (${contentRowsDeleted} content rows collected)`);
         return { ok: true, exportPath, contentRowsDeleted };
@@ -1850,6 +1857,28 @@ export class UnifiedStore {
             if (batchNo % 10 === 0 || hashes.length < batchSize) {
                 loggerLog("info", `[#4796] gc: collected ${deleted} zero-ref content rows so far (batch ${batchNo})`);
             }
+        }
+        return deleted;
+    }
+
+    /** #4796 follow-up (PR #4800 review): lifecycle-scoped zero-ref
+     *  collection. deleteSession/archiveSession/deleteCheckpoint used to
+     *  finish with a full-table `DELETE ... WHERE refcount <= 0` — on a
+     *  bloated store that re-created the exact pathology of the old gc
+     *  sweep (one giant commit inside the lifecycle transaction: unbounded
+     *  WAL growth, long write-lock hold) while adding nothing these ops
+     *  need: every hash they release already went through releaseContent's
+     *  delete-on-zero. This collects only within the operation's own
+     *  released-hash set — bounded work, same-transaction atomicity kept —
+     *  which also catches a pre-existing orphan row the op happens to
+     *  touch. Orphans from other sources stay for gc(). */
+    private collectZeroRefIn(hashes: Iterable<string>): number {
+        const list = [...new Set(hashes)];
+        let deleted = 0;
+        for (let i = 0; i < list.length; i += ZERO_REF_SWEEP_CHUNK) {
+            const chunk = list.slice(i, i + ZERO_REF_SWEEP_CHUNK);
+            const ph = chunk.map(() => "?").join(", ");
+            deleted += Number(this.db.prepare(`DELETE FROM content WHERE refcount <= 0 AND hash IN (${ph})`).run(...chunk).changes);
         }
         return deleted;
     }
@@ -2039,7 +2068,7 @@ export class UnifiedStore {
             if (!row) return false;
             this.db.prepare("DELETE FROM checkpoints WHERE cp_id = ?").run(cpId);
             this.releaseContent(row.state_hash);
-            this.db.prepare("DELETE FROM content WHERE refcount <= 0").run();
+            this.collectZeroRefIn([row.state_hash]);
             return true;
         });
     }
