@@ -24,6 +24,7 @@ import { openSqliteDatabase, type SqliteDatabase, type SqliteEngineName, type Sq
 import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.js";
 import { identityOfStoredContent } from "./identity.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
+import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
 import { listInstances, type RegistryEntry } from "../instance.js";
 import type { MessageContentStore } from "acp-kernel";
 
@@ -343,13 +344,20 @@ export class UnifiedStore {
     /** #4175: the live foreign pid found holding <db>.lock at open, if any. */
     private readonly foreignLockHolder: { pid: number } | null;
     private readonly lockPath: string | null;
+    private readonly dbPath: string;
+    /** #4609: the last completed check (sync, cache hit, or background
+     * verdict) said the file set is sound — a clean close then refreshes the
+     * verdict cache onto the post-checkpoint stats so the next boot skips
+     * the rescan. Never true while a check is still in flight or failed. */
+    private lastIntegrityOk = false;
 
-    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null) {
+    private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null, dbPath: string) {
         this.db = db;
         this.engine = engine;
         this.engineSource = engineSource;
         this.lockPath = lockPath;
         this.foreignLockHolder = foreignLockHolder;
+        this.dbPath = dbPath;
     }
 
     static open(
@@ -359,11 +367,29 @@ export class UnifiedStore {
     ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
-        // #4175: integrity self-check BEFORE migrations — a corrupt file must
-        // never be migrated against. quick_check is the fast form (it skips
-        // index-vs-table cross-validation) and is skippable for
-        // boot-time-sensitive huge deployments via BILI_STORAGE_QUICK_CHECK=0.
-        if (process.env.BILI_STORAGE_QUICK_CHECK !== "0") {
+        // #4175/#4609: integrity self-check, verdict-cached and size-gated.
+        // An unchanged file set (index.db + -wal stats + schema version) skips
+        // the rescan; a small store checks synchronously BEFORE migrations (a
+        // corrupt file must never be migrated against — #4175's premise,
+        // preserved wherever it is cheap); a large store checks in the
+        // background post-open (#4609: a 14 GB quick_check costs ~260 s and
+        // the 60 s native spawn budget killed the child mid-scan). A cached
+        // failure throws here so the shadow's quarantine-and-reopen-fresh
+        // path (#4175) runs — including for failures found by the background
+        // check of a previous run. BILI_STORAGE_QUICK_CHECK=0 opts out of all
+        // of it (no check, no cache IO).
+        let integrityOk = false;
+        const mode = integrityModeFor(path);
+        if (mode.kind === "cached-fail") {
+            recordIntegrityOutcome(path, false, 0, mode.detail);
+            db.close();
+            throw new StorageIntegrityError(path, mode.detail);
+        }
+        if (mode.kind === "cached-ok") {
+            recordIntegrityOutcome(path, true, 0, "verdict cache hit (file set unchanged since the last check)");
+            integrityOk = true;
+        } else if (mode.kind === "sync") {
+            noteIntegrityCheckRun();
             const started = Date.now();
             let verdict: string;
             try {
@@ -385,6 +411,8 @@ export class UnifiedStore {
                 db.close();
                 throw new StorageIntegrityError(path, verdict.slice(0, 400));
             }
+            writeIntegrityCache(path, true);
+            integrityOk = true;
         }
         // #4175: second-process-on-the-same-db detection. A live foreign pid
         // is reported loudly (web wire + banner) but never blocks — blocking
@@ -446,7 +474,21 @@ export class UnifiedStore {
         } catch (err) {
             loggerLog("warn", `[storage] WAL checkpoint on open failed for ${path}: ${String(err)}`);
         }
-        return new UnifiedStore(db, used, source, lockPath, foreignLockHolder);
+        const store = new UnifiedStore(db, used, source, lockPath, foreignLockHolder, path);
+        if (integrityOk) store.noteIntegrityOk();
+        // #4609: a large store's cache-miss check runs post-open on a second
+        // read-only connection — open() returns immediately; the verdict
+        // lands in runtime-status and the cache (a cached failure makes the
+        // NEXT open quarantine + reopen fresh via the #4175 path).
+        if (mode.kind === "async") scheduleBackgroundIntegrityCheck(path, (ok) => { if (ok) store.noteIntegrityOk(); });
+        return store;
+    }
+
+    /** #4609: mark this instance's file set as verified (sync check ok,
+     * cache hit, or background verdict ok) so a clean close refreshes the
+     * verdict cache onto the post-checkpoint stats. */
+    noteIntegrityOk(): void {
+        this.lastIntegrityOk = true;
     }
 
     close(): void {
@@ -460,6 +502,13 @@ export class UnifiedStore {
             loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
         }
         this.db.close();
+        // #4609: a clean close of a verified store refreshes the verdict
+        // cache onto the post-checkpoint stats — the normal restart path then
+        // skips the rescan. Deferred while a background check is still in
+        // flight (its own completion writes the cache). Best-effort.
+        if (this.lastIntegrityOk && !backgroundIntegrityInflightForTests(this.dbPath)) {
+            writeIntegrityCache(this.dbPath, true);
+        }
         // #4175: release the ownership lockfile on a clean close so the next
         // open in another process is not told a dead pid holds it. When a
         // foreign holder was reported at open we never owned the lock — leave it.
