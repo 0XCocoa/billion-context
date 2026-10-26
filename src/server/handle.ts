@@ -1788,7 +1788,7 @@ async function handleRequest(
                 log("info", `[${sessionId}] [pi-subagents] child "${subagentFallback.agent ?? "unknown"}" role allowlist lacks ACP context tools — serving proxy-style compression channel (#2268)`);
             }
         }
-        // #4657: a plugin whose host declines to put the ACP tools in the outgoing request (Hermes
+        // #4855: a plugin whose host declines to put the ACP tools in the outgoing request (Hermes
         // defers every plugin toolset behind tool_search) asks for the proxy channel explicitly.
         // Same demotion as the two signals above — identity/budget stay plugin-bound, compression
         // moves server-side — so a deferred toolset stops degenerating into anonymous proxy mode.

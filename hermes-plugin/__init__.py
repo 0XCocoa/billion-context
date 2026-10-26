@@ -123,7 +123,7 @@ _state: Dict[str, Any] = {
     "stop_event": threading.Event(),
     "warned_direct": False,
     "snapshot_warned": False,
-    # #4657: header name the proxy advertised for the per-request compression-channel override
+    # #4855: header name the proxy advertised for the per-request compression-channel override
     # (manifest headers.compression). Empty/None on an older proxy — then a request whose tool
     # snapshot lacks the ACP tools stays unstamped, exactly as before.
     "compression_header": None,
@@ -1463,7 +1463,7 @@ def _bootstrap(sidecar: Dict[str, str], ctx: Any, skip_register: bool = False) -
             else:
                 manifest = http_get_json(origin.rstrip("/") + "/__bili/plugin/manifest", MANIFEST_TIMEOUT_S)
                 tools = manifest.get("tools", {}).get("anthropic") if isinstance(manifest, dict) else None
-                # #4657: the proxy names the header that flips compression to its own channel for a
+                # #4855: the proxy names the header that flips compression to its own channel for a
                 # request whose tool snapshot lacks the native tools. Absent on older proxies.
                 declared = manifest.get("headers") if isinstance(manifest, dict) else None
                 compression_header = declared.get("compression") if isinstance(declared, dict) else None
@@ -1622,7 +1622,7 @@ def on_llm_request(request: Optional[Dict[str, Any]] = None, **context: Any) -> 
                     logger.info("billion-context: native tools are not in this session's tool list — "
                                 "compressing in proxy mode until a new session")
                 return None
-            # #4657: Hermes defers every plugin toolset behind tool_search, so the tools exist but
+            # #4855: Hermes defers every plugin toolset behind tool_search, so the tools exist but
             # never reach the outgoing request. Keep the plugin identity + budget (that is what
             # /acp and the window header read) and hand compression to the proxy explicitly.
             if not _state.get("snapshot_warned"):

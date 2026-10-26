@@ -113,7 +113,7 @@ const PLUGIN_BYPASS_HEADER = "x-bili-plugin-bypass";
 const PLUGIN_CONTEXT_WINDOW_HEADER = "x-bili-plugin-context-window";
 const PLUGIN_MAX_OUTPUT_HEADER = "x-bili-plugin-max-output";
 const PLUGIN_MODEL_HEADER = "x-bili-plugin-model";
-/** #4657: per-request compression-channel override, only honored from an announced plugin
+/** #4855: per-request compression-channel override, only honored from an announced plugin
  *  (same gate as window/model above). A host that registers the ACP tools natively but keeps them
  *  OUT of the outgoing request — Hermes defers every plugin toolset behind tool_search — still
  *  needs its identity and budget bound to the plugin conversation. Stamping "proxy" says exactly
@@ -262,7 +262,7 @@ export function pluginRequestAgentHeader(headers: Record<string, string | string
     return headerValue(headers, PLUGIN_REQUEST_AGENT_HEADER);
 }
 
-/** #4657: the plugin asks the proxy to serve compression on this request (identity + budget stay
+/** #4855: the plugin asks the proxy to serve compression on this request (identity + budget stay
  *  plugin-bound). Gated on the agent marker so a plain client cannot flip the channel by name. */
 export function pluginCompressionProxyHeader(headers: Record<string, string | string[] | undefined>): boolean {
     if (pluginAgentHeader(headers) === undefined) return false;
