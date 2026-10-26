@@ -84,7 +84,7 @@ import { AUTO_FOLD_TARGET_MIN, AUTO_FOLD_MIN_BENEFIT_TOKENS } from "./external-s
 import { auditStartupSummaryCredentials } from "./external-summary-credentials.js";
 import { applyRanges } from "./stream.js";
 import { attachSubagentSessions } from "./subagent-sessions.js";
-import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport } from "./cache-ledger.js";
+import { buildSessionCacheReport, handleAcpCache, learnedImageReserve, noteClientAbort, readKeySwitchStats, readModelSwitchStats, settleUsageReport, SIDE_LANE_SHRINK_RATIO } from "./cache-ledger.js";
 import { extractBillingAttributionBlock, extractSummaryFromSse, preflightCompress, estimateCoreMessages, estimateCoreMessagesUpper, estimateCoreMessagesUpperBytes, describeCoreTextDuplication, estimateRawBodyTokens, type PreflightResult } from "./preflight.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, DEFAULT_DECIDE_MAX_TOKENS, DECIDE_TIMEOUT_MS, extractDecisionText, ladderMode, parseDecision, recordDecision, resolveDecisionRange, type DecideConfig, type DecisionOutcome } from "./nudge-decide.js";
 import { gcConfigFromEnv, gcSessionFiles } from "./session-gc.js";
@@ -2475,6 +2475,12 @@ export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: strin
 // all require usage >= their pct lines). #728 fix: such sessions fall back to
 // the PREVIOUS turn's locally-measured outbound payload upper bound
 // (session.stats.localInputEstimate, recorded in prepare* each turn). The
+// #4805: the meter-side size guard (anchorImpossible below) also requires an ABSOLUTE gap,
+// not just the ratio: on early/small sessions the char-count upper bound is already an order
+// of magnitude above the real token count, so a pure-ratio test would demote healthy small
+// anchors to estimates and lose usage-grade sizing exactly where it is cheapest to keep.
+const SIDE_LANE_ANCHOR_MIN_ABS_DELTA = 25_000;
+
 // estimator only errs EARLY (char-count upper bound → compress earlier, never
 // later), is active only while lastInputTokens == 0 (a real usage report takes
 // precedence immediately — same invariant as #604's armFailureShrink
@@ -2514,8 +2520,8 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // local estimate then — the nudge sizes the payload it actually sees.
     const payloadUpperNow = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
     const anchorImpossible = session.stats.lastInputTokens > 0
-        && payloadUpperNow >= session.stats.lastInputTokens * 8
-        && payloadUpperNow - session.stats.lastInputTokens > 25_000;
+        && payloadUpperNow >= session.stats.lastInputTokens * SIDE_LANE_SHRINK_RATIO
+        && payloadUpperNow - session.stats.lastInputTokens > SIDE_LANE_ANCHOR_MIN_ABS_DELTA;
     if (!anchorStale && !anchorImpossible && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,

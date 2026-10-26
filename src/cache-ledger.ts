@@ -1781,6 +1781,13 @@ export function noteOutboundContextEstimates(
     session.stats.contextTokensSource = "estimate";
 }
 
+// #4805: an order-of-magnitude gap between a usage sample and the session's current anchor is
+// the side-lane signature — a main-lane resend cannot be 8x smaller than the last measurement
+// (post-fold shrinkage carries a credit and is exempt below). Shared with the meter-side size
+// guard in src/server.ts (effectiveTokenCount) so both guards agree on what "the anchor cannot
+// describe this request" means.
+export const SIDE_LANE_SHRINK_RATIO = 8;
+
 export function settleUsageReport(
     session: Session,
     s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
@@ -1802,7 +1809,7 @@ export function settleUsageReport(
         const prevUsageGrade = session.stats.lastInputTokensSource === "usage";
         const sideLaneSample = prevUsageGrade && prevAnchor > 0
             && (session.stats.compressCreditTokens ?? 0) <= 0
-            && s.total * 8 < prevAnchor;
+            && s.total * SIDE_LANE_SHRINK_RATIO < prevAnchor;
         if (sideLaneSample) {
             session.stats.inputTokens += s.total;
             loggerLog("info", `[${session.id}] usage sample ${s.total} tok is ~${Math.round(prevAnchor / Math.max(1, s.total))}× smaller than the ${prevAnchor}-tok anchor — treated as side-lane traffic, anchor kept (#4805)`);
