@@ -801,8 +801,8 @@ export class UnifiedStore {
                        @status, @createdAt, @updatedAt, @nextBlockId, @nextRunId,
                        @metaJson, @statsJson, @metadataJson, @kstateJson, @tailJson, @ccrJson, @lastIngestedSeq, @orphansJson)
                      ON CONFLICT(session_id) DO UPDATE SET
-                       parent_session_id = excluded.parent_session_id,
-                       fork_point_seq = excluded.fork_point_seq,
+                       parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
+                       fork_point_seq = COALESCE(excluded.fork_point_seq, sessions.fork_point_seq),
                        protocol = excluded.protocol,
                        label = excluded.label,
                        title = excluded.title,

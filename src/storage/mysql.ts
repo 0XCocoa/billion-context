@@ -433,8 +433,8 @@ export class MysqlBackend implements StorageBackend {
                    meta_json, stats_json, metadata_json, kstate_json, tail_json, ccr_json, last_ingested_seq)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON DUPLICATE KEY UPDATE
-                   parent_session_id = VALUES(parent_session_id),
-                   fork_point_seq = VALUES(fork_point_seq),
+                   parent_session_id = COALESCE(VALUES(parent_session_id), parent_session_id),
+                   fork_point_seq = COALESCE(VALUES(fork_point_seq), fork_point_seq),
                    protocol = VALUES(protocol),
                    label = VALUES(label),
                    title = VALUES(title),
