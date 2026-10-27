@@ -60,12 +60,14 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
 }
 import { degenerateTurnWarning, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
 import { getChangelog, latestChangelog, warmChangelogOnce } from "./web/changelog.js";
+import { warmBlogRefreshOnce } from "./web/blog-refresh.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { excludeDeadRefRanges } from "./acp-status.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
+import { billOutputUsage } from "./billing.js";
 import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 import { lookupToolWitness, recordToolWitness } from "./tool-ring.js";
@@ -1848,6 +1850,11 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     } else {
         warmChangelogOnce(); // once per process; never throws
     }
+    // #4906: same fire-and-forget cadence as the changelog warm above — one
+    // GitHub-master blog pull when this process starts out COLD (no live
+    // master overlay yet); processes that already hold a master overlay keep
+    // the status path network-free. Internal guard; never throws.
+    warmBlogRefreshOnce();
     if (panel !== undefined && preFooter.length > 0) {
         // Escape $ so advisory text (remote doc content) cannot be read as
         // replace() pattern syntax ($&, $\`, $') and corrupt the box lines.
@@ -2316,9 +2323,13 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
         loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
-        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin });
+        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin, creation: typeof sample.creationTokens === "number" ? sample.creationTokens : undefined });
     }
-    if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
+    if (sample.outputTokens !== undefined) {
+        session.stats.outputTokens += sample.outputTokens;
+        // #4899: output USD billed at the stamped price, in lockstep with the token counter.
+        billOutputUsage(session, sample.outputTokens);
+    }
 }
 
 /** Merge an SSE event's usage fields into the per-response accumulator.

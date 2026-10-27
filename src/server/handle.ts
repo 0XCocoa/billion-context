@@ -11,6 +11,7 @@ import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
+import { stampBillingPrice } from "../billing.js";
 import { codexAlignedWindow } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
@@ -2415,13 +2416,34 @@ async function handleRequest(
                     // model's models.dev price (absolute $/Mtok) so out-of-box
                     // reports read in real money instead of Anthropic-ratio
                     // guesses. Report-only — no trigger impact.
-                    if (cs.priceProfile !== undefined && Object.keys(cs.priceProfile).length > 0) session.metadata.cachePriceProfile = cs.priceProfile;
-                    else {
-                        const priceHost = (() => { try { return new URL(route?.rewrittenUrl ?? upstreamOrigin).host; } catch { return undefined; } })();
+                    // #4899 follow-up: the two sources carry DIFFERENT UNIT
+                    // SYSTEMS in one field — user-configured values are
+                    // dimensionless RATIOS (input ≡ 1), registry fallbacks are
+                    // absolute $/Mtok. The companion flag records which, so the
+                    // panel's dollar views can anchor ratios against the
+                    // session's stamped billing price (or stay tokens-only)
+                    // while every existing consumer keeps reading the profile
+                    // verbatim. The flag clears with the profile.
+                    const priceHost = (() => { try { return new URL(route?.rewrittenUrl ?? upstreamOrigin).host; } catch { return undefined; } })();
+                    if (cs.priceProfile !== undefined && Object.keys(cs.priceProfile).length > 0) {
+                        session.metadata.cachePriceProfile = cs.priceProfile;
+                        session.metadata.cachePriceProfileAbs = false;
+                    } else {
                         const registryProfile = peekRegistryPriceProfile(requestModel, priceHost);
-                        if (registryProfile !== undefined) session.metadata.cachePriceProfile = registryProfile;
-                        else delete session.metadata.cachePriceProfile;
+                        if (registryProfile !== undefined) {
+                            session.metadata.cachePriceProfile = registryProfile;
+                            session.metadata.cachePriceProfileAbs = true;
+                        } else {
+                            delete session.metadata.cachePriceProfile;
+                            delete session.metadata.cachePriceProfileAbs;
+                        }
                     }
+                    // #4899: stamp the billing price for this request's model
+                    // (config `billing.prices` > models.dev) so the usage-report
+                    // settle path bills USD without re-resolving. Model-less
+                    // requests keep the previous stamp; a model with NO resolvable
+                    // price clears it (tokens-only display, never fake dollars).
+                    stampBillingPrice(session, requestModel, priceHost);
                     const visibilityMarkers = cs.visibilityMarkers ?? true;
                     const reasoningCfg = cs.reasoning;
                     // #1995/#2607: index recoverable historical images by ref from the RAW

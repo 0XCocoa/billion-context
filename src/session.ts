@@ -300,6 +300,11 @@ export type Session = {
      *  one upstream usage report. Persisted; survives restart. */
     stats: {
         requests: number;
+        /** #4899: cumulative USD spend ledger (input / cacheRead / cacheWrite /
+         *  output), billed at the per-request stamped price
+         *  (metadata.billingPrice). Absent while no price resolves — the UI
+         *  shows tokens only, never fabricated dollars. */
+        costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number };
         /** Approximate tokens saved by compression (legacy/rough — kept for
          *  backward compat with old session files, not shown in UI). */
         tokensSaved: number;
