@@ -258,6 +258,22 @@ test("successful round renders master long-form articles from the manifest", asy
     assert.match(art?.htmlZh ?? "", /中文长文正文/);
 });
 
+test("an oversize document blows the round budget: fail-soft keeps the last good overlay", async () => {
+    installGithubRouter();
+    assert.equal((await runBlogRefreshRound({ force: true })).ok, true); // good baseline
+    const big = "x".repeat(512 * 1024 + 1);
+    router = (url) => {
+        if (url === CONTENTS_URL) return new Response(JSON.stringify([{ name: "2026-10-09_fresh.md", type: "file" }]), { status: 200 });
+        if (url === rawUrl("website/blog/posts/2026-10-09_fresh.md")) return new Response(big, { status: 200 });
+        return new Response("not here", { status: 404 });
+    };
+    const out = await runBlogRefreshRound({ force: true });
+    assert.equal(out.ok, true); // resolves — the failure rides the feed marker
+    const feed = getBlogFeed();
+    assert.equal(feed.error, "offline");
+    assert.ok(feed.items.some((i) => i.id === "demo"), "previous good overlay survives");
+});
+
 test("malformed articles.json degrades to a posts-only round without failing", async () => {
     router = (url) => {
         if (url === CONTENTS_URL) return new Response(JSON.stringify([{ name: "2026-10-09_fresh.md", type: "file" }]), { status: 200 });
