@@ -2474,6 +2474,20 @@ export function diagNudge(turn: { nudge?: { shouldInject: boolean; reason: strin
 // all require usage >= their pct lines). #728 fix: such sessions fall back to
 // the PREVIOUS turn's locally-measured outbound payload upper bound
 // (session.stats.localInputEstimate, recorded in prepare* each turn). The
+// #4805: the meter-side size guard (anchorImpossible below) also requires an ABSOLUTE gap,
+// not just the ratio: on early/small sessions the char-count upper bound is already an order
+// of magnitude above the real token count, so a pure-ratio test would demote healthy small
+// anchors to estimates and lose usage-grade sizing exactly where it is cheapest to keep.
+const SIDE_LANE_ANCHOR_MIN_ABS_DELTA = 25_000;
+// The anchor's OWN request snapshot (lastUsagePayloadUpper, taken at settle)
+// carries the honesty margin: a usage report can legitimately under-report a
+// text-heavy payload by ~8x (#1820 B — char-bound 220k over a 5k report), so the
+// anchor size alone cannot prove pollution; requiring the payload to ALSO tower
+// 8x over the payload of the request that produced the anchor keeps #1820 B's
+// honest anchors on the fast path while #4805's side-lane sample (anchor request
+// ~3k upper, main payload ~680k upper) is refused with 2-20x margin.
+const SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO = 8;
+
 // estimator only errs EARLY (char-count upper bound → compress earlier, never
 // later), is active only while lastInputTokens == 0 (a real usage report takes
 // precedence immediately — same invariant as #604's armFailureShrink
@@ -2504,7 +2518,20 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // #4383 (both guards): stale-small — a sidecar/side-request sample under
     // the same session id, superseded by later main sends — must not freeze the
     // meter either; fall through to the fresher measurement.
-    if (!anchorStale && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
+    // #4805 (size guard): a FRESH tiny anchor can still be lane pollution — a
+    // 2-message side request's usage (5100 tok) overwrote a 1700-message
+    // conversation's anchor and froze compression until the context blew the
+    // window. Time-based staleness cannot catch it (it is seconds old), but the
+    // size dimension can: a usage sample cannot describe a resent history whose
+    // own upper bound is ~an order of magnitude larger. Fall through to the
+    // local estimate then — the nudge sizes the payload it actually sees.
+    const payloadUpperNow = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
+    const anchorImpossible = session.stats.lastInputTokens > 0
+        && (session.stats.lastUsagePayloadUpper ?? 0) > 0
+        && payloadUpperNow >= session.stats.lastInputTokens * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
+        && payloadUpperNow >= session.stats.lastUsagePayloadUpper! * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
+        && payloadUpperNow - session.stats.lastInputTokens > SIDE_LANE_ANCHOR_MIN_ABS_DELTA;
+    if (!anchorStale && !anchorImpossible && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,
     // or the upstream never reports), and every branch below sizes on the
@@ -2516,7 +2543,7 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // reporting upstreams fall back to legacy sizing rather than a frozen meter.
     const anchored = postRebuildAnchorTokens(session);
     if (anchored > 0) return { tokens: anchored, source: "estimate" };
-    const raw = estimateCoreMessagesUpper(msgs) + inboundImageTokens;
+    const raw = payloadUpperNow;
     // #1569/#1839: while the latest baseline is not usage-grade (the transient
     // window right after a failed turn), sizing on ANY re-derived view is how
     // ghosts enter: #1569 first tried min(est, raw) — the char-count upper

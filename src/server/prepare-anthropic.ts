@@ -41,6 +41,7 @@ import { injectSystem, injectTool } from "./inject.js";
 import { nudgeOn, resolveLaneDecisions, surfaceOffDetail } from "./lane-decisions.js";
 import { featureEnabled } from "../rollout.js";
 import { MSG_IDS_BODY_FIELD, MSG_SEQS_BODY_FIELD, applyMsgIdPin, applyMsgSeqStamps, validateMsgIds, validateMsgSeqs } from "../msgid-pin.js";
+import { collectRequestIds, probeRequestMembership } from "../request-membership.js";
 import { alignIdSet, looksLikeSummaryCarrier } from "../msgid-algebra.js";
 
 export async function prepareAnthropic(
@@ -594,6 +595,11 @@ export async function prepareAnthropic(
     session.stats.lastLocalTextEstimate = estimateCoreMessages(processedMessages.length > 0 ? processedMessages : originalMessages)
         + countSystemAndToolsTokens(extractSystem(systemOut), toolsOut)
         + imageReserveFor(session, "anthropic", rebuilt, opts, upstreamOrigin);
+    // #4805: id-membership evidence for the settle gate — the envelope ids
+    // when the lane sends them (any rollout state), else the tool-call ids
+    // resent in the history. Placed after the payload row above so the
+    // main-scale tiebreak sees this request's own upper bound.
+    probeRequestMembership(session, collectRequestIds(incomingMsgIds, originalMessages), session.stats.localInputEstimate ?? 0);
     if (upstreamOrigin) session.stats.lastLocalTextEstimateOrigin = upstreamOrigin;
     return { body: JSON.stringify(rebuilt), session, attachedRetrievals, attachedRetrievalNoteIds, processedMessages, originalMessages, judgeBaseline, anthropicSystem: parsed.system, anthropicBillingBlock, anthropicCacheMarks, anthropicClientCacheControls: clientCacheControls, systemNotes: sysNotes, protocol: "anthropic", stream, compressInjected: injectTools, pluginMode, mcpDialectNote: laneDecisions.mcpDialect, nudge, nudgeOutcome, prompts, surface, renderTags: renderStrategy, dropReasoning: (msgs: BiliMessage[]) => applyReasoningDrop(msgs, reasoningPlan, log, sessionId) } as Prepared;
 }

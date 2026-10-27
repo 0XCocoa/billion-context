@@ -167,6 +167,7 @@ interface PersistedSession {
         // pendingFoldUsage / lastLocalTextEstimate(+Origin), which ride along
         // but are deliberately not restored — see buildSession).
         localInputEstimate?: number;
+        lastUsagePayloadUpper?: number;
         lastUsageGradeTokens?: number;
         calibratedEstimate?: number;
         calibratedEstimateOrigin?: string;

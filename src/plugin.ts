@@ -1524,6 +1524,15 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // takes precedence immediately (#728 invariant), and every prepare*
             // overwrites it with the measured outbound each turn.
             child.stats.localInputEstimate = child.stats.contextTokens;
+            // #4805: the child inherits the parent's membership needle — its
+            // resent history IS the parent's, so the probe must not
+            // cold-start (an auxiliary persona striking the fork child first
+            // would sail through an unplanted needle and pollute the fresh
+            // anchor before any guard has evidence).
+            if (parent.transient?.latestKnownMsgId) {
+                (child.transient ??= {}).latestKnownMsgId = parent.transient.latestKnownMsgId;
+                child.transient.needlePayloadUpper = parent.transient.needlePayloadUpper;
+            }
             const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
             publishForkSession(child);
