@@ -379,7 +379,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `BILI_CODEX_STATE_MODE` | string | auto | — | codex state handling: auto (shared db via CODEX_SQLITE_HOME on modern codex, legacy overlay copies otherwise), shared, or legacy. Shared mode runs up to 16 concurrent sessions, one per-session overlay slot each; legacy keeps one exclusive overlay at a time. |
 | `BILI_ATTACH_HEALTH_DEADLINE_MS` | number | (built-in) | — | Deadline for attach health checks when joining an external daemon. |
 | `BILI_SPAWN_WAIT_MS` | number | (built-in) | — | Initial health-wait window (ms) for a freshly spawned proxy child before the launcher extends the wait. |
-| `BILI_SLOW_START_GRACE_MS` | number | (built-in) | — | Additional grace (ms) for a LIVE spawned child still starting (slow store, AV scan, shared-store lock contention); the total spawn budget is the sum of the two. |
+| `BILI_SLOW_START_GRACE_MS` | number | (built-in) | — | Extra grace (ms) for a still-alive child that is slow to bind (slow store, AV scan, shared-store lock contention); the total spawn budget is the sum of the two. |
 | `BILI_ATTACH_EVIDENCE_GRACE_MS` | number | (built-in) | — | Grace period for attach ownership evidence. |
 | `BILI_PROVIDER_REWRITES` | string | unset | — | Provider URL rewrite rules applied before routing. |
 | `BILI_MCP_PROXY` | string | unset | — | Spawn channel: MCP proxy target for plugin-hosted tools. |
