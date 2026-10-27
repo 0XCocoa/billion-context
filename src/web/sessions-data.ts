@@ -7,7 +7,12 @@ import { flatFileNameFor } from "acp-kernel/persist";
 import type { WebSummaryRow } from "../storage/store.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
-import { savedUsdFromFolds } from "../billing.js";
+import { resolveBillingPrice, savedUsdFromFolds } from "../billing.js";
+
+/** Shape of a resolved price row — taken via ReturnType so this module never
+ *  couples to billing.ts's internal export surface (see #4916 unused-export
+ *  gate: ResolvedBillingPrice itself stays module-private there). */
+type LivePrice = NonNullable<ReturnType<typeof resolveBillingPrice>>;
 import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
@@ -103,14 +108,23 @@ interface WebSessionSummary {
      *  the pricing editor resolves against. */
     model?: string;
     /** #4899: cumulative USD spend billed at the per-request stamped price
-     *  (session.stats.costUsd). Absent when no price resolves — tokens only. */
-    costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number; total: number };
-    /** #4899: money mirror of netSaved — the same folds priced with the
-     *  session's stamped cachePriceProfile ($/Mtok); only when the stamp site
-     *  marked it absolute (cachePriceProfileAbs === true), else undefined.
-     *  Can be negative while a fold has not paid back (honest, like the token
-     *  display). */
+     *  (session.stats.costUsd). When that ledger is absent/zero, falls back to
+     *  a LIVE-derived estimate (`estimated: true`) — displayed tokens × the
+     *  currently resolved tier rates — so pre-upgrade sessions show dollars
+     *  too. Absent only when no price resolves at all. */
+    costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number; total: number; estimated?: boolean };
+    /** #4899 v2: money mirror of netSaved — the folds priced with the CURRENTLY
+     *  resolved tier rates (live price table); stamped profiles are only a
+     *  fallback when the model resolves nowhere today; fold-less sessions
+     *  estimate flat at the input rate. Can be negative while a fold has not
+     *  paid back (honest, like the token display). */
     savedUsd?: number;
+    /** #4899 v2: money mirror of grossSaved — avoided turns priced at the read rate. */
+    savedUsdGross?: number;
+    /** #4899 v2: hit-rate miss buckets in dollars — genuinely-new content at the
+     *  input rate, compression/TTL repays at the read rate. Only ledgered
+     *  sessions with a resolvable price. */
+    missSplitUsd?: { n: number; c: number; x: number };
     /** Σ T — measured compression re-pay tokens. */
     repayCost?: number;
     /** Σ σ — summary generation cost (output tokens). */
@@ -160,6 +174,11 @@ interface WebOverview {
     costUsdTotal: number;
     /** #4899: Σ money-mirrored net savings (only priced sessions contribute). */
     savedUsdTotal: number;
+    /** #4899 v2: Σ money-mirrored GROSS savings (avoided turns @ read rate).
+     *  Only priced sessions contribute. */
+    savedUsdGrossTotal: number;
+    /** #4899 v2: Σ hit-rate miss buckets in dollars across priced ledgered sessions. */
+    missSplitUsdTotal?: { n: number; c: number; x: number };
     /** #4899: true when at least one session had a USD ledger or priced folds
      *  (else the money totals are meaningless — hide them, don't fake $0). */
     hasMoneyData: boolean;
@@ -173,7 +192,7 @@ interface WebOverview {
     hiddenEmpty: number;
     hitPct: number | null;
     blocks: number;
-    byProtocol: Array<{ protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; hitPct: number | null; missDropNew?: number; missDropComp?: number; missDropTtl?: number }>;
+    byProtocol: Array<{ protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; hitPct: number | null; missDropNew?: number; missDropComp?: number; missDropTtl?: number; savedUsd?: number }>;
     recent: WebSessionSummary[];
 }
 
@@ -589,30 +608,47 @@ function validCostUsd(v: unknown): { input: number; cacheRead: number; cacheWrit
     return { input: input ?? 0, cacheRead: cacheRead ?? 0, cacheWrite: cacheWrite ?? 0, output: output ?? 0 };
 }
 
-/** #4899 follow-up: resolve the $/Mtok profile for the savings-mirror view
- *  from the session's stamps. Absolute stamps (registry source) bill
- *  directly; ratio stamps (user-config source) are anchored against the
- *  stamped billing price's input rate — the same per-request snapshot the
- *  spend ledger bills with. Kernel defaults fill partial profiles exactly
- *  like the token-report consumer, so both views price on the same effective
- *  values. Legacy stamps predating the flag and unanchored ratios return
- *  undefined — tokens only, never a misprice. */
-function savedUsdForSummary(s: SummarySource): number | undefined {
+/** #4899 v2 (owner design): the dollar faces of the panel are a DERIVED VIEW.
+ *  They recompute on every fetch from the CURRENTLY resolved price table
+ *  (`billing.prices` overrides > models.dev snapshot) — never gated on
+ *  request-time stamps. A session created yesterday shows dollars as soon as
+ *  its model resolves a price; editing a price re-prices every token number
+ *  instantly. Purpose: see whether compression saves MONEY given the model's
+ *  differing input/output/cache rates — an estimate by design, not an invoice.
+ *  Host-aware like the pricing editor (`handlePricingGet`). */
+function livePriceForSummary(s: SummarySource): LivePrice | undefined {
+    const model = typeof s.metadata.lastModel === "string" && s.metadata.lastModel.length > 0 ? s.metadata.lastModel : undefined;
+    if (!model) return undefined;
+    let host: string | undefined;
+    if (s.meta.upstreamOrigin) {
+        try { host = new URL(s.meta.upstreamOrigin).host; } catch { host = undefined; }
+    }
+    return resolveBillingPrice(model, host);
+}
+
+/** Absolute $/Mtok profile {w,r,q} for the fold economics mirror, newest
+ *  source first: (1) the live-resolved tier prices (input / cacheRead /
+ *  output) — always fresh, so price edits propagate; (2) a stamped ABSOLUTE
+ *  profile (model no longer in any price table); (3) legacy dimensionless
+ *  ratio profiles anchored against the stamped billing price (kernel defaults
+ *  1/0.1/4 fill partial profiles, as before). Nothing usable → undefined:
+ *  tokens only, never fabricated dollars. */
+function savedUsdProfileForSummary(s: SummarySource, live?: LivePrice): { w: number; r: number; q: number } | undefined {
+    if (live !== undefined) return { w: live.input, r: live.cacheRead, q: live.output };
     const o = s.metadata["cachePriceProfile"];
     if (!o || typeof o !== "object" || Array.isArray(o)) return undefined;
     const rec = o as Record<string, unknown>;
-    const num = (x: unknown): number | undefined => (typeof x === "number" && Number.isFinite(x) && x >= 0 ? x : undefined);
-    const w = num(rec.w), r = num(rec.r), q = num(rec.q);
+    const f = (x: unknown): number | undefined => (typeof x === "number" && Number.isFinite(x) && x >= 0 ? x : undefined);
+    const w = f(rec.w), r = f(rec.r), q = f(rec.q);
     if (w === undefined && r === undefined && q === undefined) return undefined;
     const filled = { w: w ?? 1, r: r ?? 0.1, q: q ?? 4 };
-    if (s.metadata["cachePriceProfileAbs"] !== true) {
-        const bp = s.metadata["billingPrice"];
-        const input = bp && typeof bp === "object" ? num((bp as Record<string, unknown>).input) : undefined;
-        if (input === undefined) return undefined;
-        return savedUsdFromFolds((s.metadata["cacheLedger"] as { folds?: Array<{ S?: number; sigma?: number; T?: number; requestsAfter?: number }> } | undefined)?.folds ?? [],
-            { w: filled.w * input, r: filled.r * input, q: filled.q * input });
-    }
-    return savedUsdFromFolds((s.metadata["cacheLedger"] as { folds?: Array<{ S?: number; sigma?: number; T?: number; requestsAfter?: number }> } | undefined)?.folds ?? [], filled);
+    if (s.metadata["cachePriceProfileAbs"] === true) return filled;
+    // Legacy dimensionless ratios: anchor against the stamped billing price's
+    // input rate when present — kept as a last resort for models that resolve
+    // nowhere today but were priced at request time.
+    const bp = s.metadata["billingPrice"];
+    const input = bp && typeof bp === "object" ? f((bp as Record<string, unknown>).input) : undefined;
+    return input === undefined ? undefined : { w: filled.w * input, r: filled.r * input, q: filled.q * input };
 }
 
 /** Normalizer mirroring buildSession's v1-flat → grouped fallback for exactly
@@ -731,6 +767,10 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // engine's health across the fleet before the rollout flip.
     const shadowBlob = s.metadata["snapshotShadow"] as { turns?: number; errors?: number; lastClass?: string; lastReason?: string } | undefined;
     const agg = led;
+    // #4899 v2: resolve THIS session's price live, once per fetch (see the
+    // helpers' docs). Drives every dollar face below — old or new session alike.
+    const livePrice = livePriceForSummary(s);
+    const usdProf = savedUsdProfileForSummary(s, livePrice);
     const requests = Math.max(s.stats.requests ?? 0, agg?.agg?.requests ?? 0);
     const inputTokens = Math.max(s.stats.inputTokens ?? 0, agg?.agg?.input ?? 0);
     const cachedTokens = Math.max(s.stats.cachedTokens ?? 0, agg?.agg?.cached ?? 0);
@@ -764,20 +804,52 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     let blocksSaved = 0;
     for (const b of s.state.blocks) if (b.active !== false) blocksSaved += b.compressedTokens ?? 0;
     const tokensSaved = Math.max(s.stats.tokensSaved ?? 0, blocksSaved);
-    // #4899: money faces — spend from the persisted USD ledger, savings from
-    // the same folds priced with the stamped {w,r,q} profile. Both undefined
-    // when unpriced: the UI shows tokens only, never fabricated dollars.
-    // #4899 follow-up: the stamp site records the profile's UNIT SYSTEM in
-    // cachePriceProfileAbs — registry stamps are already $/Mtok (bill
-    // directly); user-config stamps are dimensionless RATIOS, anchored here
-    // against the session's stamped billing price input rate (same
-    // per-request latest-wins snapshot the spend ledger bills with). No
-    // anchor and no absolute profile → tokens only, never a misprice.
+    // #4899 v2: spend — the persisted per-request ledger wins when present
+    // (exact beats estimated); otherwise derive from the displayed tokens ×
+    // the live tier rates (fresh input @ input rate, cached @ read rate,
+    // output @ output rate). Unpriced model → undefined: tokens only, never
+    // fabricated dollars.
     const costLedger = validCostUsd(s.stats.costUsd);
-    const costUsd = costLedger !== undefined
-        ? { ...costLedger, total: costLedger.input + costLedger.cacheRead + costLedger.cacheWrite + costLedger.output }
+    const persistedSum = costLedger === undefined ? 0 : costLedger.input + costLedger.cacheRead + costLedger.cacheWrite + costLedger.output;
+    const costUsd: { input: number; cacheRead: number; cacheWrite: number; output: number; total: number; estimated?: boolean } | undefined =
+        costLedger !== undefined && persistedSum > 0
+            ? { input: costLedger.input, cacheRead: costLedger.cacheRead, cacheWrite: costLedger.cacheWrite, output: costLedger.output, total: persistedSum }
+            : (() => {
+                  if (livePrice === undefined) return undefined;
+                  const cachedPart = Math.min(Math.max(0, cachedTokens), Math.max(0, inputTokens));
+                  const freshPart = Math.max(0, inputTokens) - cachedPart;
+                  const inputSide = (freshPart * livePrice.input) / 1e6;
+                  const cacheSide = (cachedPart * livePrice.cacheRead) / 1e6;
+                  const outputSide = (outputTokens * livePrice.output) / 1e6;
+                  const total = inputSide + cacheSide + outputSide;
+                  return total > 0
+                      ? { input: inputSide, cacheRead: cacheSide, cacheWrite: 0, output: outputSide, total, estimated: true }
+                      : undefined;
+              })();
+    // Savings — net-$ mirror through the canonical fold formula (validated in
+    // billing.ts + tests/billing-prices.test.ts), gross-$ = avoided turns at
+    // the read rate; fold-less sessions estimate flat at the live INPUT rate
+    // (uncompressed, those tokens would have been re-sent as input; nothing
+    // repayable is known, so gross == net here).
+    const foldsArr = led?.folds ?? [];
+    let savedUsd: number | undefined;
+    let savedUsdGross: number | undefined;
+    if (hasFolds && usdProf !== undefined) {
+        const net = savedUsdFromFolds(foldsArr, usdProf);
+        if (net !== undefined) {
+            savedUsd = net;
+            let gross = 0;
+            for (const f of foldsArr) gross += (((f.S ?? 0) - (f.sigma ?? 0)) * (f.requestsAfter ?? 0) * usdProf.r) / 1e6;
+            savedUsdGross = gross;
+        }
+    } else if (!hasFolds && livePrice !== undefined && tokensSaved > 0) {
+        savedUsd = savedUsdGross = (tokensSaved * livePrice.input) / 1e6;
+    }
+    // Dollar face of the hit-rate miss buckets: genuinely-new content bills at
+    // the input rate; compression/TTL repays are cache reads.
+    const missUsd = hasLedger && livePrice !== undefined && ((agg?.agg?.nc ?? 0) + (agg?.agg?.cr ?? 0) + (agg?.agg?.tr ?? 0)) > 0
+        ? { n: ((agg?.agg?.nc ?? 0) * livePrice.input) / 1e6, c: ((agg?.agg?.cr ?? 0) * livePrice.cacheRead) / 1e6, x: ((agg?.agg?.tr ?? 0) * livePrice.cacheRead) / 1e6 }
         : undefined;
-    const savedUsd = savedUsdForSummary(s);
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
     let firstBlockHint = "";
     const fb = s.state.blocks.find((b) => b.topic || b.summary);
@@ -849,6 +921,10 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(typeof s.metadata.lastModel === "string" && s.metadata.lastModel.length > 0 ? { model: s.metadata.lastModel } : {}),
         ...(costUsd !== undefined ? { costUsd } : {}),
         ...(savedUsd !== undefined ? { savedUsd: Math.round(savedUsd * 1e4) / 1e4 } : {}),
+        ...(savedUsdGross !== undefined ? { savedUsdGross: Math.round(savedUsdGross * 1e4) / 1e4 } : {}),
+        ...(missUsd !== undefined
+            ? { missSplitUsd: { n: Math.round(missUsd.n * 1e4) / 1e4, c: Math.round(missUsd.c * 1e4) / 1e4, x: Math.round(missUsd.x * 1e4) / 1e4 } }
+            : {}),
         ...(hasFolds && coverageLostFolds > 0 ? { coverageLostFolds, coverageLostFrozenTokens } : {}),
         ...(hasLedger ? { newContent: agg?.agg?.nc ?? 0, compRepay: agg?.agg?.cr ?? 0, ttlRepay: agg?.agg?.tr ?? 0 } : {}),
         ...(typeof agg?.agg?.input === "number" && agg.agg.input > 0
@@ -981,12 +1057,14 @@ export async function buildOverview(): Promise<WebOverview> {
     const all = allAll.filter((s) => !isEmptyStub(s));
     let requests = 0, input = 0, cached = 0, output = 0, saved = 0, savedEstimated = 0, blocks = 0, live = 0;
     let grossSavedTotal = 0, netSavedTotal = 0, repayTotal = 0, summaryCostTotal = 0, hasFoldData = false;
-    // #4899: fleet USD totals — spend from per-session ledgers, savings from
-    // priced folds; unpriced sessions simply contribute nothing (never $0 fake).
-    let costUsdTotal = 0, savedUsdTotal = 0, hasMoneyData = false;
+    // #4899 v2: fleet USD totals — now live-derived per session (see
+    // summaryOf), so OLD sessions contribute too; unresolvable models still
+    // contribute nothing (never $0 fake).
+    let costUsdTotal = 0, savedUsdTotal = 0, savedUsdGrossTotal = 0, hasMoneyData = false;
+    let missUsdN = 0, missUsdC = 0, missUsdX = 0, hasMissUsd = false;
     let coverageLostFoldTotal = 0, coverageLostFrozenTotal = 0;
     let missNewTotal = 0, missCompTotal = 0, missTtlTotal = 0, missInputTotal = 0;
-    const protoMap = new Map<string, { protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; missNew: number; missComp: number; missTtl: number; missInput: number }>();
+    const protoMap = new Map<string, { protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; missNew: number; missComp: number; missTtl: number; missInput: number; savedUsd: number; hasSavedUsd: boolean }>();
     for (const s of all) {
         requests += s.requests;
         input += s.inputTokens;
@@ -1000,7 +1078,7 @@ export async function buildOverview(): Promise<WebOverview> {
         // tokensSaved is a local estimate (upstream never reports it); flag
         // the share coming from sessions without usage samples (ledger).
         const key = s.protocol ?? "unknown";
-        const row = protoMap.get(key) ?? { protocol: key, sessions: 0, requests: 0, inputTokens: 0, cachedTokens: 0, savedNet: 0, folds: 0, missNew: 0, missComp: 0, missTtl: 0, missInput: 0 };
+        const row = protoMap.get(key) ?? { protocol: key, sessions: 0, requests: 0, inputTokens: 0, cachedTokens: 0, savedNet: 0, folds: 0, missNew: 0, missComp: 0, missTtl: 0, missInput: 0, savedUsd: 0, hasSavedUsd: false };
         row.sessions += 1;
         row.requests += s.requests;
         row.inputTokens += s.inputTokens;
@@ -1026,6 +1104,15 @@ export async function buildOverview(): Promise<WebOverview> {
         if (s.savedUsd !== undefined) {
             hasMoneyData = true;
             savedUsdTotal += s.savedUsd;
+            row.hasSavedUsd = true;
+            row.savedUsd += s.savedUsd;
+        }
+        if (s.savedUsdGross !== undefined) savedUsdGrossTotal += s.savedUsdGross;
+        if (s.missSplitUsd !== undefined) {
+            hasMissUsd = true;
+            missUsdN += s.missSplitUsd.n;
+            missUsdC += s.missSplitUsd.c;
+            missUsdX += s.missSplitUsd.x;
         }
         if (s.hasLedger && s.grossSaved != null) {
             hasFoldData = true;
@@ -1058,6 +1145,10 @@ export async function buildOverview(): Promise<WebOverview> {
         coverageLostFrozenTotal,
         costUsdTotal,
         savedUsdTotal,
+        savedUsdGrossTotal,
+        ...(hasMissUsd
+            ? { missSplitUsdTotal: { n: Math.round(missUsdN * 1e4) / 1e4, c: Math.round(missUsdC * 1e4) / 1e4, x: Math.round(missUsdX * 1e4) / 1e4 } }
+            : {}),
         hasMoneyData,
         missNewTotal,
         missCompTotal,
@@ -1078,6 +1169,7 @@ export async function buildOverview(): Promise<WebOverview> {
                 folds: r.folds,
                 hitPct: hitPct(r.inputTokens, r.cachedTokens),
                 ...(base > 0 ? { missDropNew: drop(r.missNew), missDropComp: drop(r.missComp), missDropTtl: drop(r.missTtl) } : {}),
+                ...(r.hasSavedUsd ? { savedUsd: Math.round(r.savedUsd * 1e4) / 1e4 } : {}),
             };
         }),
         recent: all.slice(0, 8),

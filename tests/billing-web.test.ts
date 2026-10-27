@@ -183,9 +183,10 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
     ratioOnly.stats.requests = 2;
     ratioOnly.metadata.cachePriceProfile = { w: 1, r: 0.1, q: 4 };
     ratioOnly.metadata.cacheLedger = { folds: [{ S: 50000, sigma: 5000, T: 3000, requestsAfter: 10 }] };
-    // Same ratio WITH a stamped billing price: the panel anchors it at read
-    // time (ratio × input rate) — real dollars without touching the stamped
-    // profile values any existing consumer reads.
+    // Same ratio WITH a stamped billing price and NO live table entry for this
+    // model: falls back to anchoring at read time (ratio × input rate) — real
+    // dollars without touching the stamped profile values any existing consumer
+    // reads.
     const anchored = getSession("web-money-5", { protocol: "anthropic", upstreamOrigin: "http://api.somehost.com" });
     anchored.metadata.lastModel = "claude-anchored";
     anchored.stats.requests = 2;
@@ -198,12 +199,19 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
     assert.ok(row1);
     assert.equal(row1!.model, "claude-bill", "model id surfaced for the pricing editor");
     assert.ok(Math.abs(row1!.costUsd!.total - (0.003 + 0.00012 + 0.000375 + 0.03)) < 1e-12, "spend total sums the ledger");
-    // savedUsd mirrors the kernel fold formula: (S−σ)·ra·r − [(w−r)·T + q·σ − r·S],
-    // rounded to 4 decimals at the summary boundary (display precision).
-    const perTurn = (50000 - 5000) * 10 * 0.3;
-    const oneTime = (3.75 - 0.3) * 3000 + 15 * 5000 - 0.3 * 50000;
-    const expectSaved = Math.round(((perTurn - oneTime) / 1e6) * 1e4) / 1e4;
+    // #4899 follow-up (live pricing): the panel prices folds at the CURRENT
+    // price table — live registry tiers {input:3, cacheRead:0.3, output:15}
+    // override the stamped {w:3.75,…} profile. Saved mirrors the kernel fold
+    // formula: (S−σ)·ra·r − [(w−r)·T + q·σ − r·S], rounded to 4 decimals at
+    // the summary boundary (display precision).
+    const perTurn = (50000 - 5000) * 10 * 0.3; // 135000
+    const oneTime = (3 - 0.3) * 3000 + 15 * 5000 - 0.3 * 50000; // 68100
+    const expectSaved = Math.round(((perTurn - oneTime) / 1e6) * 1e4) / 1e4; // 0.0669
     assert.ok(row1!.savedUsd !== undefined && Math.abs(row1!.savedUsd! - expectSaved) < 1e-9, `savedUsd ${row1!.savedUsd}`);
+    // Persisted ledger present ⇒ spend reads as exact (no estimated flag);
+    // gross-$ face rides the same live profile r=0.3.
+    assert.equal(row1!.costUsd?.estimated, undefined, "persisted spend ledger is exact, not estimated");
+    assert.ok(Math.abs((row1!.savedUsdGross ?? 0) - 0.135) < 1e-9, `savedUsdGross ${row1!.savedUsdGross}`);
     const row2 = list.find((s) => s.id === "web-money-2");
     assert.ok(row2);
     assert.equal(row2!.costUsd, undefined, "unpriced: no spend row, tokens only");
@@ -225,6 +233,8 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
     const ov = await buildOverview();
     assert.ok(Math.abs(ov.costUsdTotal - (0.003 + 0.00012 + 0.000375 + 0.03)) < 1e-12, "overview spend total");
     assert.ok(Math.abs(ov.savedUsdTotal - (expectSaved + expectAnchored)) < 1e-9, "overview saved-$ total includes both priced sessions");
+    // Both priced sessions share r=0.3 → gross faces sum to 2×0.135.
+    assert.ok(Math.abs((ov.savedUsdGrossTotal ?? 0) - 0.27) < 1e-9, `savedUsdGrossTotal ${ov.savedUsdGrossTotal}`);
     assert.equal(ov.hasMoneyData, true, "money totals exist when any session is priced");
 
     // A world with no prices anywhere reports hasMoneyData=false (dash, not $0).
@@ -234,4 +244,38 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
     assert.equal(ov2.hasMoneyData, false);
     assert.equal(ov2.costUsdTotal, 0);
     assert.equal(ov2.savedUsdTotal, 0);
+});
+
+test("#4899 legacy sessions: $ faces derive LIVE from the current price table (no stamps needed)", async () => {
+    resetState();
+    const legacy = getSession("web-legacy-1", { protocol: "anthropic", upstreamOrigin: "http://api.somehost.com" });
+    legacy.metadata.lastModel = "claude-bill";
+    legacy.stats.requests = 2;
+    legacy.stats.inputTokens = 1_000_000;
+    legacy.stats.cachedTokens = 500_000;
+    legacy.stats.outputTokens = 10_000;
+    legacy.metadata.cacheLedger = { folds: [{ S: 50000, sigma: 5000, T: 3000, requestsAfter: 10 }] };
+
+    const list = await buildSessionList();
+    const row = list.find((s) => s.id === "web-legacy-1");
+    assert.ok(row);
+    // Live estimate from the registry {input:3, output:15, cache_read:0.3}:
+    // fresh 500k@3 + cached 500k@0.3 + output 10k@15 = 1.5 + 0.15 + 0.15.
+    assert.equal(row!.costUsd?.estimated, true, "live-derived spend is flagged estimated");
+    assert.ok(row!.costUsd && Math.abs(row!.costUsd.total - 1.8) < 1e-12, `spend ${row!.costUsd?.total}`);
+    // Folds priced at the same live tiers: perTurn=(45000)·10·0.3=135000,
+    // oneTime=(3−0.3)·3000+15·5000−0.3·50000=68100 → 0.0669.
+    assert.ok(row!.savedUsd !== undefined && Math.abs(row!.savedUsd! - 0.0669) < 1e-9, `savedUsd ${row!.savedUsd}`);
+    assert.ok(Math.abs((row!.savedUsdGross ?? 0) - 0.135) < 1e-9, `savedUsdGross ${row!.savedUsdGross}`);
+    const ov = await buildOverview();
+    assert.equal(ov.hasMoneyData, true, "live estimate counts as money data");
+    assert.ok(Math.abs(ov.costUsdTotal - 1.8) < 1e-12, `overview spend ${ov.costUsdTotal}`);
+
+    // Editing the price table re-prices immediately (nothing was persisted).
+    setBillingOverrides({ "claude-bill": { input: 6, output: 15, cacheRead: 0.3 } });
+    const list2 = await buildSessionList();
+    const row2 = list2.find((s) => s.id === "web-legacy-1");
+    assert.ok(row2!.costUsd && Math.abs(row2!.costUsd.total - (3.0 + 0.15 + 0.15)) < 1e-12, `re-priced ${row2!.costUsd?.total}`);
+    // oneTime=(6−0.3)·3000+15·5000−0.3·50000=77100 → (135000−77100)/1e6.
+    assert.ok(row2!.savedUsd !== undefined && Math.abs(row2!.savedUsd! - 0.0579) < 1e-9, `re-priced savedUsd ${row2!.savedUsd}`);
 });
