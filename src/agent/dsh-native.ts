@@ -2420,6 +2420,20 @@ export function apply(ctx: PluginContext): void {
         if (base === undefined) return;
         if (!(await probeIncrementalTurns(base))) return;
         sweepStale(incPendingAcks, INC_PENDING_TTL_MS);
+        // #3370 single-flight (omp/opencode pattern; kept over #3329's
+        // removal per the rebase decision): while a marker'd request for
+        // this URL is still awaiting its ack, later requests ride the normal
+        // pipeline — pending entries are now keyed by turn id (#3329), so
+        // the guard scans for a live entry stashed on THIS url.
+        // The guard must run BEFORE planIncrementalTurn: planning claims the
+        // turn's msgIds client-side (#4491), and a plan this guard then
+        // discards would burn those ids — the host's retry screens against
+        // the burned claims and silently drops the whole msgIds field.
+        let inflight = false;
+        for (const pending of incPendingAcks.values()) {
+            if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
+        }
+        if (inflight) return;
         const sid = attr.sid;
         // #4491: pin the turn to the host's own message ids — the ids captured
         // on the llm/stream options are only trustworthy when they line up
@@ -2438,16 +2452,6 @@ export function apply(ctx: PluginContext): void {
             msgIds,
         });
         if (plan.mode === "skip") return;
-        // #3370 single-flight (omp/opencode pattern; kept over #3329's
-        // removal per the rebase decision): while a marker'd request for
-        // this URL is still awaiting its ack, later requests ride the normal
-        // pipeline — pending entries are now keyed by turn id (#3329), so
-        // the guard scans for a live entry stashed on THIS url.
-        let inflight = false;
-        for (const pending of incPendingAcks.values()) {
-            if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
-        }
-        if (inflight) return;
         const turnId = newIncrementalTurnId();
         // #3304: stash the pre-swap body under this turn's id — if the proxy
         // dies before the send lands, the direct-send guard restores these
