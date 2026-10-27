@@ -60,13 +60,18 @@ function mysqlEnv(dsn: string): NodeJS.ProcessEnv {
  *  already flaked once under a loaded 2-vCPU runner (#4666 review round 2). */
 async function untilRows(store: SessionStore, id: string, ms = 30_000): Promise<void> {
     const deadline = Date.now() + ms;
+    let lastError: string | undefined;
     while (Date.now() < deadline) {
-        const shadow = (store as unknown as { shadow?: { viewForAsync(sid: string): Promise<{ id?: string } | null> } }).shadow;
+        const shadow = (store as unknown as { shadow?: { viewForAsync(sid: string): Promise<{ id?: string } | null>; stats?: { lastError?: string; disabled?: boolean } } }).shadow;
+        lastError = shadow?.stats?.lastError;
         const view = shadow ? await shadow.viewForAsync(id) : null;
         if (view) return;
         await new Promise((r) => setTimeout(r, 50));
     }
-    assert.fail(`mysql rows for ${id} did not land within ${ms}ms`);
+    // #4926: the async record path only LOGS after 3 consecutive failures, so
+    // a single silent ingest failure produces zero log lines — surface the
+    // shadow's own error latch in the assertion instead of another blind red.
+    assert.fail(`mysql rows for ${id} did not land within ${ms}ms (shadow.lastError: ${lastError ?? "<none — ingest never failed or never ran>"})`);
 }
 
 test("mysql hot path: saves land on the backend, envelopes keep being written, restart stays warm", { skip: DSN ? false : "BILI_MYSQL_TEST_DSN not set" }, async () => {
