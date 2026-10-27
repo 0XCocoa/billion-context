@@ -2640,9 +2640,14 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.usage") + '</span></div><div class="card-b">');
         parts.push('<div class="grid cols-4">');
         mini(parts, t("common.requests"), d.requests ? fmtW(d.requests) : null);
-        mini(parts, t("ov.input_tokens"), d.inputTokens ? fmtW(d.inputTokens) : null, false,
-            d.payback != null && d.savedUsdGross != null ? t("det.in_counterfactual", { n: fmtUsd(d.savedUsdGross) }) : "");
-        mini(parts, t("ov.cached_tokens"), d.cachedTokens ? fmtW(d.cachedTokens) : null);
+        // #4899 v4: every token figure gets its own ≈$ face even without folds
+        // (priced sessions carry a live-estimated costUsd) — same tiers as the
+        // overview cards; unpriced sessions stay bare.
+        const inSub = (d.costUsd ? t("ov.tier_unhit", { n: fmtUsd(d.costUsd.input) }) : "")
+            + (d.payback != null && d.savedUsdGross != null ? " · " + t("det.in_counterfactual", { n: fmtUsd(d.savedUsdGross) }) : "");
+        mini(parts, t("ov.input_tokens"), d.inputTokens ? fmtW(d.inputTokens) : null, false, inSub);
+        mini(parts, t("ov.cached_tokens"), d.cachedTokens ? fmtW(d.cachedTokens) : null, false,
+            d.costUsd && d.cachedTokens > 0 ? t("ov.money_eq", { n: fmtUsd(d.costUsd.cacheRead) }) : "");
         const mt = d.ledger && d.ledger.totals;
         const missArgs = mt && mt.input > 0 ? { n: fmtW(mt.newContent || 0), c: fmtW(mt.compRepay || 0), x: fmtW(mt.ttlRepay || 0), pn: (((mt.newContent || 0) / mt.input) * 100).toFixed(1), pc: (((mt.compRepay || 0) / mt.input) * 100).toFixed(1), px: (((mt.ttlRepay || 0) / mt.input) * 100).toFixed(1) } : null;
         // #2929: the headline hit-rate subline stays the three-bucket split only —
@@ -2670,7 +2675,8 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             : "";
         mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missLine);
         mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null, false,
-            d.payback != null && d.summaryCost ? t("det.out_split", { n: fmtW(Math.max(0, d.outputTokens - d.summaryCost)), nn: fmtUsd(d.payback.normalOutputUsd), s: fmtW(d.summaryCost), ss: fmtUsd(d.payback.sigmaUsd) }) : "");
+            (d.costUsd ? t("ov.money_eq", { n: fmtUsd(d.costUsd.output) }) : "")
+            + (d.payback != null && d.summaryCost ? " · " + t("det.out_split", { n: fmtW(Math.max(0, d.outputTokens - d.summaryCost)), nn: fmtUsd(d.payback.normalOutputUsd), s: fmtW(d.summaryCost), ss: fmtUsd(d.payback.sigmaUsd) }) : ""));
         const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
         // #4899: money faces — saved-$ rides the saved-tokens card as the sub
         // line; spend gets its own card with the input/cache/output breakdown.
