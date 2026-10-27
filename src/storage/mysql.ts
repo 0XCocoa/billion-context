@@ -279,7 +279,13 @@ export class MysqlBackend implements StorageBackend {
             const [metaRows] = (await conn.query(
                 "SELECT meta_value FROM bili_meta WHERE meta_key = 'schema_version'",
             )) as unknown as Row[][];
-            const current = num((metaRows[0] as Row | undefined)?.meta_value);
+            // meta_value is VARCHAR(256): the driver hands the stamp back as a
+            // string, so the number-only num() coercion would yield 0 and fire
+            // the v8 data step on EVERY boot instead of exactly once (#4666).
+            // Parse the decimal string explicitly.
+            const rawStamp = (metaRows[0] as Row | undefined)?.meta_value;
+            const parsedStamp = Number(rawStamp);
+            const current = Number.isFinite(parsedStamp) ? parsedStamp : 0;
             if (current < MYSQL_SCHEMA_VERSION) {
                 // #4390 v8: position-independent identity + historian
                 // tombstones. CREATE TABLE IF NOT EXISTS does not upgrade an
