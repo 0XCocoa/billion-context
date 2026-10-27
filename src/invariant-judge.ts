@@ -503,7 +503,10 @@ function defaultSink(sessionId: string | undefined, lane: "main" | "loop"): Sink
     const where = `[${sessionId ?? "unknown"}] [invariant-judge${v.lane ? `/${v.lane}` : ``}]`;
     if (!v.ok) {
       const head = v.violations[0];
-      loggerLog("warn", `${where} I${v.folded ? 2 : 1} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``})`);
+      // #4862: label by the invariant that actually fired — an I3 pairing
+      // violation on a non-folded request must not read as "I1".
+      const inv = head.kind === "unpaired-tool-call" || head.kind === "unpaired-tool-result" ? 3 : v.folded ? 2 : 1;
+      loggerLog("warn", `${where} I${inv} violation: ${head.kind} @${head.index} — ${head.detail} (${v.violations.length} finding(s), matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``})`);
     } else {
       loggerLog("debug", `${where} clean ${v.folded ? "fold" : "growth"} verdict: matched ${v.matched}/${v.total}${v.exempt ? `, exempt carrier=${v.exempt.carrier} reasoning=${v.exempt.reasoning} crush=${v.exempt.crush} ccr=${v.exempt.ccr} truncate=${v.exempt.truncate}` : ``}`);
     }
