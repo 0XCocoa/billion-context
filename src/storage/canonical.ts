@@ -59,12 +59,8 @@ function canonicalizeWithContext(value: unknown, key: string | undefined): unkno
     if (value && typeof value === "object") {
         const out: Record<string, unknown> = {};
         const record = value as Record<string, unknown>;
-        // Keys digest in SORTED order (#4392): insertion order is not part of
-        // the persistence contract. The live leg carries the kernel's own
-        // object order while the replay leg rebuilds the same values field by
-        // field from unified rows (messageRefs.byRef after a ledger
-        // re-alignment, mergeState's spread-merged nudge/stats), so hashing
-        // insertion order reported "[diverged: state]" against itself.
+        // Sorted keys per the #4392 rule in this file's header — see there for
+        // why insertion order cannot be part of the contract.
         for (const k of Object.keys(record).sort()) {
             const v = record[k];
             // One skip table for every digest producer (#4392): see
