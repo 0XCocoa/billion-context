@@ -37,11 +37,11 @@ export interface BillingPrice {
     cacheWrite?: number;
 }
 
-export interface BillingSettings {
+interface BillingSettings {
     prices: Record<string, BillingPrice>;
 }
 
-export interface ResolvedBillingPrice {
+interface ResolvedBillingPrice {
     input: number;
     output: number;
     cacheRead: number;
@@ -176,14 +176,6 @@ export function stampedBillingPrice(session: Session): ResolvedBillingPrice | un
     if (input === undefined) return undefined;
     const out: ResolvedBillingPrice = { input, source: o.source === "config" ? "config" : "registry", output: nonNegNum(o.output) ?? input, cacheRead: nonNegNum(o.cacheRead) ?? input, cacheWrite: nonNegNum(o.cacheWrite) ?? input };
     return out;
-}
-
-/** USD ledger stored on the session — persisted, survives restart. */
-export interface CostUsd {
-    input: number;
-    cacheRead: number;
-    cacheWrite: number;
-    output: number;
 }
 
 /** Bill one settled usage report's input side: fresh input at the input
