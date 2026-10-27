@@ -164,13 +164,34 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
     const priced = getSession("web-money-1", { protocol: "anthropic", upstreamOrigin: "http://api.somehost.com" });
     priced.metadata.lastModel = "claude-bill";
     priced.stats.requests = 2;
+    // The stamp site writes the absolute-flag alongside $/Mtok profiles; the
+    // fixture simulates a post-fix registry/user-anchored stamp.
     priced.metadata.cachePriceProfile = { w: 3.75, r: 0.3, q: 15 };
+    priced.metadata.cachePriceProfileAbs = true;
     priced.metadata.cacheLedger = { folds: [{ S: 50000, sigma: 5000, T: 3000, requestsAfter: 10 }] };
     priced.stats.costUsd = { input: 0.003, cacheRead: 0.00012, cacheWrite: 0.000375, output: 0.03 };
     const unpriced = getSession("web-money-2", { protocol: "anthropic", upstreamOrigin: "http://api.somehost.com" });
     unpriced.metadata.lastModel = "claude-unknown";
     unpriced.stats.requests = 2;
     unpriced.metadata.cacheLedger = { folds: [{ S: 90000, sigma: 9000, T: 9000, requestsAfter: 50 }] };
+    // #4899 follow-up regression pin: a dimensionless user-ratio profile with
+    // NO absolute flag and no stamped billing price (unanchored or legacy
+    // pre-flag stamp) must NOT be billed as $/Mtok — savedUsd stays undefined,
+    // tokens only.
+    const ratioOnly = getSession("web-money-4", { protocol: "anthropic", upstreamOrigin: "http://api.somehost.com" });
+    ratioOnly.metadata.lastModel = "claude-ratio";
+    ratioOnly.stats.requests = 2;
+    ratioOnly.metadata.cachePriceProfile = { w: 1, r: 0.1, q: 4 };
+    ratioOnly.metadata.cacheLedger = { folds: [{ S: 50000, sigma: 5000, T: 3000, requestsAfter: 10 }] };
+    // Same ratio WITH a stamped billing price: the panel anchors it at read
+    // time (ratio × input rate) — real dollars without touching the stamped
+    // profile values any existing consumer reads.
+    const anchored = getSession("web-money-5", { protocol: "anthropic", upstreamOrigin: "http://api.somehost.com" });
+    anchored.metadata.lastModel = "claude-anchored";
+    anchored.stats.requests = 2;
+    anchored.metadata.cachePriceProfile = { w: 1, r: 0.1, q: 4 };
+    anchored.metadata.billingPrice = { input: 3, output: 12, cacheRead: 0.3, cacheWrite: 3.75, source: "registry" };
+    anchored.metadata.cacheLedger = { folds: [{ S: 50000, sigma: 5000, T: 3000, requestsAfter: 10 }] };
 
     const list = await buildSessionList();
     const row1 = list.find((s) => s.id === "web-money-1");
@@ -187,10 +208,23 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
     assert.ok(row2);
     assert.equal(row2!.costUsd, undefined, "unpriced: no spend row, tokens only");
     assert.equal(row2!.savedUsd, undefined, "no stamped profile: never priced on fabricated defaults");
+    const row4 = list.find((s) => s.id === "web-money-4");
+    assert.ok(row4);
+    assert.equal(
+        row4!.savedUsd,
+        undefined,
+        "ratio profile without the absolute flag is never billed as $/Mtok (#4899 follow-up)",
+    );
+    // Anchored ratio: kernel-default-filled {w:1,r:0.1,q:4} × input 3 →
+    // {w:3,r:0.3,q:12}: perTurn=(50000−5000)·10·0.3=135000, oneTime=(3−0.3)·3000+12·5000−0.3·50000=53100.
+    const expectAnchored = Math.round(((135000 - 53100) / 1e6) * 1e4) / 1e4;
+    const row5 = list.find((s) => s.id === "web-money-5");
+    assert.ok(row5);
+    assert.ok(row5!.savedUsd !== undefined && Math.abs(row5!.savedUsd! - expectAnchored) < 1e-9, `anchored savedUsd ${row5!.savedUsd}`);
 
     const ov = await buildOverview();
     assert.ok(Math.abs(ov.costUsdTotal - (0.003 + 0.00012 + 0.000375 + 0.03)) < 1e-12, "overview spend total");
-    assert.ok(Math.abs(ov.savedUsdTotal - expectSaved) < 1e-9, "overview saved-$ total");
+    assert.ok(Math.abs(ov.savedUsdTotal - (expectSaved + expectAnchored)) < 1e-9, "overview saved-$ total includes both priced sessions");
     assert.equal(ov.hasMoneyData, true, "money totals exist when any session is priced");
 
     // A world with no prices anywhere reports hasMoneyData=false (dash, not $0).

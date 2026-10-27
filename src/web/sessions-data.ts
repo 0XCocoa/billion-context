@@ -106,8 +106,10 @@ interface WebSessionSummary {
      *  (session.stats.costUsd). Absent when no price resolves — tokens only. */
     costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number; total: number };
     /** #4899: money mirror of netSaved — the same folds priced with the
-     *  session's stamped cachePriceProfile ($/Mtok). Can be negative while a
-     *  fold has not paid back (honest, like the token display). */
+     *  session's stamped cachePriceProfile ($/Mtok); only when the stamp site
+     *  marked it absolute (cachePriceProfileAbs === true), else undefined.
+     *  Can be negative while a fold has not paid back (honest, like the token
+     *  display). */
     savedUsd?: number;
     /** Σ T — measured compression re-pay tokens. */
     repayCost?: number;
@@ -587,6 +589,32 @@ function validCostUsd(v: unknown): { input: number; cacheRead: number; cacheWrit
     return { input: input ?? 0, cacheRead: cacheRead ?? 0, cacheWrite: cacheWrite ?? 0, output: output ?? 0 };
 }
 
+/** #4899 follow-up: resolve the $/Mtok profile for the savings-mirror view
+ *  from the session's stamps. Absolute stamps (registry source) bill
+ *  directly; ratio stamps (user-config source) are anchored against the
+ *  stamped billing price's input rate — the same per-request snapshot the
+ *  spend ledger bills with. Kernel defaults fill partial profiles exactly
+ *  like the token-report consumer, so both views price on the same effective
+ *  values. Legacy stamps predating the flag and unanchored ratios return
+ *  undefined — tokens only, never a misprice. */
+function savedUsdForSummary(s: SummarySource): number | undefined {
+    const o = s.metadata["cachePriceProfile"];
+    if (!o || typeof o !== "object" || Array.isArray(o)) return undefined;
+    const rec = o as Record<string, unknown>;
+    const num = (x: unknown): number | undefined => (typeof x === "number" && Number.isFinite(x) && x >= 0 ? x : undefined);
+    const w = num(rec.w), r = num(rec.r), q = num(rec.q);
+    if (w === undefined && r === undefined && q === undefined) return undefined;
+    const filled = { w: w ?? 1, r: r ?? 0.1, q: q ?? 4 };
+    if (s.metadata["cachePriceProfileAbs"] !== true) {
+        const bp = s.metadata["billingPrice"];
+        const input = bp && typeof bp === "object" ? num((bp as Record<string, unknown>).input) : undefined;
+        if (input === undefined) return undefined;
+        return savedUsdFromFolds((s.metadata["cacheLedger"] as { folds?: Array<{ S?: number; sigma?: number; T?: number; requestsAfter?: number }> } | undefined)?.folds ?? [],
+            { w: filled.w * input, r: filled.r * input, q: filled.q * input });
+    }
+    return savedUsdFromFolds((s.metadata["cacheLedger"] as { folds?: Array<{ S?: number; sigma?: number; T?: number; requestsAfter?: number }> } | undefined)?.folds ?? [], filled);
+}
+
 /** Normalizer mirroring buildSession's v1-flat → grouped fallback for exactly
  *  the fields summaryOf consumes (no blockContents/messages/state merge —
  *  those are the heavy parts this index deliberately avoids). */
@@ -739,11 +767,17 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     // #4899: money faces — spend from the persisted USD ledger, savings from
     // the same folds priced with the stamped {w,r,q} profile. Both undefined
     // when unpriced: the UI shows tokens only, never fabricated dollars.
+    // #4899 follow-up: the stamp site records the profile's UNIT SYSTEM in
+    // cachePriceProfileAbs — registry stamps are already $/Mtok (bill
+    // directly); user-config stamps are dimensionless RATIOS, anchored here
+    // against the session's stamped billing price input rate (same
+    // per-request latest-wins snapshot the spend ledger bills with). No
+    // anchor and no absolute profile → tokens only, never a misprice.
     const costLedger = validCostUsd(s.stats.costUsd);
     const costUsd = costLedger !== undefined
         ? { ...costLedger, total: costLedger.input + costLedger.cacheRead + costLedger.cacheWrite + costLedger.output }
         : undefined;
-    const savedUsd = savedUsdFromFolds(led?.folds ?? [], s.metadata["cachePriceProfile"] as { w?: number; r?: number; q?: number } | undefined);
+    const savedUsd = savedUsdForSummary(s);
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
     let firstBlockHint = "";
     const fb = s.state.blocks.find((b) => b.topic || b.summary);
