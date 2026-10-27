@@ -1853,10 +1853,6 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     // GitHub-master blog pull when this process starts out COLD (no live
     // master overlay yet); processes that already hold a master overlay keep
     // the status path network-free. Internal guard; never throws.
-    // #4906: same fire-and-forget cadence as the changelog warm above — one
-    // GitHub-master blog pull when this process starts out COLD (no live
-    // master overlay yet); processes that already hold a master overlay keep
-    // the status path network-free. Internal guard; never throws.
     warmBlogRefreshOnce();
     if (panel !== undefined && preFooter.length > 0) {
         // Escape $ so advisory text (remote doc content) cannot be read as
