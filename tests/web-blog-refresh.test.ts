@@ -205,6 +205,34 @@ test("concurrent forced rounds coalesce into one network pass (single-flight)", 
     assert.equal(hits.filter((u) => u === CONTENTS_URL).length, 1);
 });
 
+/* ---------------- hourly self-chain (#4906 follow-up) ------------------ */
+
+test("first touch arms the hourly chain: forced rounds land at ~1h and ~2h without traffic", async (t) => {
+    installGithubRouter();
+    t.mock.timers.enable({ apis: ["setTimeout"] });   // active BEFORE any arm
+    await runBlogRefreshRound({ force: true });
+    const after1 = hits.filter((u) => u === CONTENTS_URL).length;
+    assert.equal(after1, 1);
+    const ROUND = 60 * 60 * 1000;                     // must match ROUND_TTL_MS
+    t.mock.timers.tick(ROUND);                        // an hour passes, zero traffic
+    for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r));
+    const after2 = hits.filter((u) => u === CONTENTS_URL).length;
+    assert.ok(after2 > after1, "the hourly forced round ran");
+    t.mock.timers.tick(ROUND);                        // chain re-armed inside the kick
+    for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r));
+    const after3 = hits.filter((u) => u === CONTENTS_URL).length;
+    assert.ok(after3 > after2, "the chain keeps ticking");
+    t.mock.timers.reset();                            // drop the pending mock timer
+});
+
+test("armSchedule stays silent while disabled (test escape hatch never arms)", async () => {
+    installGithubRouter();
+    _setBlogRefreshDisabledForTest(true);
+    const out = await runBlogRefreshRound({ force: true });
+    assert.equal(out.ok, false);
+    assert.equal(hits.length, 0);
+});
+
 /* ---------------- status-path warm trigger (plugin.ts cadence) ---------- */
 
 test("warmBlogRefreshOnce pulls exactly once per process from fully cold state", async () => {

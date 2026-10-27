@@ -26,7 +26,7 @@ GET /__bili/blog-assets/<rel> -> 远端内存 map 命中 ? buf : 磁盘路径（
 
 ## 关键取舍
 
-- **不做常驻定时器**：house style（changelog #3719）是访问驱动节流。面板每次打开 / 状态页每次访问都会触发检查，实际新鲜度 ≈ max(1h, 访问间隔)；长跑进程不新增事件循环句柄（fetch-util idle-watchdog 契约）。
+- **每小时自驱链（2026-10-27 owner 要求，覆盖 v1 的纯访问驱动）**：进程第一次碰本模块（博客路由 / status warm / 测试轮）时启动一条每 1h 强拉一轮的链（kick 内部首行自续）。长跑进程即使零访问，服务内容也不会老于 ~1h；句柄 unref，不拖短命 CLI 退出、不进测试事件循环（`_resetBlogRefreshForTest` 会清）；force 保证失败轮也能在下一小时重试（失败轮成本 ≈ 1 次匿名 contents 请求）。
 - **不 await 刷新**：changelog 的 handler await 是因为单请求；博客是 1+N 请求，阻塞请求路径最坏可达分钟级。改为非阻塞后台预取——本次加载看到旧内容，下一刷看到新内容，可接受且零回归风险。
 - **匿名 API**：与 changelog 一致不申请 token；限额靠 fail-soft 吸收。
 - **预算**：md ≤ 512KB/篇、图片 ≤ 2MB/张、总 ≤ 8MB、文件总数 ≤ 200；任一超限 → 放弃本轮远端内容（保留上轮或捆绑），warn 日志（loggerLog，非 console）。

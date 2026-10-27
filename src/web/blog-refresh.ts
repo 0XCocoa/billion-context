@@ -17,6 +17,12 @@
  *   fire-and-forget by construction;
  * - one round at a time (in-flight coalescing) and a TTL between rounds, so a
  *   panel that polls the feed cannot turn this into a scrape;
+ * - once ANY entry point touches this module, the same TTL re-arms as an
+ *   hourly self-scheduling chain (unref'd timer) that force-kicks a round:
+ *   served content ages out to ~1h even when nobody keeps visiting (owner
+ *   requirement, #4906 follow-up 2026-10-27). Short-lived CLIs stay
+ *   unaffected — the handle is unref'd, so it never holds the event loop
+ *   open.
  * - atomic replacement: a round fully downloads its document set (posts,
  *   article texts) and registers everything at once, or registers only the
  *   error marker — a half-fetched tree would render broken bilingual pairs.
@@ -64,6 +70,8 @@ let warmAttempted = false;
  *  process stay network-free — the same cadence the changelog footer has with
  *  its empty-cache check (warm only while cold). */
 let remoteSnapshotPresent = false;
+/** Hourly self-chain handle (#4906 follow-up); unref'd, cleared on reset. */
+let scheduleHandle: ReturnType<typeof setTimeout> | undefined;
 let disabled = false; // test seam
 
 export function _resetBlogRefreshForTest(): void {
@@ -71,6 +79,8 @@ export function _resetBlogRefreshForTest(): void {
     inflight = undefined;
     warmAttempted = false;
     remoteSnapshotPresent = false;
+    if (scheduleHandle !== undefined) clearTimeout(scheduleHandle);
+    scheduleHandle = undefined;
     disabled = false;
 }
 
@@ -91,10 +101,30 @@ export function warmBlogRefreshOnce(): void {
     kickBlogRefresh({ force: true });
 }
 
+/** Hourly self-scheduling chain (#4906 follow-up): the first entry point a
+ *  process reaches (the /__bili/blog route, the status-path warm, or a test
+ *  round) starts a repeating force-kick every ROUND_TTL_MS, so any long-lived
+ *  process serving users shows fresh master content within ~1h even with no
+ *  further traffic; every later arming attempt is a no-op. Force lets a
+ *  failed round retry on the hour instead of slipping a full window; the
+ *  rate cost of a failing round is ~1 contents-API request. The handle is
+ *  unref'd: short-lived CLIs exit normally, tests reset it per case.
+ *  Disabled modules never arm. */
+function armSchedule(): void {
+    if (scheduleHandle !== undefined || disabled) return;
+    const t = setTimeout(() => {
+        scheduleHandle = undefined;
+        kickBlogRefresh({ force: true }); // its head re-arms the next hop
+    }, ROUND_TTL_MS);
+    t.unref?.();
+    scheduleHandle = t;
+}
+
 /** Fire-and-forget entry point for sync callers (the /__bili/blog handler,
  *  server warm-up). Never throws: coalesces onto an in-flight round, skips
  *  silently outside the TTL unless force. */
 export function kickBlogRefresh(opts?: { force?: boolean }): void {
+    armSchedule(); // first touch in this process arms the hourly chain
     if (disabled || inflight !== undefined) return;
     const due = (opts?.force ?? false) || Date.now() - lastRoundStartedAt >= ROUND_TTL_MS;
     if (!due) return;
@@ -107,6 +137,7 @@ export function kickBlogRefresh(opts?: { force?: boolean }): void {
  *  rejects; failure details land in the registered feed error marker. */
 export async function runBlogRefreshRound(opts?: { force?: boolean }): Promise<{ ok: boolean; error?: string }> {
     if (disabled) return { ok: false, error: "disabled" };
+    armSchedule();
     if (inflight === undefined && !((opts?.force ?? false) || Date.now() - lastRoundStartedAt >= ROUND_TTL_MS)) {
         return { ok: true }; // within TTL and nothing running — nothing to do
     }
