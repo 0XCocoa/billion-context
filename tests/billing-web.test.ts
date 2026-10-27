@@ -251,6 +251,11 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
     // Anchored profile {w:3,r:0.3,q:12}: spent == the anchored oneTime terms.
     const pb5 = row5!.payback;
     assert.ok(pb5 !== undefined, "anchored session exposes payback too");
+    // v5: each priced session carries the exact tier rates its faces used
+    // (live table {3,0.3,15} beats the stamp; anchored ratio keeps q=12).
+    assert.deepEqual(row1!.rates, { w: 3, r: 0.3, q: 15 }, "live tier rates exposed");
+    assert.ok(row5!.rates && Math.abs(row5!.rates!.w - 3) < 1e-9 && Math.abs(row5!.rates!.r - 0.3) < 1e-9 && Math.abs(row5!.rates!.q - 12) < 1e-9,
+        `anchored ratio rates (kernel 0.1×input → r) ${JSON.stringify(row5!.rates)}`);
     const expectSpent5 = r4(r4(((3 - 0.3) * 3000) / 1e6) + r4((12 * 5000) / 1e6) - expectCredit1);
     assert.ok(Math.abs((pb5!.spentUsd ?? 0) - expectSpent5) < 1e-9, `anchored spent ${pb5?.spentUsd}`);
     assert.equal(pb5!.actualTurns, 10);
@@ -273,6 +278,11 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
     assert.ok(Math.abs(ov.paybackUsdTotal!.spent - (expectSpent1 + expectSpent5)) < 1e-9, `fleet spent ${ov.paybackUsdTotal?.spent}`);
     assert.ok(Math.abs(ov.paybackUsdTotal!.saved - 0.27) < 1e-9, `fleet saved ${ov.paybackUsdTotal?.saved}`);
     assert.equal(ov.hasMoneyData, true, "money totals exist when any session is priced");
+    // v5: concrete multipliers — fold count + ONE rate triple only while the
+    // whole fleet prices at identical tiers; row1 (q=15) vs row5 (q=12) mix
+    // them ⇒ no single fleet-wide formula line.
+    assert.equal(ov.foldsTotal, 4, "every session in this fixture folded once");
+    if (ov.moneyRates !== undefined) assert.fail(`mixed-tier fleet must not print one rate: ${JSON.stringify(ov.moneyRates)}`);
 
     // A world with no prices anywhere reports hasMoneyData=false (dash, not $0).
     resetState();
@@ -283,6 +293,8 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
     assert.equal(ov2.costUsdSplitTotal, undefined, "no priced sessions → no tier split either");
     assert.equal(ov2.savedUsdTotal, 0);
     assert.equal(ov2.paybackUsdTotal, undefined, "no priced folds → no fleet payback line");
+    if (ov2.moneyRates !== undefined) assert.fail(`no priced sessions but got ${JSON.stringify(ov2.moneyRates)}`);
+    assert.equal(ov2.foldsTotal, 0);
 });
 
 test("#4899 legacy sessions: $ faces derive LIVE from the current price table (no stamps needed)", async () => {
@@ -319,6 +331,9 @@ test("#4899 legacy sessions: $ faces derive LIVE from the current price table (n
     const cul = ov.costUsdSplitTotal;
     assert.ok(cul && Math.abs(cul.i - 1.5) < 1e-9 && Math.abs(cul.r - 0.15) < 1e-9 && cul.w === 0 && Math.abs(cul.o - 0.15) < 1e-9, `legacy split ${JSON.stringify(cul)}`);
     assert.ok(ov.paybackUsdTotal && Math.abs(ov.paybackUsdTotal.turns - 10) < 1e-9 && ov.paybackUsdTotal.saved === r4(0.135 * 1), `legacy fleet payback turns=${ov.paybackUsdTotal?.turns} saved=${ov.paybackUsdTotal?.saved}`);
+    // v5: a single-tier fleet prints its exact rates inside the formula lines.
+    assert.deepEqual(ov.moneyRates, { w: 3, r: 0.3, q: 15 }, "single-rate fleet exposes the triple");
+    assert.equal(ov.foldsTotal, 1);
 
     // Editing the price table re-prices immediately (nothing was persisted).
     setBillingOverrides({ "claude-bill": { input: 6, output: 15, cacheRead: 0.3 } });
@@ -327,6 +342,8 @@ test("#4899 legacy sessions: $ faces derive LIVE from the current price table (n
     assert.ok(row2!.costUsd && Math.abs(row2!.costUsd.total - (3.0 + 0.15 + 0.15)) < 1e-12, `re-priced ${row2!.costUsd?.total}`);
     // oneTime=(6−0.3)·3000+15·5000−0.3·50000=77100 → (135000−77100)/1e6.
     assert.ok(row2!.savedUsd !== undefined && Math.abs(row2!.savedUsd! - 0.0579) < 1e-9, `re-priced savedUsd ${row2!.savedUsd}`);
+    // v5: the exposed rates follow the edit too — nothing frozen at stamp time.
+    assert.deepEqual(row2!.rates, { w: 6, r: 0.3, q: 15 }, `re-priced rates ${JSON.stringify(row2!.rates)}`);
 });
 
 test("#4899 v3 payback: a fold whose one-time cost outruns its avoidance reads NOT-yet-paid-back", async () => {
@@ -355,4 +372,7 @@ test("#4899 v3 payback: a fold whose one-time cost outruns its avoidance reads N
     const ov = await buildOverview();
     assert.ok(ov.paybackUsdTotal !== undefined && ov.paybackUsdTotal.saved - ov.paybackUsdTotal.spent < 0,
         "fleet line shows a negative net while no session has paid back");
+    // v5: single-session fleet → fold count + rate triple both printable.
+    assert.equal(ov.foldsTotal, 1);
+    assert.deepEqual(ov.moneyRates, { w: 3, r: 0.3, q: 15 });
 });

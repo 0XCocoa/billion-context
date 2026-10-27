@@ -1008,13 +1008,20 @@ function changelogCatOf(rawLine) {
             const grossEl = $("st-gross");
             grossEl.textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
             grossEl.title = o.grossSavedTotal ? String(Math.round(Number(o.grossSavedTotal))) : "";
+            // #4899 v5: print THE prices inside the formula lines — only when
+            // every priced session resolves identical rates; mixed fleets keep
+            // plain ≈$ amounts (never a misleading single rate).
+            const r6 = (x) => String(Math.round(x * 1e6) / 1e6);
+            const mra = o.moneyRates ? { w: r6(o.moneyRates.w), r: r6(o.moneyRates.r), q: r6(o.moneyRates.q) } : null;
             $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "")
-                + (o.savedUsdGrossTotal ? " · " + t("ov.money_eq", { n: fmtUsd(o.savedUsdGrossTotal) }) : "");
+                + (o.savedUsdGrossTotal
+                    ? " · " + (mra ? t("ov.gross_formula", { f: o.foldsTotal, g: fmtW(o.grossSavedTotal), r: mra.r, n: fmtUsd(o.savedUsdGrossTotal) }) : t("ov.money_eq", { n: fmtUsd(o.savedUsdGrossTotal) }))
+                    : "");
             const netEl = $("st-netsaved");
             netEl.textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
             netEl.title = o.hasFoldData && o.netSavedTotal ? String(Math.round(Number(o.netSavedTotal))) : "";
             $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "") : "";
-            if (o.hasFoldData && o.savedUsdTotal) $("st-net-sub").textContent += " · " + t("ov.money_eq", { n: fmtUsd(o.savedUsdTotal) });
+            if (o.hasFoldData && o.savedUsdTotal) $("st-net-sub").textContent += " · " + t("ov.money_eq", { n: fmtUsd(o.savedUsdTotal) }) + (mra ? " " + t("ov.net_rates", mra) : "");
             $("st-hitpct").textContent = o.hitPct == null ? t("common.none") : o.hitPct.toFixed(1) + "%";
             // #4899: fleet money totals — only priced sessions contribute; no
             // price data anywhere => dash, never $0.00 (honest-output rule).
@@ -1045,6 +1052,7 @@ function changelogCatOf(rawLine) {
                         const be = o.paybackUsdTotal.spent / avgPerTurn;
                         sub += " · " + (turns >= be ? t("ov.payback_ok") : t("ov.payback_wait", { k: Math.max(1, Math.ceil(be - turns)) }));
                     } else if (pbNet >= 0) sub += " · " + t("ov.payback_ok");
+                    if (mra) sub += " · " + t("ov.payback_rates", mra);
                     $("st-payback-sub").textContent = sub;
                 } else {
                     pbEl.textContent = t("common.none");
@@ -1058,7 +1066,7 @@ function changelogCatOf(rawLine) {
                 const f = (v) => fmtW(v) + (mi > 0 ? " (−" + ((v / mi) * 100).toFixed(1) + "%)" : "");
                 hs.textContent = missSum > 0 ? t("ov.miss_split", { n: f(o.missNewTotal || 0), c: f(o.missCompTotal || 0), x: f(o.missTtlTotal || 0) }) : t("common.none");
                 if (o.missSplitUsdTotal)
-                    hs.textContent += " · " + t("ov.miss_split_usd", { n: fmtUsd(o.missSplitUsdTotal.n), c: fmtUsd(o.missSplitUsdTotal.c), x: fmtUsd(o.missSplitUsdTotal.x) });
+                    hs.textContent += " · " + t("ov.miss_split_usd", { n: fmtUsd(o.missSplitUsdTotal.n), c: fmtUsd(o.missSplitUsdTotal.c), x: fmtUsd(o.missSplitUsdTotal.x) }) + (mra ? " " + t("ov.miss_rates", mra) : "");
             }
             $("st-input").textContent = o.inputTokens ? fmtW(o.inputTokens) : t("common.none");
             $("st-cached").textContent = o.cachedTokens ? fmtW(o.cachedTokens) : t("common.none");
@@ -1067,9 +1075,9 @@ function changelogCatOf(rawLine) {
             // reconcile with the 花费 card (i + r + w + o == costUsdTotal), so
             // every displayed token figure has a money face next to it.
             const cu = o.costUsdSplitTotal;
-            $("st-input-sub").textContent = cu ? t("ov.tier_unhit", { n: fmtUsd(cu.i) }) : "";
-            $("st-cached-sub").textContent = cu ? t("ov.money_eq", { n: fmtUsd(cu.r) }) : "";
-            $("st-output-sub").textContent = cu ? t("ov.money_eq", { n: fmtUsd(cu.o) }) : "";
+            $("st-input-sub").textContent = cu ? t("ov.tier_unhit", { n: fmtUsd(cu.i) }) + (mra ? " · " + t("ov.at_input", { v: mra.w }) : "") : "";
+            $("st-cached-sub").textContent = cu ? t("ov.money_eq", { n: fmtUsd(cu.r) }) + (mra ? " · " + t("ov.at_read", { v: mra.r }) : "") : "";
+            $("st-output-sub").textContent = cu ? t("ov.money_eq", { n: fmtUsd(cu.o) }) + (mra ? " · " + t("ov.at_output", { v: mra.q }) : "") : "";
             const pb = $("protocol-body");
             pb.innerHTML = "";
             const rows = (o.byProtocol || []).slice().sort((a, b) => b.sessions - a.sessions || b.requests - a.requests);
@@ -2643,11 +2651,16 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         // #4899 v4: every token figure gets its own ≈$ face even without folds
         // (priced sessions carry a live-estimated costUsd) — same tiers as the
         // overview cards; unpriced sessions stay bare.
+        // #4899 v5: per-session rate args — show THE price inside each formula,
+        // same rule as the overview (only when one price actually applies).
+        const d6 = (x) => String(Math.round(x * 1e6) / 1e6);
+        const drates = d.rates ? { w: d6(d.rates.w), r: d6(d.rates.r), q: d6(d.rates.q) } : null;
         const inSub = (d.costUsd ? t("ov.tier_unhit", { n: fmtUsd(d.costUsd.input) }) : "")
+            + (drates ? " · " + t("ov.at_input", { v: drates.w }) : "")
             + (d.payback != null && d.savedUsdGross != null ? " · " + t("det.in_counterfactual", { n: fmtUsd(d.savedUsdGross) }) : "");
         mini(parts, t("ov.input_tokens"), d.inputTokens ? fmtW(d.inputTokens) : null, false, inSub);
         mini(parts, t("ov.cached_tokens"), d.cachedTokens ? fmtW(d.cachedTokens) : null, false,
-            d.costUsd && d.cachedTokens > 0 ? t("ov.money_eq", { n: fmtUsd(d.costUsd.cacheRead) }) : "");
+            d.costUsd && d.cachedTokens > 0 ? t("ov.money_eq", { n: fmtUsd(d.costUsd.cacheRead) }) + (drates ? " · " + t("ov.at_read", { v: drates.r }) : "") : "");
         const mt = d.ledger && d.ledger.totals;
         const missArgs = mt && mt.input > 0 ? { n: fmtW(mt.newContent || 0), c: fmtW(mt.compRepay || 0), x: fmtW(mt.ttlRepay || 0), pn: (((mt.newContent || 0) / mt.input) * 100).toFixed(1), pc: (((mt.compRepay || 0) / mt.input) * 100).toFixed(1), px: (((mt.ttlRepay || 0) / mt.input) * 100).toFixed(1) } : null;
         // #2929: the headline hit-rate subline stays the three-bucket split only —
@@ -2671,11 +2684,12 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         // #4899: $ face under the missed-tokens split (current price table); tokens
         // only when no price resolves.
         const missLine = missArgs
-            ? t("det.miss_split_line", missArgs) + (d.missSplitUsd ? "<br>≈ " + escapeHtml(t("ov.miss_split_usd", { n: fmtUsd(d.missSplitUsd.n), c: fmtUsd(d.missSplitUsd.c), x: fmtUsd(d.missSplitUsd.x) })) : "")
+            ? t("det.miss_split_line", missArgs) + (d.missSplitUsd ? "<br>≈ " + escapeHtml(t("ov.miss_split_usd", { n: fmtUsd(d.missSplitUsd.n), c: fmtUsd(d.missSplitUsd.c), x: fmtUsd(d.missSplitUsd.x) })) + (drates ? " " + escapeHtml(t("ov.miss_rates", drates)) : "") : "")
             : "";
         mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missLine);
         mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null, false,
             (d.costUsd ? t("ov.money_eq", { n: fmtUsd(d.costUsd.output) }) : "")
+            + (drates ? " · " + t("ov.at_output", { v: drates.q }) : "")
             + (d.payback != null && d.summaryCost ? " · " + t("det.out_split", { n: fmtW(Math.max(0, d.outputTokens - d.summaryCost)), nn: fmtUsd(d.payback.normalOutputUsd), s: fmtW(d.summaryCost), ss: fmtUsd(d.payback.sigmaUsd) }) : ""));
         const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
         // #4899: money faces — saved-$ rides the saved-tokens card as the sub
@@ -2691,6 +2705,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             const pnet = d.savedUsdGross - d.payback.spentUsd;
             let brk = t("det.payback_brk_base", { r: fmtUsd(d.payback.replayUsd), g: fmtUsd(d.payback.sigmaUsd) });
             if ((d.payback.creditUsd || 0) > 0) brk += " · " + t("det.payback_brk_credit", { c: fmtUsd(d.payback.creditUsd) });
+            if (d.rates) brk += " · " + escapeHtml(t("ov.payback_rates", { w: d6(d.rates.w), r: d6(d.rates.r), q: d6(d.rates.q) }));
             let badge = "";
             if (d.payback.breakevenTurns != null) {
                 const done = d.payback.actualTurns >= d.payback.breakevenTurns;
@@ -2946,8 +2961,14 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         else {
             // All folds in one scrollable panel (same pattern as the compression blocks):
             // numeric headers align with their columns; long lists just scroll.
-            const foldHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.fold_s") + '</th><th class="num">' + t("det.fold_sigma") + '</th><th class="num">' + t("det.fold_h") + '</th><th class="num">' + t("det.fold_t") + "</th></tr>";
-            const foldRow = (f, i) => '<tr><td class="num">' + (f.seq != null ? f.seq : i + 1) + '</td><td class="num">' + (f.at ? fmtDT(f.at) : t("common.none")) + '</td><td class="num">' + fmtW(f.S) + '</td><td class="num">' + fmtW(f.sigma) + '</td><td class="num">' + (f.hPct == null ? t("common.none") : f.hPct.toFixed(1) + "%") + '</td><td class="num">' + fmtW(f.T) + "</td></tr>";
+            const foldHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.fold_s") + '</th><th class="num">' + t("det.fold_sigma") + '</th><th class="num">' + t("det.fold_h") + '</th><th class="num">' + t("det.fold_t") + '</th><th class="num">' + t("det.fold_ra") + '</th><th class="num">' + t("det.fold_saved") + "</th>" + (d.rates ? '<th class="num">' + t("det.fold_usd") + "</th>" : "") + "</tr>";
+            const foldRow = (f, i) => {
+                // #4899 v5: make "how much × how much" concrete per fold — the
+                // later-request multiplier, its token credit, and the ≈$ when a
+                // read rate resolves.
+                const credit = ((f.S ?? 0) - (f.sigma ?? 0)) * (f.requestsAfter ?? 0);
+                return '<tr><td class="num">' + (f.seq != null ? f.seq : i + 1) + '</td><td class="num">' + (f.at ? fmtDT(f.at) : t("common.none")) + '</td><td class="num">' + fmtW(f.S) + '</td><td class="num">' + fmtW(f.sigma) + '</td><td class="num">' + (f.hPct == null ? t("common.none") : f.hPct.toFixed(1) + "%") + '</td><td class="num">' + fmtW(f.T) + '</td><td class="num">' + fmtW(f.requestsAfter ?? 0) + '</td><td class="num">' + fmtW(credit) + "</td>" + (d.rates ? '<td class="num">' + fmtUsd((credit * d.rates.r) / 1e6) + "</td>" : "") + "</tr>";
+};
             parts.push('<div class="fold-scroll"><table class="data fold-table"><thead>' + foldHead + '</thead><tbody>');
             folds.forEach((f, i) => parts.push(foldRow(f, i)));
             parts.push("</tbody></table></div>");

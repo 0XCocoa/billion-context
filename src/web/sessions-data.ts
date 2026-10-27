@@ -144,6 +144,11 @@ interface WebSessionSummary {
         breakevenTurns?: number;
         actualTurns: number;
     };
+    /** #4899 v4: the exact tier rates (USD/Mtok) this session's dollar figures
+     *  were computed with — live price tiers when resolvable, else the stamped
+     *  profile. Exposed so panel formula lines can print the prices themselves.
+     *  Absent when no price resolves (tokens-only session). */
+    rates?: { w: number; r: number; q: number };
     /** Σ T — measured compression re-pay tokens. */
     repayCost?: number;
     /** Σ σ — summary generation cost (output tokens). */
@@ -195,6 +200,13 @@ interface WebOverview {
      *  carry its own ≈$ line. i = fresh (uncached) input, r = cache reads,
      *  w = cache writes, o = output — i+r+w+o == costUsdTotal. */
     costUsdSplitTotal?: { i: number; r: number; w: number; o: number };
+    /** #4899 v4: fold count across all sessions — makes "how many × how many"
+     *  concrete next to grossSavedTotal. */
+    foldsTotal: number;
+    /** #4899 v4: single rate triple (USD/Mtok) when every priced session
+     *  resolves identical rates — lets formula lines name THE price. Absent
+     *  when several models bill differently (totals stay per-session then). */
+    moneyRates?: { w: number; r: number; q: number };
     /** #4899: Σ money-mirrored net savings (only priced sessions contribute). */
     savedUsdTotal: number;
     /** #4899 v2: Σ money-mirrored GROSS savings (avoided turns @ read rate).
@@ -902,6 +914,14 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     const missUsd = hasLedger && livePrice !== undefined && ((agg?.agg?.nc ?? 0) + (agg?.agg?.cr ?? 0) + (agg?.agg?.tr ?? 0)) > 0
         ? { n: ((agg?.agg?.nc ?? 0) * livePrice.input) / 1e6, c: ((agg?.agg?.cr ?? 0) * livePrice.cacheRead) / 1e6, x: ((agg?.agg?.tr ?? 0) * livePrice.cacheRead) / 1e6 }
         : undefined;
+    // #4899 v4: publish the unit rates this session's dollars were computed
+    // with so the panel can print them INSIDE the formulas (fold math uses
+    // usdProf; spend/miss mirrors use livePrice — same tiers whenever both).
+    const rates = usdProf !== undefined
+        ? { w: usdProf.w, r: usdProf.r, q: usdProf.q }
+        : livePrice !== undefined
+            ? { w: livePrice.input, r: livePrice.cacheRead, q: livePrice.output }
+            : undefined;
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
     let firstBlockHint = "";
     const fb = s.state.blocks.find((b) => b.topic || b.summary);
@@ -975,6 +995,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(savedUsd !== undefined ? { savedUsd: Math.round(savedUsd * 1e4) / 1e4 } : {}),
         ...(savedUsdGross !== undefined ? { savedUsdGross: Math.round(savedUsdGross * 1e4) / 1e4 } : {}),
         ...(payback !== undefined ? { payback } : {}),
+        ...(rates !== undefined ? { rates } : {}),
         ...(missUsd !== undefined
             ? { missSplitUsd: { n: Math.round(missUsd.n * 1e4) / 1e4, c: Math.round(missUsd.c * 1e4) / 1e4, x: Math.round(missUsd.x * 1e4) / 1e4 } }
             : {}),
@@ -1115,6 +1136,8 @@ export async function buildOverview(): Promise<WebOverview> {
     // contribute nothing (never $0 fake).
     let costUsdTotal = 0, savedUsdTotal = 0, savedUsdGrossTotal = 0, hasMoneyData = false;
     let cuI = 0, cuR = 0, cuW = 0, cuO = 0;
+    // #4899 v4: fold count + fleet-wide rate uniformity (see WebOverview.rates).
+    let foldsTotal = 0, mrSeen = false, mrMulti = false, mW = 0, mR = 0, mQ = 0;
     let missUsdN = 0, missUsdC = 0, missUsdX = 0, hasMissUsd = false;
     let coverageLostFoldTotal = 0, coverageLostFrozenTotal = 0;
     let pbSpent = 0, pbSaved = 0, pbTurns = 0, hasPayback = false;
@@ -1159,6 +1182,15 @@ export async function buildOverview(): Promise<WebOverview> {
             cuR += s.costUsd.cacheRead;
             cuW += s.costUsd.cacheWrite;
             cuO += s.costUsd.output;
+        }
+        foldsTotal += s.foldCount ?? 0;
+        if (s.rates !== undefined) {
+            if (!mrSeen) {
+                mrSeen = true;
+                mW = s.rates.w;
+                mR = s.rates.r;
+                mQ = s.rates.q;
+            } else if (s.rates.w !== mW || s.rates.r !== mR || s.rates.q !== mQ) mrMulti = true;
         }
         if (s.savedUsd !== undefined) {
             hasMoneyData = true;
@@ -1214,6 +1246,8 @@ export async function buildOverview(): Promise<WebOverview> {
             : {}),
         savedUsdTotal,
         savedUsdGrossTotal,
+        foldsTotal,
+        ...(mrSeen && !mrMulti ? { moneyRates: { w: mW, r: mR, q: mQ } } : {}),
         ...(hasPayback
             ? { paybackUsdTotal: { spent: Math.round(pbSpent * 1e4) / 1e4, saved: Math.round(pbSaved * 1e4) / 1e4, turns: pbTurns } }
             : {}),
