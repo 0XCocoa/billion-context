@@ -125,12 +125,22 @@ export function adminRelayActiveInDraft(text: string): boolean {
     return (sec as Record<string, unknown>).adminRelay === true;
 }
 
+// #4906 P3: i18n bl.sub promises the feed turns over "约 1 小时一次", but the
+// panel kept its ONE fetch for the whole tab lifetime — pure staleness gate
+// for loadBlog's cache, inlined into the browser IIFE below via toString()
+// (same single-implementation discipline as the JSONC helpers above). The 1h
+// matches the server's hourly pull cadence (web/blog-refresh.ts ROUND_TTL_MS).
+export function blogCacheStale(cachedAt: number, now: number): boolean {
+    return now - cachedAt >= 60 * 60 * 1000;
+}
+
 export const WEB_CLIENT = `(function () {
     "use strict";
     const stripJsoncComments = ${stripJsoncComments.toString()};
     const stripJsoncTrailingCommas = ${stripJsoncTrailingCommas.toString()};
     const parseConfigDraft = ${parseConfigDraft.toString()};
     const adminRelayActiveInDraft = ${adminRelayActiveInDraft.toString()};
+    const blogCacheStale = ${blogCacheStale.toString()};
     const MESSAGES=${JSON.stringify(MESSAGES)};
     let locale = "zh-CN";
     try {
@@ -889,19 +899,41 @@ function changelogCatOf(rawLine) {
     // markdown with web/markdown.ts (escaped by construction), so this side only
     // lays out cards and expands bodies. Language rides the page-level locale;
     // switching languages reloads the page, so no incremental re-render hook.
-    let blogCache = null;
+    // #4906 P3: the cache carries a timestamp and goes stale after ~1h (the
+    // cadence bl.sub promises), so a long-lived tab re-pulls instead of pinning
+    // one fetch forever. A stale hit still paints instantly from cache; the
+    // re-pull runs silently in the background and re-renders only if the blog
+    // view is still on screen — the overview poll's discipline (no blocked
+    // first paint, no toasts from background refreshes).
+    let blogCache = null; // { data, at }
+    let blogSub = null;
+    let blogRefreshBusy = false;
+    function refreshBlogInBackground() {
+        if (blogRefreshBusy) return;
+        blogRefreshBusy = true;
+        json(API_ROOT + "/blog").then(function (feed) {
+            blogCache = { data: feed, at: Date.now() };
+            if (current === "blog") loadBlog(blogSub); // cache is fresh now — no refresh loop
+        }, function () {
+            // keep the stale paint; the cache keeps its old timestamp, so the next visit retries
+        }).then(function () { blogRefreshBusy = false; });
+    }
     async function loadBlog(sub) {
         const host = $("bl-list");
         if (!host) return;
-        let data = blogCache;
+        blogSub = sub || null;
+        let data = blogCache ? blogCache.data : null;
         if (!data) {
             try {
-                data = blogCache = await json(API_ROOT + "/blog");
+                data = await json(API_ROOT + "/blog");
+                blogCache = { data: data, at: Date.now() };
             } catch (e) {
                 host.innerHTML = "";
                 toast(t("toast.failed", { msg: e.message }), "err");
                 return;
             }
+        } else if (blogCacheStale(blogCache.at, Date.now())) {
+            refreshBlogInBackground();
         }
         const items = (data && Array.isArray(data.items)) ? data.items : [];
         const zhOn = locale === "zh-CN";
