@@ -27,7 +27,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST } from "../launcher.js";
+import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, SPAWN_BUDGET_MS } from "../launcher.js";
 import { piPackageStrings } from "../plugin-install.js";
 import { createBiliPlugin, createPiDirectSendGuard } from "./pi.js";
 import { isLegacyBcpEntry, markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
@@ -49,8 +49,8 @@ export function shouldBootstrapNative(env: NodeJS.ProcessEnv): boolean {
 }
 
 /** Decide this process's native posture (#886/#983 mechanism, ported to the pi
- *  lane in #1795). Precedence kill-switch > /bili/ rewrite launch > inline >
- *  attach > spawn. A preset BILLION_CONTEXT_PROXY is an ATTACH target, not a
+ *  lane in #1795). Precedence kill-switch > /bili/ rewrite launch > explicit
+ *  inline > attach > spawn (DEFAULT). A preset BILLION_CONTEXT_PROXY is an ATTACH target, not a
  *  stand-down: the pseudo-attach hole (preset env + bare pi) used to disarm
  *  routing entirely while tools still found the proxy through the env — model
  *  traffic went direct and uncompressed, the proxy never saw the session, and
@@ -61,7 +61,10 @@ export function shouldBootstrapNative(env: NodeJS.ProcessEnv): boolean {
  *  it is a deliberate choice about WHERE compression runs (in this process),
  *  not just which proxy to use. Resolved env > file > default(off): the
  *  config-file home is `"pi": {"inline": true}`; an explicit BILI_PI_INLINE=0/
- *  false disables over the file. */
+ *  false disables over the file. OPT-IN ONLY (owner decision on #4687:
+ *  never flip defaults) — unset env/file behaves exactly as before the
+ *  #4571 default flip (attach > spawned proxy); `bili pi-inline` presets
+ *  BILI_PI_INLINE=1 for the one-command lane. */
 export function planNativePi(env: NodeJS.ProcessEnv, fileInline: boolean | undefined = undefined): { mode: "off" | "attach" | "spawn" | "inline"; attachOrigin?: string } {
     if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_PI === "0") return { mode: "off" };
     if (env.BILI_PROVIDER_REWRITES !== undefined) return { mode: "off" };
@@ -76,10 +79,9 @@ export function planNativePi(env: NodeJS.ProcessEnv, fileInline: boolean | undef
     if (!inlineEnvOff && (inlineEnvOn || fileInline === true)) return { mode: "inline" };
     const attachOrigin = nativeAttachOrigin(env) ?? proxyEnvOrigin(env);
     if (attachOrigin !== undefined) return { mode: "attach", attachOrigin };
-    // …then the #4571 default: the pi lane compresses IN-PROCESS. A proxy
-    // server is spawned only on explicit opt-out (pi.inline=false in
-    // billion-context.json, or BILI_PI_INLINE=0/false/no/off).
-    if (!inlineEnvOff && fileInline !== false) return { mode: "inline" };
+    // …then spawn: the historical default (owner decision on #4687 — inline
+    // is opt-in only, the #4571 default flip is reverted; a proxy server is
+    // spawned unless BILI_PI_INLINE / pi.inline=true opted into in-process).
     return { mode: "spawn" };
 }
 
@@ -304,6 +306,12 @@ export function armNativePi(p: typeof plan): void {
     } else if (process.env.NODE_TEST_CONTEXT === undefined) {
         const start = singleFlight(bootstrap);
         state.respawn = start;
+        // #4516: a request may hold out for an IN-FLIGHT spawn under the
+        // launcher's own bring-up budget (+margin for health settle) instead of
+        // degrading at the generic 15s readiness cap — a slow cold start
+        // (#4515) must not refuse or direct-send a turn the proxy would have
+        // served had it finished starting a few seconds later.
+        state.spawnWaitMs = SPAWN_BUDGET_MS + 10_000;
         // #1243: the factory's before_provider_headers reads the proxy base from
         // BILLION_CONTEXT_PROXY, which bootstrap() writes asynchronously — a
         // one-shot's single header event fires before that. Publish the ready
@@ -354,6 +362,7 @@ export function _resetNativeStateForTest(): void {
     state.onRoutedOriginObserved = undefined;
     state.respawn = undefined;
     state.onGiveUp = undefined;
+    state.spawnWaitMs = undefined;
     state.ready = Promise.resolve(undefined);
     _spawnForTest = undefined;
     delete process.env.BILLION_CONTEXT_PROXY;

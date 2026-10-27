@@ -75,7 +75,7 @@
 import { ACP_TOOLS_OPENAI } from "../compress-tool.js";
 import { ensureProxyRunning, LAUNCHER_DEFAULT_HOST, unwrapUpstream, wrapUpstream } from "../launcher.js";
 import { createAcpCommandHooks, showAcpText } from "./opencode-acp-command.js";
-import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, singleFlight } from "./native-bootstrap.js";
+import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScriptPath, proxyEnvOrigin, setNativeOriginWaiter, singleFlight } from "./native-bootstrap.js";
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
@@ -84,6 +84,11 @@ import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntim
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
 import { logHostEvent } from "./host-log.js";
 import { mediaBytesOfWireBody } from "./media-bytes.js";
+import { loadConfigFile } from "../config.js";
+import { getInlineEngine, INLINE_ORIGIN } from "../inline-engine.js";
+// installInlineTransport is defined in pi-inline.ts but host-agnostic: any
+// request whose origin is INLINE_ORIGIN dispatches to the in-process engine.
+import { installInlineTransport } from "./pi-inline.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOpencode(env: NodeJS.ProcessEnv): boolean {
@@ -91,7 +96,8 @@ export function shouldBootstrapNativeOpencode(env: NodeJS.ProcessEnv): boolean {
 }
 
 /** Decide this process's native posture (#809). Precedence kill-switch >
- *  /bili/ rewrite launch > attach > spawn. A preset BILLION_CONTEXT_PROXY is
+ *  /bili/ rewrite launch > explicit inline > attach > spawn (DEFAULT).
+ *  A preset BILLION_CONTEXT_PROXY is
  *  an ATTACH target, not a stand-down: the pseudo-attach hole (preset env +
  *  bare opencode) used to disarm routing entirely while tools still found the
  *  proxy through the env — model traffic went direct, the proxy never saw the
@@ -99,10 +105,20 @@ export function shouldBootstrapNativeOpencode(env: NodeJS.ProcessEnv): boolean {
  *  ("route through THIS proxy") and matches BILLION_CONTEXT_ATTACH semantics
  *  (probe + rewrite + stamp); explicit BILLION_CONTEXT_ATTACH wins when both
  *  are set. A /bili/ launch (BILI_PROVIDER_REWRITES) still stands us down —
- *  its URLs are already proxy-shaped and isModelApiUrl skips them. */
-export function planNativeOpencode(env: NodeJS.ProcessEnv): { mode: "off" | "attach" | "spawn"; attachOrigin?: string } {
+ *  its URLs are already proxy-shaped and isModelApiUrl skips them.
+ *  `inline` (#3278 port, OPT-IN — the default stays the spawned server, per
+ *  owner decision on #4687): run compression IN-PROCESS like the pi lane —
+ * no proxy server is spawned. Enabled only by env BILI_OPENCODE_INLINE=1
+ * (or any non-off value) or file `"opencode": {"inline": true}`; disable
+ *  with 0/false/no/off. An announced attach target beats an absent inline
+ *  choice; explicit inline beats attach. */
+export function planNativeOpencode(env: NodeJS.ProcessEnv, fileInline: boolean | undefined = undefined): { mode: "off" | "inline" | "attach" | "spawn"; attachOrigin?: string } {
     if (env.BILLION_CONTEXT_PLUGIN === "0" || env.BILI_NATIVE_OPENCODE === "0") return { mode: "off" };
     if (env.BILI_PROVIDER_REWRITES !== undefined) return { mode: "off" };
+    const inlineEnv = env.BILI_OPENCODE_INLINE;
+    const inlineEnvOff = inlineEnv !== undefined && ["", "0", "false", "no", "off"].includes(inlineEnv);
+    const inlineEnvOn = inlineEnv !== undefined && !inlineEnvOff;
+    if (!inlineEnvOff && (inlineEnvOn || fileInline === true)) return { mode: "inline" };
     const attachOrigin = nativeAttachOrigin(env) ?? proxyEnvOrigin(env);
     if (attachOrigin !== undefined) return { mode: "attach", attachOrigin };
     return { mode: "spawn" };
@@ -110,15 +126,33 @@ export function planNativeOpencode(env: NodeJS.ProcessEnv): { mode: "off" | "att
 
 export type OpencodeNativeRouteDeps = LiveOriginResolverDeps;
 
+/** #4912: the stage-2 media re-pricing of the direct-refusal arm, isolated so
+ *  the undecodable-body path is unit-testable without allocating a multi-GB
+ *  buffer (inject the decoder). A body past V8's max string length (~536MB;
+ *  #3128 admits up to 5GiB) makes TextDecoder.decode throw RangeError — same
+ *  class as a non-JSON body in mediaBytesOfWireBody: no media credit, the whole
+ *  body bills as core text (conservative refusal), never an exception out of
+ *  the route handler. */
+export function wireBodyMediaBytes(body: ArrayBuffer, decode: (buf: ArrayBuffer) => string = (b) => new TextDecoder().decode(b)): number {
+    try {
+        return mediaBytesOfWireBody(decode(body));
+    } catch {
+        return 0;
+    }
+}
+
 /** #3308: client-side mirror of #2924's refuse-oversized arm for this lane
  *  (the V2 route has no takeover gate to carry it). Returns a host-visible
  *  refusal when the proxy is unavailable AND the body provably cannot fit the
  *  model's context window — the core-text floor (bytes/4) exceeds the
  *  window, and #2924's ledger evidence says real text runs ABOVE the floor
  *  (calibratedEstimate ~1.14), so the comparison cannot false-refuse. Unknown
- *  model, unknown window, unreadable or absent body all return undefined and
- *  keep the documented fail-open direct send. The size is measured through a
- *  CLONE — the original Request must stay sendable (#2496 discipline). */
+ *  model, unknown window, or an unmeasurable body all return undefined and keep
+ *  the documented fail-open direct send; a measurable body whose content cannot
+ *  be decoded (past V8's max string length, #4912) gets no media credit — the
+ *  conservative all-core-text refusal instead of an escaped RangeError. The
+ *  size is measured through a CLONE — the original Request must stay sendable
+ *  (#2496 discipline). */
 async function oversizeDirectRefusal(e: V2HttpRequestEvent, s: V2State, reason?: UnavailableReason): Promise<Error | undefined> {
     const model = e.model;
     if (model === undefined || typeof model.providerID !== "string" || typeof model.id !== "string") return undefined;
@@ -135,7 +169,7 @@ async function oversizeDirectRefusal(e: V2HttpRequestEvent, s: V2State, reason?:
     const bytes = body.byteLength;
     if (Math.ceil(bytes / 4) <= window) return undefined;
     // #4121: only re-price would-refuse bodies; inline media is not text.
-    const coreBytes = Math.max(bytes - mediaBytesOfWireBody(new TextDecoder().decode(body)), 0);
+    const coreBytes = Math.max(bytes - wireBodyMediaBytes(body), 0);
     const floorTokens = Math.ceil(coreBytes / 4);
     if (floorTokens <= window) return undefined;
     // #3654: a busy-exhausted refusal must NOT claim "proxy unavailable …
@@ -330,7 +364,7 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
     return landed;
 }
 
-const plan = planNativeOpencode(process.env);
+const plan = planNativeOpencode(process.env, loadConfigFile().opencode?.inline);
 
 /** Wire the shared intercept state for the planned mode. Attach mode arms
  *  even under NODE_TEST_CONTEXT (it installs no global patches and spawns
@@ -373,6 +407,31 @@ export function armNativeOpencode(p: typeof plan): void {
         } else {
             state.ready = Promise.resolve(undefined);
         }
+    } else if (p.mode === "inline") {
+        // #3278 port (pi lane sibling): the compression engine runs in THIS
+        // process. state.origin freezes SYNCHRONOUSLY so the V2 route and
+        // V1's server() resolve INLINE_ORIGIN without waiting on a port that
+        // does not exist; the chain rewrites model URLs to
+        // `${INLINE_ORIGIN}/bili/<upstream>` and the inline transport link
+        // (installed at module load, BELOW this intercept) catches them and
+        // dispatches to the engine — no DNS, no socket.
+        state.attach = false;
+        state.origin = INLINE_ORIGIN;
+        process.env.BILLION_CONTEXT_PROXY = INLINE_ORIGIN;
+        logHostEvent("info", "[native-client]", "bili-native-opencode: inline mode — compression runs in-process, no proxy server will be started");
+        const start = singleFlight(async () => {
+            await getInlineEngine();
+            return INLINE_ORIGIN;
+        });
+        state.respawn = start;
+        setNativeOriginWaiter({ wait: () => readyOrigin(state) });
+        state.onGiveUp = () => {
+            delete process.env.BILLION_CONTEXT_PROXY;
+            state.origin = undefined;
+        };
+        // Production mirrors spawn mode's fail-fast posture (bootstrap at arm
+        // time); tests stay lazy so nothing starts until one asks for it.
+        state.ready = process.env.NODE_TEST_CONTEXT === undefined ? start() : Promise.resolve(undefined);
     } else if (process.env.NODE_TEST_CONTEXT === undefined) {
         const start = singleFlight(bootstrap);
         state.respawn = start;
@@ -384,6 +443,16 @@ export function armNativeOpencode(p: typeof plan): void {
 }
 
 if (plan.mode !== "off") armNativeOpencode(plan);
+
+// node:test imports this module for plan/arm surfaces — never patch
+// globalThis.fetch from inside a test run. #3278 port: chain order is install
+// order — the inline transport must sit BELOW the fetch intercept so the
+// `/bili/<upstream>` rewrite lands on that link instead of egressing toward a
+// proxy port that does not exist.
+if (process.env.NODE_TEST_CONTEXT === undefined && plan.mode === "inline") {
+    installInlineTransport();
+    installNativeFetchIntercept(state);
+}
 
 /** Test hook: expose the armed runtime-recovery seam (mirrors dsh-native). */
 export function _stateRespawnForTest(): (() => Promise<string | undefined>) | undefined {
@@ -925,19 +994,23 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
         const b = body as { messages?: unknown; model?: unknown; system?: unknown };
         if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) return; // anthropic-wire only; OpenAI-tool shapes resend full
         if (!(await probeIncrementalTurns(base))) return;
-        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: alignedMsgIdsForWire(sid, b.messages) });
-        if (plan.mode === "skip") return;
         // #3378 single-flight (kept over #3329's removal per the rebase
         // decision): while a marker'd request for this URL is still awaiting
         // its ack, later requests ride the normal pipeline. Pending entries
         // are keyed by turn id (#3329), so the guard scans for a live entry
         // stashed on THIS url (sweepStale above already aged out the stale
         // ones — an aged entry must not block a fresh conversion).
+        // The guard must run BEFORE planIncrementalTurn: planning claims the
+        // turn's msgIds client-side (#4491), and a plan this guard then
+        // discards would burn those ids — the host's retry screens against
+        // the burned claims and silently drops the whole msgIds field.
         let inflight = false;
         for (const pending of incPendingOpencode.values()) {
             if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
         }
         if (inflight) return;
+        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: alignedMsgIdsForWire(sid, b.messages) });
+        if (plan.mode === "skip") return;
         const turnId = newIncrementalTurnId();
         // #3304: stash before the swap — the opencode replacement happens in
         // this hook, BEFORE the fetch intercept ever sees the request, so
