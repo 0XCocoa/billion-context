@@ -905,6 +905,7 @@ function changelogCatOf(rawLine) {
         }
         const items = (data && Array.isArray(data.items)) ? data.items : [];
         const zhOn = locale === "zh-CN";
+        const offlineNote = data && data.error ? '<div class="card"><div class="card-b">' + escapeHtml(t("bl.offline")) + '</div></div>' : "";
         if (sub) {
             const item = items.find((x) => String(x.id) === String(sub)) || null;
             if (!item) {
@@ -914,7 +915,7 @@ function changelogCatOf(rawLine) {
             const kindLabel = item.kind === "post" ? t("bl.kind_post") : t("bl.kind_article");
             const title = zhOn && item.titleZh ? item.titleZh : (item.title || "");
             const html = zhOn ? (item.htmlZh || item.html || "") : (item.html || "");
-            host.innerHTML = '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a></div>"
+            host.innerHTML = offlineNote + '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a></div>"
                 + '<h3 class="bl-h">' + escapeHtml(title) + "</h3>"
                 + '<div class="card-b post-body">' + html + "</div></div>";
             return;
@@ -926,11 +927,11 @@ function changelogCatOf(rawLine) {
             box.className = "card-b";
             box.textContent = t("bl.empty");
             wrap.appendChild(box);
-            host.innerHTML = "";
+            host.innerHTML = offlineNote;
             host.appendChild(wrap);
             return;
         }
-        host.innerHTML = '<div class="card">' + items.map((it) => {
+        host.innerHTML = offlineNote + '<div class="card">' + items.map((it) => {
             const title = zhOn && it.titleZh ? it.titleZh : (it.title || "");
             const alt = zhOn ? (it.title || "") : (it.titleZh || "");
             let kindLabel;

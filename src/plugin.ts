@@ -60,6 +60,7 @@ function tailLooksTerminal(tail: string, protocol: WireProtocol | "responses"): 
 }
 import { degenerateTurnWarning, endsWithDraftClose, requestExpectsProseSummary } from "./degenerate-turn.js";
 import { getChangelog, latestChangelog, warmChangelogOnce } from "./web/changelog.js";
+import { warmBlogRefreshOnce } from "./web/blog-refresh.js";
 import { PANEL_BOX_FOOTER } from "./acp-panel.js";
 import { excludeDeadRefRanges } from "./acp-status.js";
 import { describeAdvisory, getAdvisoryState } from "./advisory.js";
@@ -1849,6 +1850,11 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
     } else {
         warmChangelogOnce(); // once per process; never throws
     }
+    // #4906: same fire-and-forget cadence as the changelog warm above — one
+    // GitHub-master blog pull when this process starts out COLD (no live
+    // master overlay yet); processes that already hold a master overlay keep
+    // the status path network-free. Internal guard; never throws.
+    warmBlogRefreshOnce();
     if (panel !== undefined && preFooter.length > 0) {
         // Escape $ so advisory text (remote doc content) cannot be read as
         // replace() pattern syntax ($&, $\`, $') and corrupt the box lines.
