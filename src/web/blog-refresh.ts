@@ -158,10 +158,14 @@ async function runRound(): Promise<void> {
 
 
         // 2. Article manifest: ABSENT ⇒ posts-only round (not a failure);
-        //    present-but-malformed ⇒ same, degrade silently.
+        //    present-but-malformed ⇒ same, degrade silently. The raw text is
+        //    kept in `files` under MANIFEST_REL — buildRemoteBlogPosts re-reads
+        //    it by that key when assembling the article section.
         let entries: ArticleEntry[] = [];
         try {
-            const parsed = JSON.parse(await getText(`${GITHUB_RAW_BASE}/${BRANCH}/${MANIFEST_REL}`)) as { articles?: unknown };
+            const manifestText = await getText(`${GITHUB_RAW_BASE}/${BRANCH}/${MANIFEST_REL}`, account);
+            files.set(MANIFEST_REL, manifestText);
+            const parsed = JSON.parse(manifestText) as { articles?: unknown };
             if (Array.isArray(parsed.articles)) entries = parsed.articles.filter(isArticleEntry);
         } catch {
             entries = [];

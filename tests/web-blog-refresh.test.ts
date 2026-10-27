@@ -4,8 +4,10 @@
  * priority (remote wins per id, bundled-only ids survive), asset route
  * remote-first/disk-fallback split, image-404 churn (reference dropped,
  * round succeeds), fail-soft (offline marker + last-good/bundled content
- * kept, nothing throws), TTL gating + single-flight coalescing, the pure
- * resolveRepoRel escape classes, and collectImageTargets candidate sets.
+ *  kept, nothing throws), TTL gating + single-flight coalescing, remote
+ *  long-form article rendering from the manifest (+ malformed-manifest
+ *  degrade), the pure resolveRepoRel escape classes, and collectImageTargets
+ *  candidate sets.
  */
 import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
@@ -223,6 +225,51 @@ test("warmBlogRefreshOnce skips when a master snapshot already exists in-process
     warmBlogRefreshOnce();                    // snapshot present → no pull
     await new Promise((r) => setTimeout(r, 25));
     assert.equal(hits.length, afterOne);
+});
+
+/* ---------------- remote long-form articles (manifest overlay) ------------ */
+
+test("successful round renders master long-form articles from the manifest", async () => {
+    router = (url) => {
+        switch (url) {
+            case CONTENTS_URL:
+                return new Response(JSON.stringify([{ name: "2026-10-09_fresh.md", type: "file" }]), { status: 200 });
+            case rawUrl("website/blog/posts/2026-10-09_fresh.md"):
+                return new Response("# Fresh post\n\npost body\n", { status: 200 });
+            case rawUrl("website/articles.json"):
+                return new Response(JSON.stringify({ articles: [
+                    { file: "website/articles/long-form.md", zh_file: "website/articles/long-form.zh.md", slug: "long-form", title: "Long Form", title_zh: "长文" },
+                ] }), { status: 200 });
+            case rawUrl("website/articles/long-form.md"):
+                return new Response("---\ntitle: \"Long Form\"\ndate: \"2026-01-01\"\n---\n\n# Long Form\n\nlong form body\n", { status: 200 });
+            case rawUrl("website/articles/long-form.zh.md"):
+                return new Response("---\ntitle_zh: \"长文\"\n---\n\n中文长文正文。\n", { status: 200 });
+            default:
+                return new Response("not here", { status: 404 });
+        }
+    };
+    const out = await runBlogRefreshRound({ force: true });
+    assert.equal(out.ok, true);
+    const art = getBlogFeed().items.find((i) => i.kind === "article" && i.id === "long-form");
+    assert.ok(art, "remote long-form article must appear in the merged feed");
+    assert.equal(art?.title, "Long Form");
+    assert.equal(art?.titleZh, "长文");
+    assert.match(art?.html ?? "", /long form body/);
+    assert.match(art?.htmlZh ?? "", /中文长文正文/);
+});
+
+test("malformed articles.json degrades to a posts-only round without failing", async () => {
+    router = (url) => {
+        if (url === CONTENTS_URL) return new Response(JSON.stringify([{ name: "2026-10-09_fresh.md", type: "file" }]), { status: 200 });
+        if (url === rawUrl("website/blog/posts/2026-10-09_fresh.md")) return new Response("# Fresh post\n\npost body\n", { status: 200 });
+        if (url === rawUrl("website/articles.json")) return new Response("{ not json", { status: 200 });
+        return new Response("not here", { status: 404 });
+    };
+    const out = await runBlogRefreshRound({ force: true });
+    assert.equal(out.ok, true);
+    const feed = getBlogFeed();
+    assert.ok(feed.items.some((i) => i.kind === "post" && i.id === "fresh"));
+    assert.ok(!feed.items.some((i) => i.kind === "article"));
 });
 
 /* ---------------- pure helpers exported from blogfeed ---------------- */
