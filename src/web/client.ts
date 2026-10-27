@@ -419,8 +419,10 @@ export const WEB_CLIENT = `(function () {
             await json(API_ROOT + "/config", { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
             toast(t("cfg.saved"), "ok");
             loadConfig();
+            return true;
         } catch (e) {
             toast(e.message, "err");
+            return false;
         } finally {
             busy(btn, false);
         }
@@ -443,6 +445,13 @@ export const WEB_CLIENT = `(function () {
         let i = 0;
         while (Math.abs(n) >= 1024 && i < units.length - 1) { n /= 1024; i++; }
         return (i > 0 ? n.toFixed(1) : String(Math.round(n))) + " " + units[i];
+    }
+    // #4899: USD display — 4 decimals under $1 (per-turn pennies stay visible),
+    // 2 above; negatives keep the sign (unpaid-back folds are honest).
+    function fmtUsd(n) {
+        if (n === null || n === undefined || isNaN(n)) return "—";
+        const abs = Math.abs(Number(n));
+        return (n < 0 ? "−" : "") + "$" + (abs >= 1 ? abs.toFixed(2) : abs.toFixed(4));
     }
     function timeAgo(iso) {
         if (!iso) return t("common.none");
@@ -583,9 +592,15 @@ export const WEB_CLIENT = `(function () {
         const clTip = x.coverageLostFolds
             ? ' title="' + escapeHtml(t("ses.covlost_tip", { n: x.coverageLostFolds, x: fmtW(x.coverageLostFrozenTokens || 0) })) + '"'
             : "";
-        if (v > 0) return '<td class="num good-num"' + clTip + ">" + fmtW(v) + "</td>";
-        if (v) return '<td class="num"' + (clTip || ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"') + ">" + fmtW(v) + "</td>";
+        if (v > 0) return '<td class="num good-num"' + clTip + ">" + fmtW(v) + moneySub(x) + "</td>";
+        if (v) return '<td class="num"' + (clTip || ' title="' + escapeHtml(t("ov.saved_neg_tip")) + '"') + ">" + fmtW(v) + moneySub(x) + "</td>";
         return '<td class="num dim">' + t("common.none") + "</td>";
+    }
+    // #4899: small $ line under the saved-tokens number — priced folds only
+    // (undefined when the session has no price profile: tokens only, no fake $).
+    function moneySub(x) {
+        if (x.savedUsd == null) return "";
+        return '<div class="dim small">' + (x.savedUsd >= 0 ? "≈ " : "") + "" + escapeHtml(fmtUsd(x.savedUsd)) + "</div>";
     }
     // Compact single-line hit cell: (97.0%/−1.3%/−0.9%/−1.1%) = hit/new/compress/TTL.
     function hitTd(s) {
@@ -999,6 +1014,15 @@ function changelogCatOf(rawLine) {
             netEl.title = o.hasFoldData && o.netSavedTotal ? String(Math.round(Number(o.netSavedTotal))) : "";
             $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "") : "";
             $("st-hitpct").textContent = o.hitPct == null ? t("common.none") : o.hitPct.toFixed(1) + "%";
+            // #4899: fleet money totals — only priced sessions contribute; no
+            // price data anywhere => dash, never $0.00 (honest-output rule).
+            const spendEl = $("st-spend");
+            if (spendEl) {
+                spendEl.textContent = o.hasMoneyData ? fmtUsd(o.costUsdTotal || 0) : t("common.none");
+                $("st-spend-sub").textContent = o.hasMoneyData && (o.savedUsdTotal || 0) !== 0
+                    ? t("ov.money_saved", { n: fmtUsd(o.savedUsdTotal) })
+                    : (o.hasMoneyData ? t("ov.money_none") : "");
+            }
             const hs = $("st-hit-split");
             if (hs) {
                 const missSum = (o.missNewTotal || 0) + (o.missCompTotal || 0) + (o.missTtlTotal || 0);
@@ -2604,8 +2628,15 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missArgs ? t("det.miss_split_line", missArgs) : "");
         mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null);
         const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
+        // #4899: money faces — saved-$ rides the saved-tokens card as the sub
+        // line; spend gets its own card with the input/cache/output breakdown.
+        const savedUsdSub = d.savedUsd != null ? t("ov.money_saved", { n: fmtUsd(d.savedUsd) }) : "";
         mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0,
-            d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : "");
+            d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : savedUsdSub);
+        if (d.costUsd != null) {
+            mini(parts, t("ov.spend"), fmtUsd(d.costUsd.total), false,
+                t("det.spend_sub", { i: fmtUsd(d.costUsd.input), r: fmtUsd(d.costUsd.cacheRead), w: fmtUsd(d.costUsd.cacheWrite), o: fmtUsd(d.costUsd.output) }));
+        }
         mini(parts, t("det.last_input"), (d.lastInputTokens || 0) > 0 ? fmtW(d.lastInputTokens) : null);
         parts.push("</div>");
         // #1839: mark estimate-grade context numbers so a bounded local estimate
@@ -3455,7 +3486,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             hydrateSummaryConfig(cfg);
             refreshDirtyFlag();
             const broken = Boolean(cfg.parseError);
-            ["cfg-file-edit", "save-file", "save-upstream", "save-quick", "save-summary"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
+            ["cfg-file-edit", "save-file", "save-upstream", "save-quick", "save-summary", "save-pricing"].forEach((id) => { const el = $(id); if (el) el.disabled = broken; });
             const ptState = $("pt-state");
             const ptSource = $("pt-source");
             const clearPt = $("clear-passthrough");
@@ -3474,8 +3505,54 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             }
             loadUpstream(cfg);
             void loadResign();
+            void loadPricing();
         } catch (e) {
             toast(t("toast.failed", { msg: e.message }), "err");
+        }
+    }
+    // #4899: per-model billing price editor — GET /__bili/pricing renders one
+    // row per model the panel has seen (plus existing override keys); the
+    // models.dev registry defaults prefill the placeholders; Save PUTs
+    // {billing:{prices}} through the structured config section (hot-applied).
+    let pricingModels = [];
+    function priceBadge(m) {
+        if (m.override) return '<span class="badge ok">' + t("cfg.pricing_src_config") + "</span>";
+        if (m.price) return '<span class="badge disk">' + t("cfg.pricing_src_registry") + "</span>";
+        return '<span class="badge warn">' + t("cfg.pricing_src_none") + "</span>";
+    }
+    function priceInput(m, f, label) {
+        const ov = m.override && m.override[f] != null ? m.override[f] : "";
+        const def = m.price && m.price[f] != null ? m.price[f] : "";
+        return '<label style="flex:1;min-width:110px"><span class="dim small">' + label + '</span>'
+            + '<input class="field-input mono" data-f="' + f + '" value="' + ov + '" placeholder="' + (def !== "" ? def : "—")
+            + '" inputmode="decimal" spellcheck="false"></label>';
+    }
+    function renderPricing() {
+        const host = $("pricing-fields");
+        if (!host) return;
+        if (!pricingModels.length) { host.innerHTML = '<span class="dim small">' + t("cfg.pricing_empty") + "</span>"; return; }
+        host.innerHTML = pricingModels.map((m) =>
+            '<div class="price-row" data-model="' + escapeHtml(m.model) + '" style="display:flex;flex-direction:column;gap:6px;padding:10px 0;border-bottom:1px solid var(--border,#e1e4e8)">'
+            + '<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="mono small">' + escapeHtml(m.model) + "</span>" + priceBadge(m)
+            + '<button class="btn sm" data-del="1" title="' + escapeHtml(t("cfg.pricing_del")) + '">✕</button></div>'
+            + '<div style="display:flex;gap:8px;flex-wrap:wrap">'
+            + priceInput(m, "input", t("cfg.pricing_input"))
+            + priceInput(m, "output", t("cfg.pricing_output"))
+            + priceInput(m, "cacheRead", t("cfg.pricing_cacheread"))
+            + priceInput(m, "cacheWrite", t("cfg.pricing_cachewrite"))
+            + "</div></div>").join("");
+        const note = host.parentElement ? host.parentElement.querySelector(".cfg-dirty-note") : null;
+        if (note) note.hidden = true;
+    }
+    async function loadPricing() {
+        const host = $("pricing-fields");
+        if (!host) return;
+        try {
+            const data = await json(API_ROOT + "/pricing");
+            pricingModels = Array.isArray(data.models) ? data.models : [];
+            renderPricing();
+        } catch (e) {
+            host.innerHTML = '<span class="dim small">' + escapeHtml(t("toast.failed", { msg: e.message })) + "</span>";
         }
     }
     // #2090 plan A: read-only "Signed upstreams" card — every known/observed
@@ -4306,6 +4383,66 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const sf = $("save-file");
         const ss = $("save-summary");
         if (ss) ss.addEventListener("click", () => putCfg(ss, { file: $("cfg-file-edit").value }));
+        // #4899: billing price editor events — add-model, per-row delete, and
+        // Save (validates every filled field, PUTs {billing:{prices}}).
+        const addBtn = $("pricing-add-btn");
+        if (addBtn) addBtn.addEventListener("click", () => {
+            const inp = $("pricing-add-model");
+            const model = inp ? inp.value.trim() : "";
+            if (!model) { toast(t("cfg.pricing_add_ph"), "err"); return; }
+            if (pricingModels.some((m) => m.model === model)) { toast(t("cfg.pricing_dup"), "err"); return; }
+            pricingModels.push({ model, price: null, override: null });
+            inp.value = "";
+            renderPricing();
+            const note = $("pricing-fields").parentElement.querySelector(".cfg-dirty-note");
+            if (note) note.hidden = false;
+        });
+        const pf = $("pricing-fields");
+        if (pf) pf.addEventListener("click", (ev) => {
+            const del = ev.target && ev.target.closest ? ev.target.closest("[data-del]") : null;
+            if (!del) return;
+            const row = del.closest(".price-row");
+            if (!row) return;
+            const model = row.getAttribute("data-model") || "";
+            pricingModels = pricingModels.filter((m) => m.model !== model);
+            renderPricing();
+        });
+        if (pf) pf.addEventListener("input", () => {
+            const note = pf.parentElement.querySelector(".cfg-dirty-note");
+            if (note) note.hidden = false;
+        });
+        const spr = $("save-pricing");
+        if (spr) spr.addEventListener("click", async () => {
+            const prices = {};
+            try {
+                pf.querySelectorAll(".price-row").forEach((row) => {
+                    const model = row.getAttribute("data-model") || "";
+                    if (!model) return;
+                    const read = (f) => {
+                        const el = row.querySelector('[data-f="' + f + '"]');
+                        const v = el ? String(el.value || "").trim() : "";
+                        if (v === "") return undefined;
+                        const n = Number(v);
+                        if (!isFinite(n) || n < 0) throw new Error(model + ": " + f);
+                        return n;
+                    };
+                    const input = read("input");
+                    if (input == null) return;
+                    const entry = { input };
+                    const output = read("output");
+                    if (output != null) entry.output = output;
+                    const cacheRead = read("cacheRead");
+                    if (cacheRead != null) entry.cacheRead = cacheRead;
+                    const cacheWrite = read("cacheWrite");
+                    if (cacheWrite != null) entry.cacheWrite = cacheWrite;
+                    prices[model] = entry;
+                });
+            } catch (e) {
+                toast(t("cfg.pricing_invalid", { msg: e.message }), "err");
+                return;
+            }
+            if (await putCfg(spr, { billing: { prices } })) loadPricing();
+        });
         if (sf) sf.addEventListener("click", async () => {
             const el = $("cfg-file-edit");
             const raw = el ? el.value : "";

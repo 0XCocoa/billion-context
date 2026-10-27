@@ -11,6 +11,7 @@ import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
+import { stampBillingPrice } from "../billing.js";
 import { codexAlignedWindow } from "../codex-models.js";
 import { DecodedRequestAdmission, DecodedRequestBusyError } from "../request-body-budget.js";
 import { hostIdForLog, maskHeadersForLog, maskUrlForLog, maskUrlsInText } from "../log-mask.js";
@@ -2422,6 +2423,12 @@ async function handleRequest(
                         if (registryProfile !== undefined) session.metadata.cachePriceProfile = registryProfile;
                         else delete session.metadata.cachePriceProfile;
                     }
+                    // #4899: stamp the billing price for this request's model
+                    // (config `billing.prices` > models.dev) so the usage-report
+                    // settle path bills USD without re-resolving. Model-less
+                    // requests keep the previous stamp; a model with NO resolvable
+                    // price clears it (tokens-only display, never fake dollars).
+                    stampBillingPrice(session, requestModel, (() => { try { return new URL(route?.rewrittenUrl ?? upstreamOrigin).host; } catch { return undefined; } })());
                     const visibilityMarkers = cs.visibilityMarkers ?? true;
                     const reasoningCfg = cs.reasoning;
                     // #1995/#2607: index recoverable historical images by ref from the RAW

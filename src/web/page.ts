@@ -52,6 +52,7 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div class="stat"><div class="k" data-i18n="ov.input_tokens">${zh("ov.input_tokens")}</div><div class="v" id="st-input">—</div></div>
 <div class="stat"><div class="k" data-i18n="ov.cached_tokens">${zh("ov.cached_tokens")}</div><div class="v" id="st-cached">—</div></div>
 <div class="stat"><div class="k" data-i18n="ov.output_tokens">${zh("ov.output_tokens")}</div><div class="v" id="st-output">—</div></div>
+<div class="stat"><div class="k" data-i18n="ov.spend">${zh("ov.spend")}</div><div class="v" id="st-spend">—</div><div class="s" id="st-spend-sub"></div></div>
 </div>
 <div style="margin-top:16px">
 <div class="card"><div class="card-h"><span data-i18n="ov.by_protocol">${zh("ov.by_protocol")}</span></div><div class="card-b flush"><div class="twrap tproc"><table class="data"><thead><tr><th data-i18n="common.protocol">${zh("common.protocol")}</th><th class="num" data-i18n="common.sessions">${zh("common.sessions")}</th><th class="num" data-i18n="ses.th_reqs">${zh("ses.th_reqs")}</th><th class="num" data-i18n="ov.input_tokens">${zh("ov.input_tokens")}</th><th class="num" data-i18n="ov.cached_tokens">${zh("ov.cached_tokens")}</th><th class="num" data-i18n="ses.th_hit">${zh("ses.th_hit")}</th><th class="num" data-i18n="ses.th_saved">${zh("ses.th_saved")}</th><th class="num" data-i18n="ses.th_folds">${zh("ses.th_folds")}</th></tr></thead><tbody id="protocol-body"></tbody></table></div></div></div>
@@ -92,6 +93,16 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div id="summary-fields"></div>
 <div class="cfg-dirty-note small" hidden><span data-i18n="cfg.unsaved">${zh("cfg.unsaved")}</span></div>
 <button id="save-summary" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button>
+</div></div>
+<div class="card" id="card-pricing"><div class="card-h"><span data-i18n="cfg.pricing">${zh("cfg.pricing")}</span></div><div class="card-b">
+<p class="dim small" style="margin:0 0 12px" data-i18n="cfg.pricing_desc">${zh("cfg.pricing_desc")}</p>
+<div id="pricing-fields" style="display:flex;flex-direction:column;gap:12px"><span class="dim small" data-i18n="common.loading">${zh("common.loading")}</span></div>
+<div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+<input id="pricing-add-model" class="field-input mono" style="flex:1;min-width:220px" placeholder="${zh("cfg.pricing_add_ph")}">
+<button id="pricing-add-btn" class="btn sm" data-i18n="cfg.pricing_add">${zh("cfg.pricing_add")}</button>
+</div>
+<div class="cfg-dirty-note small" style="margin-top:10px;color:#9a6700" hidden><span data-i18n="cfg.unsaved">${zh("cfg.unsaved")}</span></div>
+<div style="margin-top:10px"><button id="save-pricing" class="btn"><span data-i18n="cfg.save">${zh("cfg.save")}</span></button></div>
 </div></div>
 <div class="card" id="card-file"><div class="card-h"><span data-i18n="cfg.file">${zh("cfg.file")}</span></div><div class="card-b">
 <p class="dim small" style="margin:0 0 8px" data-i18n="cfg.file_desc">${zh("cfg.file_desc")}</p>

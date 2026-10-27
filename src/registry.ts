@@ -21,8 +21,8 @@ type RegistryShape = Record<string, ModelEntry>;
 // providers.<host>.models.<id>.cost ($/Mtok). Only rows with a usable input
 // price are stored — without an input anchor there is nothing to normalize
 // against, and half-inventing a profile would misprice every fold.
-type CostRow = { input: number; output?: number; cache_read?: number; cache_write?: number };
-type CostsShape = Record<string, CostRow>;
+export type CostRow = { input: number; output?: number; cache_read?: number; cache_write?: number };
+export type CostsShape = Record<string, CostRow>;
 type LoadedRegistry = { reg: RegistryShape; costs: CostsShape | null };
 
 let cache: RegistryShape | null = null;
@@ -392,7 +392,26 @@ export function peekRegistryOutputLimit(model: string, host?: string): number | 
  *  prices are not comparable across deployments. User config at any level
  *  wins wholesale at the stamp site; this is only the unconfigured default. */
 export function peekRegistryPriceProfile(model: string | undefined, host?: string): PriceProfile | undefined {
-    const costs = costCache;
+    return costCache !== null ? scanRegistryCostRow(costCache, model, host)?.profile : undefined;
+}
+
+export function peekRegistryCostRow(model: string | undefined, host?: string): CostRow | undefined {
+    return costCache !== null ? scanRegistryCostRow(costCache, model, host)?.row : undefined;
+}
+
+/** #4899: the shared cost-row scan behind both price faces (the economics
+ *  profile and billing). Takes the table as a parameter so the billing
+ *  overrides table (`billing.prices`) resolves through the SAME name
+ *  matching (roots/variants/case-fold/host provider namespace) as the
+ *  registry snapshot. Returns the first row with a usable input price plus
+ *  its precomputed profile; `conflictHint` names the override surface in
+ *  the conflict warning when scanning a non-registry table. */
+export function scanRegistryCostRow(
+    costs: CostsShape,
+    model: string | undefined,
+    host?: string,
+    opts?: { conflictHint?: string },
+): { row: CostRow; key: string; profile: PriceProfile } | undefined {
     if (!costs || !model) return undefined;
     const provider = host ? providerFromHost(host) : undefined;
     const roots = [model];
@@ -411,11 +430,11 @@ export function peekRegistryPriceProfile(model: string | undefined, host?: strin
             let row: CostRow | undefined = costs[key];
             if (!row) row = idx.byLower.get(key.toLowerCase())?.value;
             const profile = priceProfileFromRow(row);
-            if (profile) return profile;
+            if (profile) return { row: row as CostRow, key, profile };
         }
         if (provider === undefined) {
             const suffix = `/${name.toLowerCase()}`;
-            let chosen: PriceProfile | undefined;
+            let chosen: { row: CostRow; key: string; profile: PriceProfile } | undefined;
             const seen = new Set<string>();
             const parts: string[] = [];
             for (const { lower, key, value: row } of idx.entries) {
@@ -427,12 +446,12 @@ export function peekRegistryPriceProfile(model: string | undefined, host?: strin
                     seen.add(sig);
                     parts.push(`${key}=in:${profile.w}/out:${profile.q}`);
                 }
-                if (!chosen) chosen = profile;
+                if (!chosen) chosen = { row, key, profile };
             }
             if (chosen !== undefined) {
                 if (seen.size > 1 && !warnedPriceConflicts.has(name)) {
                     warnedPriceConflicts.add(name);
-                    loggerLog("warn", `[acp-registry] conflicting prices for "${name}" (${parts.join(", ")}) — using the first listing; set compress.priceProfile to override`);
+                    loggerLog("warn", `[acp-registry] conflicting prices for "${name}" (${parts.join(", ")}) — using the first listing; set ${opts?.conflictHint ?? "compress.priceProfile"} to override`);
                 }
                 return chosen;
             }

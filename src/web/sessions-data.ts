@@ -7,6 +7,7 @@ import { flatFileNameFor } from "acp-kernel/persist";
 import type { WebSummaryRow } from "../storage/store.js";
 import { renderHandoff } from "../export.js";
 import { buildSessionCacheReport } from "../cache-ledger.js";
+import { savedUsdFromFolds } from "../billing.js";
 import { keepaliveStatusFor, type KeepaliveStatus } from "../cache-keepalive.js";
 import { METADATA_FOLD_COVERAGE } from "../fold-reconcile.js";
 import { markdownToHtml } from "./markdown.js";
@@ -98,6 +99,16 @@ interface WebSessionSummary {
     grossSaved?: number;
     /** Per-session net: Σ ((S−σ)×requestsAfter − T − σ); may be negative. */
     netSaved?: number;
+    /** #4899: model id the session last ran on (metadata.lastModel) — the key
+     *  the pricing editor resolves against. */
+    model?: string;
+    /** #4899: cumulative USD spend billed at the per-request stamped price
+     *  (session.stats.costUsd). Absent when no price resolves — tokens only. */
+    costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number; total: number };
+    /** #4899: money mirror of netSaved — the same folds priced with the
+     *  session's stamped cachePriceProfile ($/Mtok). Can be negative while a
+     *  fold has not paid back (honest, like the token display). */
+    savedUsd?: number;
     /** Σ T — measured compression re-pay tokens. */
     repayCost?: number;
     /** Σ σ — summary generation cost (output tokens). */
@@ -143,6 +154,13 @@ interface WebOverview {
     coverageLostFrozenTotal: number;
     /** Σ genuinely-new missed tokens across ledger sessions (decomposeSample). */
     missNewTotal: number;
+    /** #4899: Σ per-session USD spend (only priced sessions contribute). */
+    costUsdTotal: number;
+    /** #4899: Σ money-mirrored net savings (only priced sessions contribute). */
+    savedUsdTotal: number;
+    /** #4899: true when at least one session had a USD ledger or priced folds
+     *  (else the money totals are meaningless — hide them, don't fake $0). */
+    hasMoneyData: boolean;
     /** Σ compression re-read missed tokens across ledger sessions. */
     missCompTotal: number;
     /** Σ upstream-TTL-expiry / other-prefix-invalidation missed tokens across ledger sessions. */
@@ -542,7 +560,7 @@ export function _diskScanStatsForTest(): { files: number; decodedTotal: number; 
 interface SummarySource {
     id: string;
     meta: { protocol?: string; upstreamOrigin?: string; label?: string; title?: string; hostTitle?: string };
-    stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate"; lastUsageGradeTokens?: number; lastInputTokensSource?: "usage" | "estimate" | "overflow-arm"; contextEstimateTokens?: number; contextEstimateCalibrated?: boolean };
+    stats: { requests: number; tokensSaved: number; inputTokens: number; cachedTokens: number; outputTokens: number; contextTokens: number; contextTokensSource?: "usage" | "estimate"; lastUsageGradeTokens?: number; lastInputTokensSource?: "usage" | "estimate" | "overflow-arm"; contextEstimateTokens?: number; contextEstimateCalibrated?: boolean; costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number } };
     metadata: Record<string, unknown>;
     state: { blocks: Array<{ topic?: string; summary: string; active?: boolean; compressedTokens?: number }> };
     lastSeen: number;
@@ -555,6 +573,18 @@ function num(v: unknown, fallback = 0): number {
 
 function str(v: unknown): string | undefined {
     return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/** #4899: validate the persisted USD ledger blob — metadata/stats are
+ *  user-editable JSON, so only finite non-negative fields survive; anything
+ *  else reads as "no ledger" instead of poisoning the display. */
+function validCostUsd(v: unknown): { input: number; cacheRead: number; cacheWrite: number; output: number } | undefined {
+    if (!v || typeof v !== "object" || Array.isArray(v)) return undefined;
+    const o = v as Record<string, unknown>;
+    const f = (x: unknown): number | undefined => (typeof x === "number" && Number.isFinite(x) && x >= 0 ? x : undefined);
+    const input = f(o.input), cacheRead = f(o.cacheRead), cacheWrite = f(o.cacheWrite), output = f(o.output);
+    if (input === undefined && cacheRead === undefined && cacheWrite === undefined && output === undefined) return undefined;
+    return { input: input ?? 0, cacheRead: cacheRead ?? 0, cacheWrite: cacheWrite ?? 0, output: output ?? 0 };
 }
 
 /** Normalizer mirroring buildSession's v1-flat → grouped fallback for exactly
@@ -591,6 +621,7 @@ function summaryFromRecord(rec: unknown): WebSessionSummary {
             lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" || stats.lastInputTokensSource === "overflow-arm" ? stats.lastInputTokensSource : undefined,
             contextEstimateTokens: num(stats.contextEstimateTokens) > 0 ? num(stats.contextEstimateTokens) : undefined,
             contextEstimateCalibrated: typeof stats.contextEstimateCalibrated === "boolean" ? stats.contextEstimateCalibrated : undefined,
+            costUsd: validCostUsd(stats.costUsd),
         },
         metadata: (r.metadata && typeof r.metadata === "object" ? r.metadata : {}) as Record<string, unknown>,
         state: { blocks: blocksRaw.filter((b) => !!b && typeof b === "object") as Array<{ topic?: string; summary: string }> },
@@ -639,6 +670,7 @@ function summaryFromRow(row: import("../storage/store.js").WebSummaryRow): WebSe
             lastInputTokensSource: stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "estimate" || stats.lastInputTokensSource === "overflow-arm" ? stats.lastInputTokensSource : undefined,
             contextEstimateTokens: num(stats.contextEstimateTokens) > 0 ? num(stats.contextEstimateTokens) : undefined,
             contextEstimateCalibrated: typeof stats.contextEstimateCalibrated === "boolean" ? stats.contextEstimateCalibrated : undefined,
+            costUsd: validCostUsd(stats.costUsd),
         },
         metadata,
         state: { blocks },
@@ -704,6 +736,14 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     let blocksSaved = 0;
     for (const b of s.state.blocks) if (b.active !== false) blocksSaved += b.compressedTokens ?? 0;
     const tokensSaved = Math.max(s.stats.tokensSaved ?? 0, blocksSaved);
+    // #4899: money faces — spend from the persisted USD ledger, savings from
+    // the same folds priced with the stamped {w,r,q} profile. Both undefined
+    // when unpriced: the UI shows tokens only, never fabricated dollars.
+    const costLedger = validCostUsd(s.stats.costUsd);
+    const costUsd = costLedger !== undefined
+        ? { ...costLedger, total: costLedger.input + costLedger.cacheRead + costLedger.cacheWrite + costLedger.output }
+        : undefined;
+    const savedUsd = savedUsdFromFolds(led?.folds ?? [], s.metadata["cachePriceProfile"] as { w?: number; r?: number; q?: number } | undefined);
     // Untitled sessions: fall back to the first compression block's topic/summary lead.
     let firstBlockHint = "";
     const fb = s.state.blocks.find((b) => b.topic || b.summary);
@@ -772,6 +812,9 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(hasLedger ? { hasLedger: true } : {}),
         ...(firstBlockHint ? { firstBlockHint } : {}),
         ...(hasFolds ? { grossSaved, netSaved, repayCost, summaryCost, foldCount } : {}),
+        ...(typeof s.metadata.lastModel === "string" && s.metadata.lastModel.length > 0 ? { model: s.metadata.lastModel } : {}),
+        ...(costUsd !== undefined ? { costUsd } : {}),
+        ...(savedUsd !== undefined ? { savedUsd: Math.round(savedUsd * 1e4) / 1e4 } : {}),
         ...(hasFolds && coverageLostFolds > 0 ? { coverageLostFolds, coverageLostFrozenTokens } : {}),
         ...(hasLedger ? { newContent: agg?.agg?.nc ?? 0, compRepay: agg?.agg?.cr ?? 0, ttlRepay: agg?.agg?.tr ?? 0 } : {}),
         ...(typeof agg?.agg?.input === "number" && agg.agg.input > 0
@@ -904,6 +947,9 @@ export async function buildOverview(): Promise<WebOverview> {
     const all = allAll.filter((s) => !isEmptyStub(s));
     let requests = 0, input = 0, cached = 0, output = 0, saved = 0, savedEstimated = 0, blocks = 0, live = 0;
     let grossSavedTotal = 0, netSavedTotal = 0, repayTotal = 0, summaryCostTotal = 0, hasFoldData = false;
+    // #4899: fleet USD totals — spend from per-session ledgers, savings from
+    // priced folds; unpriced sessions simply contribute nothing (never $0 fake).
+    let costUsdTotal = 0, savedUsdTotal = 0, hasMoneyData = false;
     let coverageLostFoldTotal = 0, coverageLostFrozenTotal = 0;
     let missNewTotal = 0, missCompTotal = 0, missTtlTotal = 0, missInputTotal = 0;
     const protoMap = new Map<string, { protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; missNew: number; missComp: number; missTtl: number; missInput: number }>();
@@ -939,6 +985,14 @@ export async function buildOverview(): Promise<WebOverview> {
             row.missTtl += s.ttlRepay ?? 0;
             row.missInput += s.inputTokens;
         }
+        if (s.costUsd !== undefined) {
+            hasMoneyData = true;
+            costUsdTotal += s.costUsd.total;
+        }
+        if (s.savedUsd !== undefined) {
+            hasMoneyData = true;
+            savedUsdTotal += s.savedUsd;
+        }
         if (s.hasLedger && s.grossSaved != null) {
             hasFoldData = true;
             grossSavedTotal += s.grossSaved;
@@ -968,6 +1022,9 @@ export async function buildOverview(): Promise<WebOverview> {
         summaryCostTotal,
         coverageLostFoldTotal,
         coverageLostFrozenTotal,
+        costUsdTotal,
+        savedUsdTotal,
+        hasMoneyData,
         missNewTotal,
         missCompTotal,
         missTtlTotal,
