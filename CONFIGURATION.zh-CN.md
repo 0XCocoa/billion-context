@@ -88,6 +88,7 @@
 | `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (resolves to pixels) | BILI_IMAGE_BILLING | 全局图片 token 估算口径；逐请求实时读取，优先于所有逐 provider 设置。 |
 | `imageTokenCap` | number | unset (uncapped) | BILI_IMAGE_TOKEN_CAP | 全局单图 token 上限，叠加在计费口径之上生效；逐请求实时读取。 |
 | `imageRescale` | boolean | true | BILI_IMAGE_RESCALE | 出站图片降采样总开关（#3295/#3400）：大图以缩小形态发给模型，原图在会话存储中保持字节级原样。逐请求实时读取。 |
+| `billing` | object | {} | — | 按模型计费单价（#4899）：billing.prices[模型] = { input, output?, cacheRead?, cacheWrite? }，美元/百万 token；覆盖 models.dev 快照价，驱动面板美元花费台账与省钱折算。无价模型只显示 token。 |
 
 **行为开关**
 
@@ -635,6 +636,29 @@
   - `models.<name>.benefit: boolean`（三级）—— 这个模型在这个 provider 上是否走免费额度计费（重签请求附带参与签名的 `maas_type: benefit` 头）。`true`/`false` 都是显式的 —— `false` 可以把默认集里的模型踢出；未设置则落到内置回退集 `glm-5.3-flash, deepseek-v4.1-flash`（dsh codearts 插件 `CODEARTS_BENEFIT_FALLBACK` 的镜像）。环境变量 `BILI_RESIGN_BENEFIT`（逗号分隔）优先于整棵树。
   - `providers.<url>.resign["<方案>"]`（二级）—— 同样的方案键下 `{ enabled?, passthrough?, credentialRef? }`，逐字段压过全局块。
   - 宿主侧拦截（dsh native lane）运行在路由存在之前，始终用全局块 —— 那是传输必要性判定（签名 body 只能隧道或拒收），不是策略。方案键匹配不区分大小写（电线 token 形如 `SDK-HMAC-SHA256 Access=…`，键一律小写）。
+
+### `billing`
+
+- **类型：** `object` — `{ prices: Record<string, { input: number, output?: number, cacheRead?: number, cacheWrite?: number }> }`，单价为美元/百万 token
+- **默认值：** `{}`（由内置 models.dev 快照给已知模型定价）
+- **状态：** ACTIVE（#4899）
+- **说明：** 面板金钱视图的按模型单价。每份落账的 usage 报告都会在会话上累计一笔美元台账（`session.stats.costUsd`：输入/缓存读/缓存写/输出）；「节省」列另外把折叠节省折算成美元。每个模型 id 的解析顺序：先 `billing.prices`，再内置 models.dev 快照，都没有则不计价（只显示 token —— 不折算假美元，也不显示假的 `$0`）。
+  - 键为模型 id，匹配规则与 registry 一致：`"anthropic/claude-sonnet-4-5"`、裸 `"claude-sonnet-4-5"`、大小写漂移都能命中。
+  - `input`（美元/百万输入 token）必填 —— 没有锚点价就诚实地不计费；`output` / `cacheRead` / `cacheWrite` 可选，缺省时按输入价计（花费估算绝不伪造折扣或溢价 —— 刻意不用内核经济学比例 r=0.1w / q=4w）。
+  - 单价按请求盖戳（最新模型胜出），会话中途换模型立即按新价计；已入账的条目保持当时单价（电表语义）。
+  - 形状非法（未知字段、input 零/负、非数值）时整个块在加载时拒收 —— 单价打错字绝不静默失效。
+  - Web 编辑器（`/__bili/` → 配置 → 计费单价）列出会话用过的每个模型、预填 registry 默认价并保存回本块；保存空表即删除该块。
+
+  ```jsonc
+  {
+    "billing": {
+      "prices": {
+        "anthropic/claude-sonnet-4-5": { "input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 3.75 },
+        "openai/gpt-5": { "input": 1.25 }
+      }
+    }
+  }
+  ```
 
 ### `modelContextLimit`
 

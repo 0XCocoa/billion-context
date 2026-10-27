@@ -66,6 +66,7 @@ import { describeAdvisory, getAdvisoryState } from "./advisory.js";
 import { describeUpdateReady, getUpdateVisibility } from "./update-notes.js";
 import { warnCacheCollapse } from "./cache-warn.js";
 import { currentContextObservation, recordContextObservation, settleUsageReport } from "./cache-ledger.js";
+import { billOutputUsage } from "./billing.js";
 import { promptInputTotal, declaredInclusiveFromUsage, type WireProtocol } from "./util.js";
 import { stateDir } from "./paths.js";
 import { lookupToolWitness, recordToolWitness } from "./tool-ring.js";
@@ -2316,9 +2317,13 @@ export function applyUsageSample(session: Session, sample: UsageSample, protocol
         const foldNew = session.stats.pendingFoldUsage === true;
         if (foldNew) session.stats.pendingFoldUsage = false;
         loggerLog("info", `[${session.id}] [plugin] [acp-usage] input=${total} ${reportedCached === null ? "(no cache report)" : `cached=${reportedCached} (cache hit ${hit}%)`}${foldNew ? " fold=new" : ""}`);
-        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin });
+        settleUsageReport(session, { total, reportedCached, output: sample.outputTokens, protocol, upstream: upstreamOrigin, creation: typeof sample.creationTokens === "number" ? sample.creationTokens : undefined });
     }
-    if (sample.outputTokens !== undefined) session.stats.outputTokens += sample.outputTokens;
+    if (sample.outputTokens !== undefined) {
+        session.stats.outputTokens += sample.outputTokens;
+        // #4899: output USD billed at the stamped price, in lockstep with the token counter.
+        billOutputUsage(session, sample.outputTokens);
+    }
 }
 
 /** Merge an SSE event's usage fields into the per-response accumulator.

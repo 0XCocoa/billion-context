@@ -19,6 +19,7 @@ import { log as loggerLog } from "./logger.js";
 import { METADATA_CANONICAL_SYS_FP, METADATA_FOLD_COVERAGE, METADATA_LAST_RESPONSES_MODE, METADATA_SYSTEM_FP } from "./fold-reconcile.js";
 import { clearPostRebuildAnchor, markDirty, type Session } from "./session.js";
 import { isForeignMembership } from "./request-membership.js";
+import { billInputUsage } from "./billing.js";
 import { normalizeUpstreamOrigin } from "./util.js";
 import { toolFail, toolOk, type ProxyToolResult } from "./proxy-tool-result.js";
 
@@ -1798,13 +1799,18 @@ export function noteOutboundContextEstimates(
 
 export function settleUsageReport(
     session: Session,
-    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string },
+    s: { total: number; reportedCached: number | null; output?: number; protocol?: string; upstream?: string; creation?: number },
     localTextEstimate?: number,
 ): void {
     // #793: a zero-total sample carries no information (gateway placeholder or
     // relay echo) — it must not clobber the last trusted lastInputTokens.
     if (s.total > 0) {
         session.stats.inputTokens += s.total;
+        // #4899: USD spend ledger — input/cache-read/cache-write billed at the
+        // per-request stamped price, in lockstep with the token counters above
+        // (foreign #4805 payloads bill too: the tokens were really spent, the
+        // gate only protects this conversation's anchor family).
+        billInputUsage(session, { total: s.total, cached: s.reportedCached, creation: s.creation });
         // #4805: id-membership gate — a report produced by a request whose
         // message ids do not join this session's known id family is foreign
         // billing data under a colliding session key (auxiliary host personas
