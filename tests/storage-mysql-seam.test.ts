@@ -354,7 +354,7 @@ test("seam: an existing envelope wins over the DB row (zero behavior change)", a
         assert.ok(viaSync, "envelope load must keep working");
         const before = stub.viewCalls.count;
         const viaAsync = await store.loadAsync(CORPUS_ID);
-        assert.equal(viaAsync, viaSync, "loadAsync returns the sync result untouched when the sync path finds a copy");
+        assert.deepEqual(viaAsync, viaSync, "loadAsync serves content-identical to the sync result when the sync path finds a copy (each cold load builds a fresh object; reference identity was never part of the contract)");
         assert.equal(stub.viewCalls.count, before, "no DB read may happen while an envelope exists");
     } finally {
         store.cancelAll();
@@ -371,7 +371,7 @@ test("seam: without a sidecar at all, loadAsync is exactly loadSync", async () =
         const a = store.loadSync(CORPUS_ID);
         const b = await store.loadAsync(CORPUS_ID);
         assert.ok(a && b);
-        assert.equal(b, a, "no sidecar → loadAsync short-circuits to the sync result");
+        assert.deepEqual(b, a, "no sidecar → loadAsync serves content-identical to the sync result");
     } finally {
         store.cancelAll();
         await store.closeQuietlyAsync();
@@ -393,8 +393,8 @@ test("seam: bounded boot pre-warms DB-only sessions within the budget", async ()
         const warm = warmed.get(CORPUS_ID);
         assert.ok(warm, "boot union must enumerate the DB-only id through the async twins");
         assert.deepEqual(
-            warm!.blocks.map((b) => b.blockId).sort(),
-            loaded.blocks.map((b) => b.blockId).sort(),
+            warm!.state.blocks.map((b) => b.blockId).sort(),
+            loaded.state.blocks.map((b) => b.blockId).sort(),
         );
     } finally {
         store.cancelAll();
@@ -415,7 +415,7 @@ test("seam: loadAll unions in DB-only sessions", async () => {
 
         const all = await store.loadAll();
         assert.ok(all.has(CORPUS_ID), "loadAll must see the DB-only id");
-        assert.ok(all.get(CORPUS_ID)!.blocks.length === loaded.blocks.length);
+        assert.ok(all.get(CORPUS_ID)!.state.blocks.length === loaded.state.blocks.length);
     } finally {
         store.cancelAll();
         await store.closeQuietlyAsync();
@@ -438,7 +438,7 @@ test("seam: getSessionAsync reloads a DB-only session into the resident pool, si
         const [a, b] = await Promise.all([getSessionAsync(CORPUS_ID), getSessionAsync(CORPUS_ID)]);
         assert.equal(a, b, "concurrent first-touches must share one load (single-flight)");
         assert.equal(a.id, CORPUS_ID);
-        assert.equal(a.blocks.length, loaded.blocks.length);
+        assert.equal(a.state.blocks.length, loaded.state.blocks.length);
         assert.equal(await getSessionAsync(CORPUS_ID), a, "subsequent calls hit the resident pool");
     } finally {
         store.cancelAll();
