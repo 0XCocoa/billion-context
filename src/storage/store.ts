@@ -2369,8 +2369,11 @@ export class UnifiedStore {
      *  session row records the lineage; content/media CAS refcounts are
      *  bumped per copied row. Idempotent: replaying the same clone is a no-op.
      *  throughSeq is inclusive (store seq is 0-based; the endpoint passes the
-     *  parent's last live seq — #4730). */
-    cloneSessionRows(parentId: string, childId: string, throughSeq: number): void {
+     *  parent's last live seq — #4730). Returns false when the parent session
+     *  has no row (never mirrored — nothing to clone), true otherwise
+     *  (including zero-row clones and idempotent replays). */
+    cloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
+        if (this.getSessionRow(parentId) === null) return false;
         this.db.transaction(() => {
             const parent = this.getSessionRow(parentId);
             if (parent === null) return;
@@ -2430,6 +2433,7 @@ export class UnifiedStore {
                     throughSeq,
                 );
         });
+        return true;
     }
 
     private putContentRef(hash: string): void {
