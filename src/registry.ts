@@ -12,7 +12,13 @@ import bundledSnapshot from "./registry-snapshot.json" with { type: "json" };
 // all; the per-model $/Mtok cost rows live nested under
 // providers.<host>.models.<id>.cost in catalog.json (#1279 follow-up).
 const REGISTRY_URL = "https://models.dev/catalog.json";
-const CACHE_FILE = path.join(cacheDir(), "models-dev.json");
+// Resolved per call, not at module scope: #4916 put this module into the
+// static import graph of config (config→billing→registry), so it can be
+// evaluated before a test redirects XDG_*; a module-scope path would bind the
+// loader to the ambient cache dir and silently skip the fetch under test.
+function cacheFilePath(): string {
+    return path.join(cacheDir(), "models-dev.json");
+}
 const TTL_MS = 24 * 60 * 60 * 1000;
 
 type ModelEntry = { limit?: { context?: number; output?: number } };
@@ -110,7 +116,7 @@ function parse(raw: string): LoadedRegistry | null {
 
 async function readDiskCache(): Promise<LoadedRegistry | null> {
     try {
-        const raw = await readFile(CACHE_FILE, "utf8");
+        const raw = await readFile(cacheFilePath(), "utf8");
         return parse(raw);
     } catch {
         return null;
@@ -119,17 +125,19 @@ async function readDiskCache(): Promise<LoadedRegistry | null> {
 
 async function writeDiskCache(data: LoadedRegistry): Promise<void> {
     try {
-        await mkdir(path.dirname(CACHE_FILE), { recursive: true });
-        await writeFile(CACHE_FILE, JSON.stringify({ models: data.reg, costs: data.costs }), "utf8");
+        const file = cacheFilePath();
+        await mkdir(path.dirname(file), { recursive: true });
+        await writeFile(file, JSON.stringify({ models: data.reg, costs: data.costs }), "utf8");
     } catch {
         // best-effort
     }
 }
 
 function diskCacheFresh(): boolean {
-    if (!existsSync(CACHE_FILE)) return false;
+    const file = cacheFilePath();
+    if (!existsSync(file)) return false;
     try {
-        const { mtimeMs } = statSync(CACHE_FILE);
+        const { mtimeMs } = statSync(file);
         return Date.now() - mtimeMs < TTL_MS;
     } catch {
         return false;
@@ -280,11 +288,12 @@ async function pickFallback(): Promise<{ reg: RegistryShape; costs: CostsShape |
     const snap = bundledSnapshotRegistry();
     let disk: LoadedRegistry | null = null;
     let diskMs = 0;
-    if (existsSync(CACHE_FILE)) {
+    const file = cacheFilePath();
+    if (existsSync(file)) {
         disk = await readDiskCache();
         if (disk) {
             try {
-                diskMs = statSync(CACHE_FILE).mtimeMs;
+                diskMs = statSync(file).mtimeMs;
             } catch {
                 diskMs = 0;
             }
