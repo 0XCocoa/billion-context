@@ -9,6 +9,7 @@
   - 资产路由先查内存远端 map（rel → {buf, type}），未命中再走原磁盘路径。
 - `src/server/admin.ts`（改）：`/__bili/blog` 路由响应后调 `kickBlogRefresh()`（fire-and-forget，TTL+单飞在模块内部）。
 - `src/plugin.ts`（改 1 行）：`/acp` 状态路径紧跟 `warmChangelogOnce()` 旁加 `warmBlogRefreshOnce()` —— 仅冷启动触发（本进程尚无 master 快照时拉一次）；进程已持有 overlay 后，后续状态访问完全不走网络；失败静默。
+- `src/agent/dsh-native-client.ts`（改，owner 跟进 2026-10-27）：dsh 内嵌 bili 设置面的 tab 栏在「版本」后加「博客」按钮 —— `PAGE_IDS` 尾部追加 `"blog"` + `PAGE_KEYS`/zh/en 各一条 i18n；点击只改 iframe hash（`#/blog`），零新增数据通道。
 
 ## 数据流
 
