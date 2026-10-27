@@ -125,6 +125,25 @@ interface WebSessionSummary {
      *  input rate, compression/TTL repays at the read rate. Only ledgered
      *  sessions with a resolvable price. */
     missSplitUsd?: { n: number; c: number; x: number };
+    /** #4899 v3: compression PAYBACK at current prices — where is this session's
+     *  fold money now? `spentUsd` is the effective one-time cost of folding
+     *  (full-price replay of re-sent tokens + summary output − credit for the
+     *  previously-cached content the fold replaced; it is exactly
+     *  savedUsdGross − savedUsd, so on-screen numbers reconcile); the split
+     *  fields show which part each term contributed. `breakevenTurns` is the
+     *  turn count at which avoided turns outrun the cost (absent when not
+     *  computable — zero gross savings, or already broken even from turn 0);
+     *  compare against `actualTurns` to read paid-back / not-yet. */
+    payback?: {
+        spentUsd: number;
+        replayUsd: number;
+        sigmaUsd: number;
+        creditUsd: number;
+        /** Σ σ output priced at the output rate — the compression side of the output bill. */
+        normalOutputUsd: number;
+        breakevenTurns?: number;
+        actualTurns: number;
+    };
     /** Σ T — measured compression re-pay tokens. */
     repayCost?: number;
     /** Σ σ — summary generation cost (output tokens). */
@@ -177,6 +196,10 @@ interface WebOverview {
     /** #4899 v2: Σ money-mirrored GROSS savings (avoided turns @ read rate).
      *  Only priced sessions contribute. */
     savedUsdGrossTotal: number;
+    /** #4899 v3: fleet payback aggregation over sessions that HAVE fold USD
+     *  data — spent/saved in dollars plus Σ actual post-fold turns so the
+     *  client can render one break-even line. Absent when no session has it. */
+    paybackUsdTotal?: { spent: number; saved: number; turns: number };
     /** #4899 v2: Σ hit-rate miss buckets in dollars across priced ledgered sessions. */
     missSplitUsdTotal?: { n: number; c: number; x: number };
     /** #4899: true when at least one session had a USD ledger or priced folds
@@ -834,13 +857,38 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
     const foldsArr = led?.folds ?? [];
     let savedUsd: number | undefined;
     let savedUsdGross: number | undefined;
+    let payback: WebSessionSummary["payback"];
     if (hasFolds && usdProf !== undefined) {
         const net = savedUsdFromFolds(foldsArr, usdProf);
         if (net !== undefined) {
             savedUsd = net;
-            let gross = 0;
-            for (const f of foldsArr) gross += (((f.S ?? 0) - (f.sigma ?? 0)) * (f.requestsAfter ?? 0) * usdProf.r) / 1e6;
+            // #4899 v3: payback decomposition — same canonical formula as
+            // savedUsdFromFolds (net = gross − oneTime), with the one-time
+            // terms separated on screen: full-price replay (w−r)·T, summary
+            // output q·σ, and the r·S credit for content that was cached
+            // before the fold (hence net == gross − spent holds by
+            // construction — no second arithmetic the user can't reconcile).
+            let gross = 0, replayUsd = 0, sigmaUsd = 0, creditUsd = 0, actualTurns = 0;
+            for (const f of foldsArr) {
+                const S = f.S ?? 0, sig = f.sigma ?? 0, T = f.T ?? 0, ra = f.requestsAfter ?? 0;
+                gross += ((S - sig) * ra * usdProf.r) / 1e6;
+                replayUsd += ((usdProf.w - usdProf.r) * T) / 1e6;
+                sigmaUsd += (usdProf.q * sig) / 1e6;
+                creditUsd += (usdProf.r * S) / 1e6;
+                actualTurns += ra;
+            }
             savedUsdGross = gross;
+            const spentUsd = replayUsd + sigmaUsd - creditUsd;
+            const avgPerTurn = actualTurns > 0 ? gross / actualTurns : 0;
+            payback = {
+                spentUsd: Math.round(spentUsd * 1e4) / 1e4,
+                replayUsd: Math.round(replayUsd * 1e4) / 1e4,
+                sigmaUsd: Math.round(sigmaUsd * 1e4) / 1e4,
+                creditUsd: Math.round(creditUsd * 1e4) / 1e4,
+                normalOutputUsd: Math.round((Math.max(0, outputTokens - summaryCost) * usdProf.q) / 1e6 * 1e4) / 1e4,
+                ...(spentUsd > 0 && avgPerTurn > 0 ? { breakevenTurns: Math.round((spentUsd / avgPerTurn) * 100) / 100 } : {}),
+                actualTurns,
+            };
         }
     } else if (!hasFolds && livePrice !== undefined && tokensSaved > 0) {
         savedUsd = savedUsdGross = (tokensSaved * livePrice.input) / 1e6;
@@ -922,6 +970,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         ...(costUsd !== undefined ? { costUsd } : {}),
         ...(savedUsd !== undefined ? { savedUsd: Math.round(savedUsd * 1e4) / 1e4 } : {}),
         ...(savedUsdGross !== undefined ? { savedUsdGross: Math.round(savedUsdGross * 1e4) / 1e4 } : {}),
+        ...(payback !== undefined ? { payback } : {}),
         ...(missUsd !== undefined
             ? { missSplitUsd: { n: Math.round(missUsd.n * 1e4) / 1e4, c: Math.round(missUsd.c * 1e4) / 1e4, x: Math.round(missUsd.x * 1e4) / 1e4 } }
             : {}),
@@ -1063,6 +1112,7 @@ export async function buildOverview(): Promise<WebOverview> {
     let costUsdTotal = 0, savedUsdTotal = 0, savedUsdGrossTotal = 0, hasMoneyData = false;
     let missUsdN = 0, missUsdC = 0, missUsdX = 0, hasMissUsd = false;
     let coverageLostFoldTotal = 0, coverageLostFrozenTotal = 0;
+    let pbSpent = 0, pbSaved = 0, pbTurns = 0, hasPayback = false;
     let missNewTotal = 0, missCompTotal = 0, missTtlTotal = 0, missInputTotal = 0;
     const protoMap = new Map<string, { protocol: string; sessions: number; requests: number; inputTokens: number; cachedTokens: number; savedNet: number; folds: number; missNew: number; missComp: number; missTtl: number; missInput: number; savedUsd: number; hasSavedUsd: boolean }>();
     for (const s of all) {
@@ -1108,6 +1158,12 @@ export async function buildOverview(): Promise<WebOverview> {
             row.savedUsd += s.savedUsd;
         }
         if (s.savedUsdGross !== undefined) savedUsdGrossTotal += s.savedUsdGross;
+        if (s.payback !== undefined) {
+            hasPayback = true;
+            pbSpent += s.payback.spentUsd;
+            pbSaved += s.savedUsdGross ?? 0;
+            pbTurns += s.payback.actualTurns;
+        }
         if (s.missSplitUsd !== undefined) {
             hasMissUsd = true;
             missUsdN += s.missSplitUsd.n;
@@ -1146,6 +1202,9 @@ export async function buildOverview(): Promise<WebOverview> {
         costUsdTotal,
         savedUsdTotal,
         savedUsdGrossTotal,
+        ...(hasPayback
+            ? { paybackUsdTotal: { spent: Math.round(pbSpent * 1e4) / 1e4, saved: Math.round(pbSaved * 1e4) / 1e4, turns: pbTurns } }
+            : {}),
         ...(hasMissUsd
             ? { missSplitUsdTotal: { n: Math.round(missUsdN * 1e4) / 1e4, c: Math.round(missUsdC * 1e4) / 1e4, x: Math.round(missUsdX * 1e4) / 1e4 } }
             : {}),

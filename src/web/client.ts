@@ -1026,6 +1026,32 @@ function changelogCatOf(rawLine) {
                     : (o.hasMoneyData ? t("ov.money_none") : "");
             }
             const hs = $("st-hit-split");
+            // #4899 v3: compression payback — colored net plus a break-even
+            // line (green when avoided turns outrun the fold cost, red while
+            // they haven't; turns here are the fleet Σ post-fold requests).
+            const pbEl = $("st-payback");
+            if (pbEl) {
+                const pbCard = $("st-payback-card");
+                if (o.paybackUsdTotal) {
+                    const pbNet = (o.paybackUsdTotal.saved || 0) - (o.paybackUsdTotal.spent || 0);
+                    pbEl.textContent = "\u2248 " + fmtUsd(pbNet);
+                    pbEl.title = String(Math.round(pbNet * 1e4) / 1e4);
+                    pbCard.classList.remove("good", "bad");
+                    if (pbNet !== 0) pbCard.classList.add(pbNet >= 0 ? "good" : "bad");
+                    const turns = o.paybackUsdTotal.turns || 0;
+                    const avgPerTurn = turns > 0 ? (o.paybackUsdTotal.saved || 0) / turns : 0;
+                    let sub = t("ov.payback_sub", { v: fmtUsd(o.paybackUsdTotal.saved || 0), s: fmtUsd(o.paybackUsdTotal.spent || 0) });
+                    if (avgPerTurn > 0 && (o.paybackUsdTotal.spent || 0) > 0) {
+                        const be = o.paybackUsdTotal.spent / avgPerTurn;
+                        sub += " · " + (turns >= be ? t("ov.payback_ok") : t("ov.payback_wait", { k: Math.max(1, Math.ceil(be - turns)) }));
+                    } else if (pbNet >= 0) sub += " · " + t("ov.payback_ok");
+                    $("st-payback-sub").textContent = sub;
+                } else {
+                    pbEl.textContent = t("common.none");
+                    pbCard.classList.remove("good", "bad");
+                    $("st-payback-sub").textContent = "";
+                }
+            }
             if (hs) {
                 const missSum = (o.missNewTotal || 0) + (o.missCompTotal || 0) + (o.missTtlTotal || 0);
                 const mi = o.missInputTotal || 0;
@@ -2607,7 +2633,8 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.usage") + '</span></div><div class="card-b">');
         parts.push('<div class="grid cols-4">');
         mini(parts, t("common.requests"), d.requests ? fmtW(d.requests) : null);
-        mini(parts, t("ov.input_tokens"), d.inputTokens ? fmtW(d.inputTokens) : null);
+        mini(parts, t("ov.input_tokens"), d.inputTokens ? fmtW(d.inputTokens) : null, false,
+            d.payback != null && d.savedUsdGross != null ? t("det.in_counterfactual", { n: fmtUsd(d.savedUsdGross) }) : "");
         mini(parts, t("ov.cached_tokens"), d.cachedTokens ? fmtW(d.cachedTokens) : null);
         const mt = d.ledger && d.ledger.totals;
         const missArgs = mt && mt.input > 0 ? { n: fmtW(mt.newContent || 0), c: fmtW(mt.compRepay || 0), x: fmtW(mt.ttlRepay || 0), pn: (((mt.newContent || 0) / mt.input) * 100).toFixed(1), pc: (((mt.compRepay || 0) / mt.input) * 100).toFixed(1), px: (((mt.ttlRepay || 0) / mt.input) * 100).toFixed(1) } : null;
@@ -2635,13 +2662,32 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             ? t("det.miss_split_line", missArgs) + (d.missSplitUsd ? "<br>≈ " + escapeHtml(t("ov.miss_split_usd", { n: fmtUsd(d.missSplitUsd.n), c: fmtUsd(d.missSplitUsd.c), x: fmtUsd(d.missSplitUsd.x) })) : "")
             : "";
         mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missLine);
-        mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null);
+        mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null, false,
+            d.payback != null && d.summaryCost ? t("det.out_split", { n: fmtW(Math.max(0, d.outputTokens - d.summaryCost)), nn: fmtUsd(d.payback.normalOutputUsd), s: fmtW(d.summaryCost), ss: fmtUsd(d.payback.sigmaUsd) }) : "");
         const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
         // #4899: money faces — saved-$ rides the saved-tokens card as the sub
         // line; spend gets its own card with the input/cache/output breakdown.
         const savedUsdSub = d.savedUsd != null ? t("ov.money_saved", { n: fmtUsd(d.savedUsd) }) : "";
         mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0,
             d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : savedUsdSub);
+        // #4899 v3: the honest question — did this session's folding pay back?
+        // The net reuses the same rounded faces rendered next door
+        // (gross − spent, exactly the canonical savedUsd arithmetic), so the
+        // numbers on screen reconcile by construction.
+        if (d.payback != null && d.savedUsdGross != null) {
+            const pnet = d.savedUsdGross - d.payback.spentUsd;
+            let brk = t("det.payback_brk_base", { r: fmtUsd(d.payback.replayUsd), g: fmtUsd(d.payback.sigmaUsd) });
+            if ((d.payback.creditUsd || 0) > 0) brk += " · " + t("det.payback_brk_credit", { c: fmtUsd(d.payback.creditUsd) });
+            let badge = "";
+            if (d.payback.breakevenTurns != null) {
+                const done = d.payback.actualTurns >= d.payback.breakevenTurns;
+                badge = ' <span style="color:' + (done ? "#1a7f37" : "#cf222e") + '">' + (done ? t("ov.payback_ok") : t("ov.payback_wait", { k: Math.max(1, Math.ceil(d.payback.breakevenTurns - d.payback.actualTurns)) })) + "</span>";
+            } else if (pnet >= 0) {
+                badge = ' <span style="color:#1a7f37">' + t("ov.payback_ok") + "</span>";
+            }
+            mini(parts, t("det.payback"), "\u2248 " + fmtUsd(pnet), pnet >= 0,
+                t("det.payback_split", { s: fmtUsd(d.payback.spentUsd), brk, v: fmtUsd(d.savedUsdGross) }) + badge);
+        }
         if (d.costUsd != null) {
             // #4899: derived-from-price-table spend carries the same ≈ mark
             // every other money face uses; a persisted ledger reads exact.
@@ -2649,6 +2695,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
                 t("det.spend_sub", { i: fmtUsd(d.costUsd.input), r: fmtUsd(d.costUsd.cacheRead), w: fmtUsd(d.costUsd.cacheWrite), o: fmtUsd(d.costUsd.output) }));
         }
         mini(parts, t("det.last_input"), (d.lastInputTokens || 0) > 0 ? fmtW(d.lastInputTokens) : null);
+        // #4899 v3: money faces are live estimates at current list prices — say so where they appear.
+        if (d.costUsd != null || d.savedUsd != null)
+            parts.push('<div class="dim small" style="margin-top:8px">' + escapeHtml(t("common.price_est_note")) + "</div>");
         parts.push("</div>");
         // #1839: mark estimate-grade context numbers so a bounded local estimate
         // is never read as a measured value (the ghost-denominator incident).

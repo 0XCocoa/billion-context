@@ -47,6 +47,9 @@ function seedSession(id: string, model: string | undefined): void {
     s.stats.requests = 2; // survive isEmptyStub (requests<=1 && no ctx/blocks/ledger gets hidden)
 }
 
+/** Display-precision rounding the panel applies at the summary boundary. */
+const r4 = (x: number): number => Math.round(x * 1e4) / 1e4;
+
 async function getPricing(): Promise<{ status: number; payload: Record<string, unknown> }> {
     let status = 0;
     let payloadText = "";
@@ -208,6 +211,22 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
     const oneTime = (3 - 0.3) * 3000 + 15 * 5000 - 0.3 * 50000; // 68100
     const expectSaved = Math.round(((perTurn - oneTime) / 1e6) * 1e4) / 1e4; // 0.0669
     assert.ok(row1!.savedUsd !== undefined && Math.abs(row1!.savedUsd! - expectSaved) < 1e-9, `savedUsd ${row1!.savedUsd}`);
+    // #4899 v3: payback decomposition — the split faces must be exactly the
+    // one-time terms of the canonical formula, so gross − spent == savedUsd
+    // on screen (no second arithmetic the user can't reconcile).
+    const pb1 = row1!.payback;
+    assert.ok(pb1 !== undefined, "priced fold session exposes payback");
+    const r4 = (x: number) => Math.round(x * 1e4) / 1e4;
+    const expectReplay1 = r4(((3 - 0.3) * 3000) / 1e6);
+    const expectSigma1 = r4((15 * 5000) / 1e6);
+    const expectCredit1 = r4((0.3 * 50000) / 1e6);
+    const expectSpent1 = r4(expectReplay1 + expectSigma1 - expectCredit1);
+    assert.ok(Math.abs((pb1!.replayUsd ?? 0) - expectReplay1) < 1e-9, `replay ${pb1?.replayUsd}`);
+    assert.ok(Math.abs((pb1!.sigmaUsd ?? 0) - expectSigma1) < 1e-9, `sigma ${pb1?.sigmaUsd}`);
+    assert.ok(Math.abs((pb1!.creditUsd ?? 0) - expectCredit1) < 1e-9, `credit ${pb1?.creditUsd}`);
+    assert.ok(Math.abs((pb1!.spentUsd ?? 0) - expectSpent1) < 1e-9, `spent ${pb1?.spentUsd}`);
+    assert.equal(pb1!.actualTurns, 10, "Σ post-fold requests");
+    assert.ok(Math.abs((pb1!.breakevenTurns ?? 0) - Math.round((expectSpent1 / (0.135 / 10)) * 100) / 100) < 1e-9, `beTurns ${pb1?.breakevenTurns}`);
     // Persisted ledger present ⇒ spend reads as exact (no estimated flag);
     // gross-$ face rides the same live profile r=0.3.
     assert.equal(row1!.costUsd?.estimated, undefined, "persisted spend ledger is exact, not estimated");
@@ -229,12 +248,24 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
     const row5 = list.find((s) => s.id === "web-money-5");
     assert.ok(row5);
     assert.ok(row5!.savedUsd !== undefined && Math.abs(row5!.savedUsd! - expectAnchored) < 1e-9, `anchored savedUsd ${row5!.savedUsd}`);
+    // Anchored profile {w:3,r:0.3,q:12}: spent == the anchored oneTime terms.
+    const pb5 = row5!.payback;
+    assert.ok(pb5 !== undefined, "anchored session exposes payback too");
+    const expectSpent5 = r4(r4(((3 - 0.3) * 3000) / 1e6) + r4((12 * 5000) / 1e6) - expectCredit1);
+    assert.ok(Math.abs((pb5!.spentUsd ?? 0) - expectSpent5) < 1e-9, `anchored spent ${pb5?.spentUsd}`);
+    assert.equal(pb5!.actualTurns, 10);
 
     const ov = await buildOverview();
     assert.ok(Math.abs(ov.costUsdTotal - (0.003 + 0.00012 + 0.000375 + 0.03)) < 1e-12, "overview spend total");
     assert.ok(Math.abs(ov.savedUsdTotal - (expectSaved + expectAnchored)) < 1e-9, "overview saved-$ total includes both priced sessions");
-    // Both priced sessions share r=0.3 → gross faces sum to 2×0.135.
+    // Both priced fold sessions share r=0.3 → gross faces sum to 2×0.135.
     assert.ok(Math.abs((ov.savedUsdGrossTotal ?? 0) - 0.27) < 1e-9, `savedUsdGrossTotal ${ov.savedUsdGrossTotal}`);
+    // Fleet payback aggregation: only the two fold-priced sessions contribute
+    // (unpriced + unanchored-ratio sessions stay out — never fabricated $).
+    assert.ok(ov.paybackUsdTotal !== undefined, "overview carries fleet payback");
+    assert.equal(ov.paybackUsdTotal!.turns, 20, "Σ post-fold turns across priced folds");
+    assert.ok(Math.abs(ov.paybackUsdTotal!.spent - (expectSpent1 + expectSpent5)) < 1e-9, `fleet spent ${ov.paybackUsdTotal?.spent}`);
+    assert.ok(Math.abs(ov.paybackUsdTotal!.saved - 0.27) < 1e-9, `fleet saved ${ov.paybackUsdTotal?.saved}`);
     assert.equal(ov.hasMoneyData, true, "money totals exist when any session is priced");
 
     // A world with no prices anywhere reports hasMoneyData=false (dash, not $0).
@@ -244,6 +275,7 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
     assert.equal(ov2.hasMoneyData, false);
     assert.equal(ov2.costUsdTotal, 0);
     assert.equal(ov2.savedUsdTotal, 0);
+    assert.equal(ov2.paybackUsdTotal, undefined, "no priced folds → no fleet payback line");
 });
 
 test("#4899 legacy sessions: $ faces derive LIVE from the current price table (no stamps needed)", async () => {
@@ -267,9 +299,16 @@ test("#4899 legacy sessions: $ faces derive LIVE from the current price table (n
     // oneTime=(3−0.3)·3000+15·5000−0.3·50000=68100 → 0.0669.
     assert.ok(row!.savedUsd !== undefined && Math.abs(row!.savedUsd! - 0.0669) < 1e-9, `savedUsd ${row!.savedUsd}`);
     assert.ok(Math.abs((row!.savedUsdGross ?? 0) - 0.135) < 1e-9, `savedUsdGross ${row!.savedUsdGross}`);
+    // #4899 v3: legacy sessions get the same payback view; output splits into
+    // normal vs summary-generation tokens (σ of the fold = 5000).
+    assert.ok(row!.payback !== undefined, "legacy fold session exposes payback");
+    assert.ok(Math.abs((row!.payback!.sigmaUsd ?? 0) - r4((15 * 5000) / 1e6)) < 1e-9, `legacy sigma ${row!.payback?.sigmaUsd}`);
+    assert.ok(Math.abs((row!.payback!.normalOutputUsd ?? 0) - r4(((10_000 - 5000) * 15) / 1e6)) < 1e-9, `normal output ${row!.payback?.normalOutputUsd}`);
+    assert.equal(row!.payback!.actualTurns, 10);
     const ov = await buildOverview();
     assert.equal(ov.hasMoneyData, true, "live estimate counts as money data");
     assert.ok(Math.abs(ov.costUsdTotal - 1.8) < 1e-12, `overview spend ${ov.costUsdTotal}`);
+    assert.ok(ov.paybackUsdTotal && Math.abs(ov.paybackUsdTotal.turns - 10) < 1e-9 && ov.paybackUsdTotal.saved === r4(0.135 * 1), `legacy fleet payback turns=${ov.paybackUsdTotal?.turns} saved=${ov.paybackUsdTotal?.saved}`);
 
     // Editing the price table re-prices immediately (nothing was persisted).
     setBillingOverrides({ "claude-bill": { input: 6, output: 15, cacheRead: 0.3 } });
@@ -278,4 +317,32 @@ test("#4899 legacy sessions: $ faces derive LIVE from the current price table (n
     assert.ok(row2!.costUsd && Math.abs(row2!.costUsd.total - (3.0 + 0.15 + 0.15)) < 1e-12, `re-priced ${row2!.costUsd?.total}`);
     // oneTime=(6−0.3)·3000+15·5000−0.3·50000=77100 → (135000−77100)/1e6.
     assert.ok(row2!.savedUsd !== undefined && Math.abs(row2!.savedUsd! - 0.0579) < 1e-9, `re-priced savedUsd ${row2!.savedUsd}`);
+});
+
+test("#4899 v3 payback: a fold whose one-time cost outruns its avoidance reads NOT-yet-paid-back", async () => {
+    resetState();
+    seedSession("web-payback-pending", "claude-bill");
+    const p = getSession("web-payback-pending", { protocol: "anthropic", upstreamOrigin: "http://api.somehost.com" });
+    // Tiny S, huge σ: the summary is almost as long as what it replaced — the
+    // owner's "is compression worth it?" worst case.
+    p.metadata.cacheLedger = { folds: [{ S: 10_000, sigma: 9_000, T: 0, requestsAfter: 1 }] };
+    const list = await buildSessionList();
+    const row = list.find((s) => s.id === "web-payback-pending");
+    assert.ok(row);
+    // perTurn=(10000−9000)·1·0.3=300; oneTime=(3−0.3)·0+15·9000−0.3·10000=132000
+    // → net=−0.1317 < 0 — money-losing while actualTurns(1) ≪ breakevenTurns(440).
+    assert.ok(row!.savedUsd !== undefined && Math.abs(row!.savedUsd! - r4((300 - 132_000) / 1e6)) < 1e-9, `saved ${row?.savedUsd}`);
+    const pb = row!.payback;
+    assert.ok(pb !== undefined, "exposes payback even for money-losing folds");
+    assert.ok(Math.abs((pb!.sigmaUsd ?? 0) - r4((15 * 9_000) / 1e6)) < 1e-9, `sigma ${pb?.sigmaUsd}`);
+    assert.ok(Math.abs((pb!.creditUsd ?? 0) - r4((0.3 * 10_000) / 1e6)) < 1e-9, `credit ${pb?.creditUsd}`);
+    assert.equal(pb!.replayUsd, 0, "T=0 → no full-price replay term");
+    assert.ok(Math.abs((pb!.spentUsd ?? 0) - 0.132) < 1e-9, `spent ${pb?.spentUsd}`);
+    assert.equal(pb!.actualTurns, 1);
+    assert.ok(Math.abs((pb!.breakevenTurns ?? 0) - 440) < 1e-9, `beTurns ${pb?.breakevenTurns}`);
+    // Reconciliation on screen: gross − spent ≈ saved (rounding drift allowed).
+    assert.ok(Math.abs((row!.savedUsdGross ?? 0) - (pb!.spentUsd ?? 0) - (row!.savedUsd ?? 0)) < 3e-4, "faces reconcile");
+    const ov = await buildOverview();
+    assert.ok(ov.paybackUsdTotal !== undefined && ov.paybackUsdTotal.saved - ov.paybackUsdTotal.spent < 0,
+        "fleet line shows a negative net while no session has paid back");
 });
