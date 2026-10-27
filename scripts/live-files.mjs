@@ -68,6 +68,12 @@ export const LIVE_FILES = [
     // servers; every socket is listen(0), spawns are mocked, so the zone band
     // is belt-and-braces like #3890's — the entry is for the tripwire
     "tests/issue4811-dsh-busy-drop-selfheal.test.ts",
+    // #4994: ensureProxyRunning timeout-adoption rows drive fully mocked
+    // children + a fake clock; nothing is spawned and no socket is bound
+    // (the 1899x ports appear only in tmpdir log-file names) — like #3890's
+    // the entry is for the tripwire (its SPAWN_RE hit is the identifier
+    // "spawnLogOffset" in a code comment)
+    "tests/issue4994-spawn-timeout-adopt.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
