@@ -976,19 +976,23 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
         const b = body as { messages?: unknown; model?: unknown; system?: unknown };
         if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) return; // anthropic-wire only; OpenAI-tool shapes resend full
         if (!(await probeIncrementalTurns(base))) return;
-        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: alignedMsgIdsForWire(sid, b.messages) });
-        if (plan.mode === "skip") return;
         // #3378 single-flight (kept over #3329's removal per the rebase
         // decision): while a marker'd request for this URL is still awaiting
         // its ack, later requests ride the normal pipeline. Pending entries
         // are keyed by turn id (#3329), so the guard scans for a live entry
         // stashed on THIS url (sweepStale above already aged out the stale
         // ones — an aged entry must not block a fresh conversion).
+        // The guard must run BEFORE planIncrementalTurn: planning claims the
+        // turn's msgIds client-side (#4491), and a plan this guard then
+        // discards would burn those ids — the host's retry screens against
+        // the burned claims and silently drops the whole msgIds field.
         let inflight = false;
         for (const pending of incPendingOpencode.values()) {
             if (pending.url === url && Date.now() - pending.at < INC_PENDING_TTL_MS) { inflight = true; break; }
         }
         if (inflight) return;
+        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: alignedMsgIdsForWire(sid, b.messages) });
+        if (plan.mode === "skip") return;
         const turnId = newIncrementalTurnId();
         // #3304: stash before the swap — the opencode replacement happens in
         // this hook, BEFORE the fetch intercept ever sees the request, so

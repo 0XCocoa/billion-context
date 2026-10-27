@@ -12,7 +12,7 @@ import { excludeDeadRefRanges } from "../acp-status.js";
 import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
 import { METADATA_LAST_RESPONSES_MODE, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
-import { maybeSnapshotView } from "./snapshot-render.js";
+import { buildAnchoredView, maybeSnapshotView, noteAnchoredRender, SnapshotAnchorFallbackError, wsAnchoredPayload } from "./snapshot-render.js";
 import { storedMessagesFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
 import { compressBreakerArmed } from "../stream.js";
@@ -218,7 +218,26 @@ export async function prepareResponses(
         // (fold-time ids, immune to identity re-mints); live tail keeps the
         // client's bytes. No-op when the lane is inactive/degraded; the
         // reconcile call below still observes the CLIENT view.
-        const renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        // #4804 WS delta continuation: the session layer short-circuited a
+        // previous_response_id delta onto an augmented body ([...prevOutput,
+        // ...newInput]) and stamped this request with the identitySig of its
+        // last converted message. The prefix renders from the unified
+        // transcript, the whole converted body rides verbatim as tail — no
+        // chain walk. A verification miss throws the typed fallback error;
+        // the session layer turns it into the 400 the client answers with a
+        // full replay (lossless recovery).
+        const wsAnchored = !pluginMode ? wsAnchoredPayload(req) : undefined;
+        let renderMsgs: BiliMessage[];
+        if (wsAnchored) {
+            const anchored = buildAnchoredView(session, msgs, wsAnchored.tailSig);
+            if (!anchored.ok) throw new SnapshotAnchorFallbackError(anchored.reason);
+            delete session.metadata["snapshotRenderDegradeReason"];
+            session.metadata["snapshotRenderTailStart"] = anchored.tailStart;
+            noteAnchoredRender(session, log);
+            renderMsgs = anchored.view;
+        } else {
+            renderMsgs = maybeSnapshotView(session, msgs, { sessionId, pluginMode, log });
+        }
         // #4241: the render lane replaced the view (reference-inequality is the
         // discriminator — maybeSnapshotView returns the SAME array when idle),
         // so the judged baseline is the rendered transcript, not the inbound.
