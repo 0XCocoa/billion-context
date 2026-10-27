@@ -65,6 +65,7 @@ import { prepareGoogle, prepareGoogleCountTokens } from "./prepare-google.js";
 import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { prepareResponses, prepareResponsesCompact } from "./prepare-responses.js";
 import { bodyDumpEnabled, isModelDiscoveryPath, isV1InternalControlPlanePath, logDumpFailure, logUnrecognizedPath } from "./observability.js";
+import { yieldToEventLoop } from "../yield-loop.js";
 import { adminGateDenial, handleAdminRoute, isManagementPath } from "./admin.js";
 import { handleIncrementalTurn, handleIncrementalProbe, incrementalTurnBodyShape, incrementalTurnsEnabled, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_PATH } from "../incremental-lane.js";
 import { handlePluginRender, PLUGIN_RENDER_PATH } from "../plugin-render.js";
@@ -2561,6 +2562,11 @@ async function handleRequest(
                 }
                 prepared = await runPrepare();
                 memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? Buffer.byteLength(prepared.body) : prepared.body.byteLength);
+                // #4528: prepare ran the per-turn O(messages) scan passes over
+                // the resent history; yield so UI/API requests queue-drained
+                // during it are served before the (possibly multi-round)
+                // compression pass starts.
+                await yieldToEventLoop();
                 // [#2926] anthropic Threads lane: prepare mirrored the turn and
                 // may have armed a reforge (mirror estimate crossed the window
                 // on a continue, rollout flag on). Execute it now — one summary
@@ -2724,6 +2730,10 @@ async function handleRequest(
                         gcDumpDirIfConfigured(rawDir);
                     } catch (err) { logDumpFailure("INCOMING dump", err); }
                 }
+                // #4528: last local-processing yield before the upstream
+                // forward — anything that queued during the turn is served
+                // here rather than behind the response stream setup.
+                await yieldToEventLoop();
                 logRequestCost(log, session.id, inboundMsgs, inboundBytes, reqT0, prepared!.body);
                 return { body: prepared!.body, prepared: prepared! };
             };
