@@ -167,6 +167,7 @@ interface PersistedSession {
         // pendingFoldUsage / lastLocalTextEstimate(+Origin), which ride along
         // but are deliberately not restored — see buildSession).
         localInputEstimate?: number;
+        lastUsagePayloadUpper?: number;
         lastUsageGradeTokens?: number;
         calibratedEstimate?: number;
         calibratedEstimateOrigin?: string;
@@ -1718,6 +1719,14 @@ export class SessionStore {
 
     replicasAvailable(): boolean {
         return this.shadow !== undefined && !this.shadow.stats.disabled;
+    }
+
+    /** #4804: true only in FULL mode — the one mode whose unified reads
+     *  (unifiedMessageIdRows/unifiedMessageRows/…) actually serve data. In
+     *  shadow mode every read returns null, so read-dependent lanes gate on
+     *  THIS predicate instead of replicasAvailable(). */
+    unifiedReads(): boolean {
+        return this.enabled && this.shadow?.readsUnified === true;
     }
 
     /** #4316 PR3/3: raw id → canonical seq map for the one-time ledger
