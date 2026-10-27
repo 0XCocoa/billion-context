@@ -1655,6 +1655,17 @@ export function resolveRecordedMitmDomains(passed: readonly string[] | undefined
     ]);
 }
 
+/** #4850: passthrough-axis twin of resolveRecordedMitmDomains (#3436
+ *  discipline) — an instance record carries the CONFIG-MERGED mode
+ *  (`passthrough: true` in the config file flips a spawned child even when
+ *  the launcher passed no --passthrough flag; an inherited ACP_PASSTHROUGH
+ *  reaches the child the same way), while launcher callers pass a raw boolean
+ *  flag (native lanes hardcode false). Attach-side shape checks must compare
+ *  against what a spawned child would RECORD, not the raw caller input. */
+export function resolveRecordedPassthrough(flag: boolean, env: NodeJS.ProcessEnv = process.env): boolean {
+    return flag || passthroughState(env).enabled;
+}
+
 /** #1392: opted-in non-http(s) baseUrl providers — providers-table entries
  *  (key = provider id) with `compactionOptIn: true` ∪
  *  BILI_NON_HTTP_PROVIDERS, deduped. Exported so launchers can mirror the list
