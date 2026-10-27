@@ -259,6 +259,25 @@ function substrateDestructionPauseParagraph(n: number): string {
     return ` [COMPRESS CIRCUIT BREAKER: ${n} consecutive compress failures in this session — every attempt has failed because the fold substrate was destroyed by an out-of-band history rewrite. STOP calling compress now: do not try other ranges and do not re-issue any previous ones. There is exactly ONE recovery step: run acp_status once, then compress ONLY a range it currently reports as compressible — one success clears this breaker. If acp_status reports no compressible ranges, continue your task without compressing.]`;
 }
 
+// #4812: short refusal for parse-failure receipts once the breaker has climbed
+// PAST its arm moment (n > threshold). The full format lecture is first-sight
+// teaching — failures 1-3 deliver it, and the arm-moment receipt (n ==
+// threshold) keeps its verbatim pause paragraph. Observed in the field: a
+// looping model re-issued the same malformed call six times and bili
+// re-broadcast the same ~2K-token lecture plus guard plus paragraph on every
+// attempt (~12K burned, all ignored) — the breaker escalated wording but never
+// enforced. From n+1 on the receipt collapses to this one-liner instead. It is
+// self-contained (hideConsumedCompressCalls may have folded the earlier
+// lectures away) and deliberately never mentions acp_status: the loop-noise
+// paragraph orders "do not poll acp_status", and #2360 measured that two
+// contradictory orders in one receipt get obeyed as zero. Calls whose args DO
+// parse are never refused here (see applyRanges), so the #2432 substrate
+// recovery step — acp_status once, then ONE live range — still goes through
+// and can clear the breaker.
+function armedRefusalReceipt(n: number, decayMinutes: number): string {
+    return `[Compression refused: this call carried no usable ranges and the compress circuit breaker is still armed (${n} consecutive failures) — while it stays armed, repeat parse-failure lectures are withheld. Format reminder: 'content' must be a non-empty array whose elements are {startId, endId, summary} objects with mNNNNN refs from your visible history. The breaker disarms on one successful fold or ${decayMinutes} minutes without a failing call. Continue your task without compressing.]`;
+}
+
 /** #2146: record one total compress failure (any spec) and return "" while
  *  healthy, or the pause paragraph to embed in the receipt once the
  *  consecutive-failure threshold is reached. Only failed-call receipts carry
@@ -937,6 +956,15 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
                     : "Fix the argument shape against the format below instead of re-issuing the same malformed call.",
         );
         const loopGuard = trackLoop ? noteCompressLoopFailure(ctx, parseKey) : "";
+        // #4812: enforce the armed breaker on parse-failure receipts — see
+        // armedRefusalReceipt for the invariants (arm-moment receipt unchanged;
+        // parsing-valid calls never blocked; preflight lane untouched via
+        // trackLoop).
+        const armedDetail = trackLoop ? compressBreakerDetail(ctx.session) : undefined;
+        if (armedDetail !== undefined && armedDetail.n > COMPRESS_LOOP_THRESHOLD) {
+            ctx.log(`[acp-proxy: parse-failure receipt collapsed to short refusal (breaker armed, n=${armedDetail.n}, kind=${diagnostics.kind})`);
+            return compressResult(armedRefusalReceipt(armedDetail.n, armedDetail.decayMinutes), "refused", 0, `parse:${diagnostics.kind}`);
+        }
         if (isEmptyCall) {
             return compressResult(`[Compression FAILED: the call carried no content at all (kind=${diagnostics.kind}) — an empty compress() compresses nothing and can never succeed. Do NOT re-issue an empty call; if you meant to compress, put the non-empty 'content' array (elements {startId, endId, summary}) in that SAME single call.${guard}${loopGuard}]`, "refused", 0, `parse:${diagnostics.kind}`);
         }
