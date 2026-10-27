@@ -1721,6 +1721,14 @@ export class SessionStore {
         return this.shadow !== undefined && !this.shadow.stats.disabled;
     }
 
+    /** #4804: true only in FULL mode — the one mode whose unified reads
+     *  (unifiedMessageIdRows/unifiedMessageRows/…) actually serve data. In
+     *  shadow mode every read returns null, so read-dependent lanes gate on
+     *  THIS predicate instead of replicasAvailable(). */
+    unifiedReads(): boolean {
+        return this.enabled && this.shadow?.readsUnified === true;
+    }
+
     /** #4316 PR3/3: raw id → canonical seq map for the one-time ledger
      *  re-stamp (single-row ids only — multi-generation ids are excluded by
      *  the store). Null when the unified store is unavailable; the re-stamp

@@ -157,6 +157,7 @@ import { pipeThrough } from "./server/stream-io.js";
 import { artifactSeedHit, detectAcpArtifacts } from "./server/chain-artifacts.js";
 import { droppedOpenaiParts } from "./wire-drop-warn.js";
 import { BP_MAX, ROLLOUT_FEATURES, rolloutDecisions, rolloutInstallId, warnRolloutConfigProblems } from "./rollout.js";
+import { SnapshotAnchorFallbackError, WS_ANCHORED_REQ_PROP } from "./server/snapshot-render.js";
 export { forward } from "./server/relay.js";
 
 // #1086/#1218: the per-session chain-verdict memory moved to plugin.ts
@@ -675,6 +676,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         try {
             await handle(req, res, opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, adminCtx);
         } catch (err) {
+            // #4817/#4804: an anchored WS delta continuation whose seam check
+            // failed is OWNED by the WS session above — it answers with the
+            // client's standard 400 previous_response_not_found frame, clears
+            // the checkpoint chain, and the client's full replay re-anchors.
+            // Swallowing it into the generic 503 here would retain the
+            // checkpoint and loop the client on the same deterministic miss.
+            // The rethrow rides ONLY the request the WS session stamped
+            // (WS_ANCHORED_REQ_PROP); plain-HTTP lanes keep the 503 shape.
+            if (err instanceof SnapshotAnchorFallbackError && (req as unknown as Record<symbol, unknown>)[WS_ANCHORED_REQ_PROP] !== undefined) throw err;
             const msg = String(err);
             const e = err as { name?: string; message?: string };
             // #411: a client cancel aborts the upstream fetch via
