@@ -154,6 +154,31 @@ describe("#4580 recording: response pipes ring tool_use ids per lane", () => {
         assert.equal(lookupToolUseIdSession(""), undefined);
         assert.equal(lookupToolUseIdSession("x".repeat(513)), undefined);
     });
+
+    test("capacity eviction drops the least-recently-seen id, not the first-inserted", () => {
+        // A re-record keeps its insertion slot but refreshes its timestamp —
+        // the first-inserted id can be the FRESHEST entry, so eviction must
+        // order by time, never by map position.
+        let clock = 2_000_000;
+        _setToolRingClockForTest(() => clock);
+        try {
+            const anchor = "toolu_anchor";
+            recordToolUseId(anchor, "lane-anchor"); // slot 1
+            clock += 1;
+            for (let i = 0; i < 1023; i++) { // slots 2..1024 → exactly at cap
+                recordToolUseId(`toolu_fill_${i}`, "lane-fill");
+                clock += 1;
+            }
+            clock += 1000;
+            recordToolUseId(anchor, "lane-anchor"); // re-record: newest by time, still slot 1
+            recordToolUseId("toolu_newest", "lane-newest"); // overflows the cap → one eviction
+            assert.equal(lookupToolUseIdSession(anchor), "lane-anchor", "re-recorded anchor survives: it is the newest by time");
+            assert.equal(lookupToolUseIdSession("toolu_fill_0"), undefined, "true oldest entry (by time) is evicted");
+            assert.equal(lookupToolUseIdSession("toolu_newest"), "lane-newest");
+        } finally {
+            _setToolRingClockForTest(undefined);
+        }
+    });
 });
 
 // ─────────────────── 2. routing: the id outranks a stale binding ─────────────

@@ -184,7 +184,10 @@ export function recordToolUseId(toolUseId: string, sessionId: string): void {
     if (toolUseId.length === 0 || toolUseId.length > 512) return;
     toolUseIds.set(toolUseId, { sessionId, at: nowMs() });
     while (toolUseIds.size > TOOL_USE_ID_CAPACITY) {
-        // evict the oldest entry (ties impossible: map preserves insert order)
+        // Evict the entry with the smallest recorded time. Full scan — the cap
+        // is tiny and this only runs past it. A re-record keeps its insertion
+        // slot but refreshes `at`, so position order is NOT age order (a
+        // first-inserted id can be the freshest one in the ring).
         let oldestKey: string | undefined;
         let oldestAt = Infinity;
         for (const [k, v] of toolUseIds) {
@@ -192,8 +195,9 @@ export function recordToolUseId(toolUseId: string, sessionId: string): void {
                 oldestAt = v.at;
                 oldestKey = k;
             }
-            if (oldestKey !== undefined && oldestAt === v.at) break;
         }
+        // Never evict what this call just wrote (clock went backwards): leave
+        // the ring one over the cap until a normal insert can evict someone else.
         if (oldestKey === undefined || oldestKey === toolUseId) break;
         toolUseIds.delete(oldestKey);
     }
