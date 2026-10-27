@@ -88,6 +88,7 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `imageBilling` | "auto" \| "pixels" \| "bytes" | auto (resolves to pixels) | BILI_IMAGE_BILLING | Global image-token estimation basis; live-read per request, beats every per-provider setting. |
 | `imageTokenCap` | number | unset (uncapped) | BILI_IMAGE_TOKEN_CAP | Global per-image token ceiling applied on top of the resolved billing mode; live-read per request. |
 | `imageRescale` | boolean | true | BILI_IMAGE_RESCALE | Egress image downscale master switch (#3295/#3400): large outbound images are sent shrunken while originals stay untouched in session storage. Live-read per request. |
+| `billing` | object | {} | — | Per-model billing prices (#4899): billing.prices[model] = { input, output?, cacheRead?, cacheWrite? } in USD per million tokens; overrides the models.dev snapshot for the panel's USD spend ledger and saved-dollar estimate. Unpriced models show tokens only. |
 
 **Behavior toggles**
 
@@ -635,6 +636,29 @@ Top-level keys that control how the proxy listens and behaves globally.
   - `models.<name>.benefit: boolean` (level 3) — whether THIS model on THIS provider bills against the CodeArts free quota (its re-signed requests carry the signed `maas_type: benefit` header). `true`/`false` are explicit — `false` opts a default-set model out; unset falls through to the built-in fallback `glm-5.3-flash, deepseek-v4.1-flash` (the dsh codearts plugin's `CODEARTS_BENEFIT_FALLBACK` mirror). Env `BILI_RESIGN_BENEFIT` (comma-separated) wins over the whole tree.
   - `providers.<url>.resign["<scheme>"]` (level 2) — `{ enabled?, passthrough?, credentialRef? }` under the same scheme key, per-field over the global block.
   - The host-side intercept (dsh native lane) runs before routing exists and always uses the global block — that's the wire-necessity trigger (signed body must tunnel or be refused), not policy. Scheme lookup itself is case-insensitive (wire tokens arrive as `SDK-HMAC-SHA256 Access=…`, keys are lowercase).
+
+### `billing`
+
+- **Type:** `object` — `{ prices: Record<string, { input: number, output?: number, cacheRead?: number, cacheWrite?: number }> }`, prices in USD per **million** tokens
+- **Default:** `{}` (the models.dev registry snapshot prices everything it knows)
+- **Status:** ACTIVE (#4899)
+- **Description:** Per-model billing prices for the web panel's money views. Every settled usage report bills a running USD ledger on the session (`session.stats.costUsd`: input / cache-read / cache-write / output); the panel's "Saved" column additionally converts fold savings into dollars. Resolution per model id: `billing.prices` first, then the bundled models.dev snapshot, then unpriced (tokens only — no fabricated dollars, no fake `$0`).
+  - Keys are model ids and match with the same fuzzy logic the registry uses: `"anthropic/claude-sonnet-4-5"`, a bare `"claude-sonnet-4-5"`, and case drift all hit.
+  - `input` (USD per 1M input tokens) is required — a row without it bills nothing honestly; `output` / `cacheRead` / `cacheWrite` are optional and bill at the input rate when absent (a spend estimate never invents a discount or premium — deliberately NOT the kernel's economics ratios r=0.1w / q=4w).
+  - The price is stamped per request (latest model wins), so a mid-session model switch reprices immediately; past ledger entries keep the price they were billed at (meter semantics).
+  - Invalid shapes (unknown field, negative or zero `input`, non-numeric values) reject the whole block at load — a typo'd price must never silently no-op.
+  - The web editor (`/__bili/` → Configuration → Billing prices) lists every model your sessions have used, prefills registry defaults, and saves back into this block; saving an empty table deletes it.
+
+  ```jsonc
+  {
+    "billing": {
+      "prices": {
+        "anthropic/claude-sonnet-4-5": { "input": 3, "output": 15, "cacheRead": 0.3, "cacheWrite": 3.75 },
+        "openai/gpt-5": { "input": 1.25 }
+      }
+    }
+  }
+  ```
 
 ### `modelContextLimit`
 

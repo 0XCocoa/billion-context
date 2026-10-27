@@ -31,8 +31,9 @@ import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, reco
 import { detectStaleInstall, getLastInstall } from "../update.js";
 import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
-import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
+import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, handlePricingGet, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
 import { handleChangelogGet } from "../web/changelog.js";
+import { kickBlogRefresh } from "../web/blog-refresh.js";
 import { handleBlogAssetGet, handleBlogGet } from "../web/blogfeed.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
@@ -330,6 +331,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/config") return handleConfigGet(res);
+    // #4899: pricing editor data — resolved per-model prices (user overrides >
+    // models.dev snapshot) for the panel's billing settings card. Read-only.
+    if (req.method === "GET" && req.url === "/__bili/pricing") return handlePricingGet(res);
     // #3719: per-release notes for the panel's changelog section — same
     // read-only admin gating as every other /__bili/ GET above (the gates run
     // before dispatch). Always answers 200; offline degrades to empty+error.
@@ -339,6 +343,10 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // fail-soft, no config surface; same gating as every other /__bili/ GET above.
     if (req.method === "GET" && req.url === "/__bili/blog") {
         handleBlogGet(res);
+        // #4906: opportunistically pull newer master content in the background
+        // — fire-and-forget, single-flight + TTL-gated inside; this response
+        // still serves the bundled floor / last good overlay instantly.
+        kickBlogRefresh();
         return;
     }
     if (req.method === "GET" && req.url !== undefined && req.url.startsWith("/__bili/blog-assets/")) {
