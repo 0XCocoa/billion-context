@@ -121,6 +121,22 @@ test("I3 POS lone re-minted call over a host-sent lone call stays clean (volume 
   assert.equal(v.ok, true, JSON.stringify(v.violations));
 });
 
+test("I3 POS in-flight compress re-mint does not inflate volume over a host-broken call", () => {
+  // entry ships ONE host-broken non-compress call plus an in-flight compress
+  // call (no result yet); exit re-mints both ids. Compress must be excluded
+  // from BOTH volume counts or this reads as bili breaking a second pair.
+  const entry = [
+    mk("assistant", "tool-call", "{\"cmd\":\"ls\"}", { toolName: "bash", toolCallId: "call_hostbroken" }),
+    mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_1" }),
+  ];
+  const exit = [
+    mk("assistant", "tool-call", "{\"cmd\":\"ls\"}", { toolName: "bash", toolCallId: "call_REMINTED" }),
+    mk("assistant", "tool-call", "{}", { toolName: "compress", toolCallId: "c_REMINTED" }),
+  ];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+});
+
 test("I3 POS compress call with pending result is exempt (kernel parity, bare + MCP dialect)", () => {
   for (const name of ["compress", "mcp__bili__compress"]) {
     const entry = [
