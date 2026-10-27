@@ -257,6 +257,12 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
 
     const ov = await buildOverview();
     assert.ok(Math.abs(ov.costUsdTotal - (0.003 + 0.00012 + 0.000375 + 0.03)) < 1e-12, "overview spend total");
+    // Per-tier split must reconcile with the total so each overview token
+    // card's ≈$ line sums back to the 花费 card.
+    const cu1 = ov.costUsdSplitTotal;
+    assert.ok(cu1 !== undefined, "priced sessions expose the tier split");
+    assert.ok(Math.abs(cu1!.i - r4(0.003)) < 1e-9 && Math.abs(cu1!.r - r4(0.00012)) < 1e-9 && Math.abs(cu1!.w - r4(0.000375)) < 1e-9 && Math.abs(cu1!.o - r4(0.03)) < 1e-9, `split ${JSON.stringify(cu1)}`);
+    assert.ok(Math.abs((cu1!.i + cu1!.r + cu1!.w + cu1!.o) - ov.costUsdTotal) < 3e-4, "tiers sum to the spend card");
     assert.ok(Math.abs(ov.savedUsdTotal - (expectSaved + expectAnchored)) < 1e-9, "overview saved-$ total includes both priced sessions");
     // Both priced fold sessions share r=0.3 → gross faces sum to 2×0.135.
     assert.ok(Math.abs((ov.savedUsdGrossTotal ?? 0) - 0.27) < 1e-9, `savedUsdGrossTotal ${ov.savedUsdGrossTotal}`);
@@ -274,6 +280,7 @@ test("#4899 web summaries: sessions carry costUsd/savedUsd/model; overview total
     const ov2 = await buildOverview();
     assert.equal(ov2.hasMoneyData, false);
     assert.equal(ov2.costUsdTotal, 0);
+    assert.equal(ov2.costUsdSplitTotal, undefined, "no priced sessions → no tier split either");
     assert.equal(ov2.savedUsdTotal, 0);
     assert.equal(ov2.paybackUsdTotal, undefined, "no priced folds → no fleet payback line");
 });
@@ -308,6 +315,9 @@ test("#4899 legacy sessions: $ faces derive LIVE from the current price table (n
     const ov = await buildOverview();
     assert.equal(ov.hasMoneyData, true, "live estimate counts as money data");
     assert.ok(Math.abs(ov.costUsdTotal - 1.8) < 1e-12, `overview spend ${ov.costUsdTotal}`);
+    // Live-estimate split: 500k fresh @3 + 500k cached @0.3 + 10k output @15.
+    const cul = ov.costUsdSplitTotal;
+    assert.ok(cul && Math.abs(cul.i - 1.5) < 1e-9 && Math.abs(cul.r - 0.15) < 1e-9 && cul.w === 0 && Math.abs(cul.o - 0.15) < 1e-9, `legacy split ${JSON.stringify(cul)}`);
     assert.ok(ov.paybackUsdTotal && Math.abs(ov.paybackUsdTotal.turns - 10) < 1e-9 && ov.paybackUsdTotal.saved === r4(0.135 * 1), `legacy fleet payback turns=${ov.paybackUsdTotal?.turns} saved=${ov.paybackUsdTotal?.saved}`);
 
     // Editing the price table re-prices immediately (nothing was persisted).

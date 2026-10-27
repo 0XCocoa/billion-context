@@ -1063,6 +1063,13 @@ function changelogCatOf(rawLine) {
             $("st-input").textContent = o.inputTokens ? fmtW(o.inputTokens) : t("common.none");
             $("st-cached").textContent = o.cachedTokens ? fmtW(o.cachedTokens) : t("common.none");
             $("st-output").textContent = o.outputTokens ? fmtW(o.outputTokens) : t("common.none");
+            // #4899 v3: each token card carries its own ≈$ tier — together they
+            // reconcile with the 花费 card (i + r + w + o == costUsdTotal), so
+            // every displayed token figure has a money face next to it.
+            const cu = o.costUsdSplitTotal;
+            $("st-input-sub").textContent = cu ? t("ov.tier_unhit", { n: fmtUsd(cu.i) }) : "";
+            $("st-cached-sub").textContent = cu ? t("ov.money_eq", { n: fmtUsd(cu.r) }) : "";
+            $("st-output-sub").textContent = cu ? t("ov.money_eq", { n: fmtUsd(cu.o) }) : "";
             const pb = $("protocol-body");
             pb.innerHTML = "";
             const rows = (o.byProtocol || []).slice().sort((a, b) => b.sessions - a.sessions || b.requests - a.requests);

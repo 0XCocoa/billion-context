@@ -50,9 +50,9 @@ export function renderPage(origin: string, version: string, embed = false, theme
 <div class="stat good"><div class="k" data-i18n="ov.net_saved">${zh("ov.net_saved")}</div><div class="v" id="st-netsaved">—</div><div class="s" id="st-net-sub"></div></div>
 <div class="stat" id="st-payback-card"><div class="k" data-i18n="ov.payback">${zh("ov.payback")}</div><div class="v" id="st-payback">—</div><div class="s" id="st-payback-sub"></div></div>
 <div class="stat"><div class="k" data-i18n="ov.global_hitpct">${zh("ov.global_hitpct")}</div><div class="v" id="st-hitpct">—</div><div class="s" id="st-hit-split" data-i18n="common.none">${zh("common.none")}</div></div>
-<div class="stat"><div class="k" data-i18n="ov.input_tokens">${zh("ov.input_tokens")}</div><div class="v" id="st-input">—</div></div>
-<div class="stat"><div class="k" data-i18n="ov.cached_tokens">${zh("ov.cached_tokens")}</div><div class="v" id="st-cached">—</div></div>
-<div class="stat"><div class="k" data-i18n="ov.output_tokens">${zh("ov.output_tokens")}</div><div class="v" id="st-output">—</div></div>
+<div class="stat"><div class="k" data-i18n="ov.input_tokens">${zh("ov.input_tokens")}</div><div class="v" id="st-input">—</div><div class="s" id="st-input-sub"></div></div>
+<div class="stat"><div class="k" data-i18n="ov.cached_tokens">${zh("ov.cached_tokens")}</div><div class="v" id="st-cached">—</div><div class="s" id="st-cached-sub"></div></div>
+<div class="stat"><div class="k" data-i18n="ov.output_tokens">${zh("ov.output_tokens")}</div><div class="v" id="st-output">—</div><div class="s" id="st-output-sub"></div></div>
 <div class="stat"><div class="k" data-i18n="ov.spend">${zh("ov.spend")}</div><div class="v" id="st-spend">—</div><div class="s" id="st-spend-sub"></div></div>
 </div>
 <div class="dim small" style="margin-top:8px" data-i18n="common.price_est_note">${zh("common.price_est_note")}</div>

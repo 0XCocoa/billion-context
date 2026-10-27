@@ -191,6 +191,10 @@ interface WebOverview {
     missNewTotal: number;
     /** #4899: Σ per-session USD spend (only priced sessions contribute). */
     costUsdTotal: number;
+    /** #4899 v3: per-tier split of costUsdTotal so each overview token card can
+     *  carry its own ≈$ line. i = fresh (uncached) input, r = cache reads,
+     *  w = cache writes, o = output — i+r+w+o == costUsdTotal. */
+    costUsdSplitTotal?: { i: number; r: number; w: number; o: number };
     /** #4899: Σ money-mirrored net savings (only priced sessions contribute). */
     savedUsdTotal: number;
     /** #4899 v2: Σ money-mirrored GROSS savings (avoided turns @ read rate).
@@ -1110,6 +1114,7 @@ export async function buildOverview(): Promise<WebOverview> {
     // summaryOf), so OLD sessions contribute too; unresolvable models still
     // contribute nothing (never $0 fake).
     let costUsdTotal = 0, savedUsdTotal = 0, savedUsdGrossTotal = 0, hasMoneyData = false;
+    let cuI = 0, cuR = 0, cuW = 0, cuO = 0;
     let missUsdN = 0, missUsdC = 0, missUsdX = 0, hasMissUsd = false;
     let coverageLostFoldTotal = 0, coverageLostFrozenTotal = 0;
     let pbSpent = 0, pbSaved = 0, pbTurns = 0, hasPayback = false;
@@ -1150,6 +1155,10 @@ export async function buildOverview(): Promise<WebOverview> {
         if (s.costUsd !== undefined) {
             hasMoneyData = true;
             costUsdTotal += s.costUsd.total;
+            cuI += s.costUsd.input;
+            cuR += s.costUsd.cacheRead;
+            cuW += s.costUsd.cacheWrite;
+            cuO += s.costUsd.output;
         }
         if (s.savedUsd !== undefined) {
             hasMoneyData = true;
@@ -1200,6 +1209,9 @@ export async function buildOverview(): Promise<WebOverview> {
         coverageLostFoldTotal,
         coverageLostFrozenTotal,
         costUsdTotal,
+        ...(hasMoneyData && costUsdTotal > 0
+            ? { costUsdSplitTotal: { i: Math.round(cuI * 1e4) / 1e4, r: Math.round(cuR * 1e4) / 1e4, w: Math.round(cuW * 1e4) / 1e4, o: Math.round(cuO * 1e4) / 1e4 } }
+            : {}),
         savedUsdTotal,
         savedUsdGrossTotal,
         ...(hasPayback
