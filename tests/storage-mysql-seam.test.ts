@@ -4,7 +4,8 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { SessionStore, _setStoreForTest, recordToLegacyView } from "../src/persist.ts";
-import { getSessionAsync } from "../src/session.ts";
+import { _resetSessionsForTest, getSessionAsync, peekSession } from "../src/session.ts";
+import { handlePluginStatus } from "../src/plugin.ts";
 import type { Session } from "../src/session.ts";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
 import type {
@@ -440,6 +441,57 @@ test("seam: getSessionAsync reloads a DB-only session into the resident pool, si
         assert.equal(a.id, CORPUS_ID);
         assert.equal(a.state.blocks.length, loaded.state.blocks.length);
         assert.equal(await getSessionAsync(CORPUS_ID), a, "subsequent calls hit the resident pool");
+    } finally {
+        store.cancelAll();
+        await store.closeQuietlyAsync();
+    }
+});
+
+test("seam: plugin conversation resolution materializes DB-only sessions through the async seam", async () => {
+    const baseDir = tmpDir("bili-seam-pluginres-");
+    const loaded = await seedCorpusSession(baseDir);
+    const stub = new StubMysqlBackend();
+    const shadow = makeShadow(stub);
+    const seamDir = tmpDir("bili-seam-pluginres-store-");
+    const store = makeSeamStore(seamDir, shadow);
+    _setStoreForTest(store);
+    // The earlier tests leave CORPUS_ID resident in the module-level pool —
+    // this scenario needs a cold process view of the conversation.
+    _resetSessionsForTest();
+    try {
+        await seedOnSeam(store, shadow, loaded);
+        removeEnvelopes(seamDir);
+        assert.equal(store.loadSync(CORPUS_ID), null, "precondition: DB-only");
+        assert.equal(peekSession(CORPUS_ID), undefined, "precondition: not resident");
+
+        const chunks: string[] = [];
+        let status = 0;
+        const res = {
+            writeHead: (st: number): void => { status = st; },
+            end: (body?: string): void => { if (body) chunks.push(body); },
+        } as unknown as import("node:http").ServerResponse;
+        // The kernel/config deps are never reached for a DB-reloaded session
+        // (no in-memory plugin snapshot → the nudge path stays empty), so a
+        // throwing stub doubles as a guard against accidental use.
+        const deps = {
+            core: { processTurn(): never { throw new Error("deps.core must not be called"); } },
+            config: {},
+            log: (): void => {},
+        } as unknown as Parameters<typeof handlePluginStatus>[2];
+        await handlePluginStatus(CORPUS_ID, res, deps);
+
+        assert.equal(status, 200, "status must resolve the DB-only conversation");
+        const body = JSON.parse(chunks[chunks.length - 1]);
+        assert.ok(body.ok === true);
+        assert.equal(body.sessionId, CORPUS_ID, "must answer from the resolved session, not a ghost");
+        const resident = peekSession(CORPUS_ID);
+        assert.ok(resident, "resolution must land the session in the resident pool");
+        // The pre-fix shape: a sync getSession after an async probe minted an
+        // EMPTY ghost here (0 blocks) that then poisoned later getSessionAsync.
+        assert.deepEqual(
+            resident!.state.blocks.map((b) => b.blockId).sort(),
+            loaded.state.blocks.map((b) => b.blockId).sort(),
+        );
     } finally {
         store.cancelAll();
         await store.closeQuietlyAsync();
