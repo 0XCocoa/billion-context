@@ -396,7 +396,13 @@ export class SessionStore {
      *  failed to — the sidecar just stays undefined). Resolved immediately
      *  for sqlite/legacy boots. */
     private readonly mysqlReady: Promise<void> = Promise.resolve();
-    /** Await the storage backend before first use (mysql pool + DDL). */
+    /** #4942: true when a network backend (mysql) was selected for
+     *  unified-full mode — the sidecar attaches asynchronously, so before
+     *  ready() resolves this.shadow is still undefined while the DB already
+     *  carries rows. */
+    private readonly networkFullExpected: boolean = false;
+    /** Await the storage backend before first use (mysql pool + DDL). openAsync
+     *  never rejects (it degrades to null), so awaiting this cannot throw. */
     ready(): Promise<void> {
         return this.mysqlReady;
     }
@@ -414,7 +420,7 @@ export class SessionStore {
     private readonly saveBuilders = new Map<string, () => PersistedSession>();
     private readonly debounceMs: number;
 
-    constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
+    constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger; shadow?: UnifiedShadow }) {
         const debounceMs = opts?.debounceMs ?? defaultDebounce();
         this.enabled = (opts?.enabled ?? true) && debounceMs >= 0;
         this.debounceMs = Math.max(0, debounceMs);
@@ -471,17 +477,18 @@ export class SessionStore {
         if (wantJsonWriterOff && !this.jsonWriterOff) {
             baseLog("warn", "[storage] storage.jsonWriter=off ignored — requires storage.unified=full on the sqlite backend (network backends keep the JSON envelope as the sync read path)");
         }
-        const legacyLoad = (rec: unknown): LegacySessionLike | null => {
-            const s = buildSession(rec as PersistedSession);
-            return toLegacyLike(s);
-        };
+        const legacyLoad = recordToLegacyView;
         // #3931 step 3: network backends (mysql) can only open asynchronously
         // (pool + DDL), so the sidecar attaches when it resolves — until then
         // this.shadow stays undefined and every surface keeps its documented
         // no-sidecar posture (envelope reads/writes, banner, replicas off).
         // `ready()` gates the async consumers (saves, boot, admin).
         const backendName = resolveBackendName(process.env, fileStorageBackend());
-        if (this.enabled && !unifiedBlockedByEncryption && backendName === "mysql") {
+        if (opts?.shadow !== undefined) {
+            // #4942 test seam: a pre-built sidecar skips the env-driven open.
+            this.shadow = opts.shadow;
+            this.networkFullExpected = !!(opts.shadow.readsUnified && opts.shadow.isAsyncBackend);
+        } else if (this.enabled && !unifiedBlockedByEncryption && backendName === "mysql") {
             this.mysqlReady = UnifiedShadow.openAsync(
                 this.sessionsDir,
                 process.env,
@@ -494,6 +501,7 @@ export class SessionStore {
                 this.shadow = sh ?? undefined;
             });
             this.shadow = undefined;
+            this.networkFullExpected = storageMode === "full";
         } else {
             this.shadow = this.enabled && !unifiedBlockedByEncryption
                 ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined)
@@ -682,11 +690,14 @@ export class SessionStore {
         // #2960 R2.1 boot union (full mode): rows whose legacy file is gone
         // (deleted, or written by a Phase 3 future that stops writing JSON)
         // remain enumerable — the index is self-sufficient. Shadow stays
-        // file-walk: there JSON is the truth base.
-        if (this.shadow?.readsUnified) {
-            for (const id of this.shadow.listSessionIds()) {
+        // file-walk: there JSON is the truth base. #4942: on network backends
+        // the sidecar attaches asynchronously and the sync facade misses by
+        // design — enumerate through the async twins instead.
+        if (this.shadow?.readsUnified || this.networkFullExpected) {
+            if (this.networkFullExpected) await this.ready();
+            for (const id of await this.unionIds()) {
                 if (out.has(id)) continue;
-                const session = this.loadSync(id);
+                const session = await this.loadAsync(id);
                 if (session) out.set(id, session);
             }
         }
@@ -715,11 +726,13 @@ export class SessionStore {
         // without a legacy file stay enumerable (the index is
         // self-sufficient). bootBounded (limits path) intentionally stays
         // file-based: bounded boot is the cold-start triage path for huge
-        // legacy trees.
-        if (this.shadow?.readsUnified) {
-            for (const id of this.shadow.listSessionIds()) {
+        // legacy trees. #4942: network backends enumerate through the async
+        // twins (the sync facade misses by design there).
+        if (this.shadow?.readsUnified || this.networkFullExpected) {
+            if (this.networkFullExpected) await this.ready();
+            for (const id of await this.unionIds()) {
                 if (out.has(id)) continue;
-                const session = this.loadSync(id);
+                const session = await this.loadAsync(id);
                 if (session) out.set(id, session);
             }
         }
@@ -736,6 +749,21 @@ export class SessionStore {
             if (existsSync(path.join(root, flatFileNameFor(id)))) return true;
         }
         return false;
+    }
+
+    /** #4942: enumeration for the boot/loadAll unions. sqlite keeps the sync
+     *  listSessionIds(); network backends enumerate through sessionSummaries —
+     *  one query carries both the ids and updatedAt, so a budget-bounded
+     *  pre-warm can order newest-first (matching the savedAt-desc arbitration
+     *  of the file path) instead of alphabetical row order. Both sources
+     *  return the SAME row set (neither filters archived tombstones). */
+    private async unionIds(): Promise<string[]> {
+        const shadow = this.shadow;
+        if (!shadow) return [];
+        if (!shadow.isAsyncBackend) return shadow.listSessionIds();
+        const rows = await shadow.sessionSummariesAsync();
+        rows.sort((a, b) => b.updatedAt - a.updatedAt);
+        return rows.map((r) => r.sessionId);
     }
 
     private async bootBounded(limits: { maxSessions: number; maxBytes: number }): Promise<Map<string, Session>> {
@@ -853,15 +881,19 @@ export class SessionStore {
         // The pure-index ids that do enter are measured by their SERIALIZED
         // record — the same proxy readRawFileWithBytes gives the file path
         // (#2803: the budget is a RAM proxy, not a disk one).
-        if (this.shadow?.readsUnified) {
+        // #4942: network backends pre-warm through the async twins under the
+        // SAME budget (the sync facade misses by design there); newest-first
+        // ordering comes from unionIds.
+        if (this.shadow?.readsUnified || this.networkFullExpected) {
+            if (this.networkFullExpected) await this.ready();
             let warmBytes = 0;
             for (const item of warm) warmBytes += item.bytes;
-            for (const id of this.shadow.listSessionIds()) {
+            for (const id of await this.unionIds()) {
                 if (out.size >= limits.maxSessions) break;
                 if (warmBytes >= limits.maxBytes) break;
                 if (out.has(id)) continue;
                 if (this.stateFileOnDisk(id)) continue;
-                const session = this.loadSync(id);
+                const session = await this.loadAsync(id);
                 if (!session) continue;
                 const bytes = this.estimateDecodedBytes(session);
                 if (warmBytes + bytes > limits.maxBytes) continue;
@@ -1571,6 +1603,28 @@ export class SessionStore {
         this.logColdLoad(id, "legacy file", session, envelope.payload.savedAt);
         this.adoptRequestedRoute(id, session, meta);
         return session;
+    }
+
+    /** #4942: async reload seam for network backends — on mysql the sync
+     *  facade has NO read path (viewFor/listSessionIds miss by design, #3931
+     *  step 3), so a cold load with no local envelope used to return null and
+     *  the request path silently started a fresh session, losing every folded
+     *  block at each restart. Serves exactly what loadSync serves whenever
+     *  loadSync finds something (zero behavior change); only when the sync
+     *  path has no copy does it fall to the DB row via viewForAsync.
+     *  Envelope-first precedence is deliberate: envelope writes are
+     *  synchronous per save while DB writes ride the coalesced record queue,
+     *  so an existing envelope is never older than the DB in single-writer
+     *  deployments. Null when neither copy exists. */
+    async loadAsync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Promise<Session | null> {
+        const sync = this.loadSync(id, meta);
+        if (sync) return sync;
+        const shadow = this.shadow;
+        if (!shadow || !shadow.readsUnified || !shadow.isAsyncBackend) return null;
+        await this.ready();
+        const view = await shadow.viewForAsync(id);
+        if (!view) return null;
+        return this.afterLoad(id, view);
     }
 
     /** Shared post-load fixups for the unified read path: rebuilds the
@@ -2937,6 +2991,14 @@ function restoreCalibrationRing(v: unknown): { origin: string; values: number[] 
     const values = ring.values.filter((x): x is number => typeof x === "number" && Number.isFinite(x) && x >= CALIBRATION_SAMPLE_MIN && x <= CALIBRATION_SAMPLE_MAX);
     const recent = values.slice(-CALIBRATION_SAMPLE_WINDOW);
     return recent.length > 0 ? { origin: ring.origin, values: recent } : undefined;
+}
+
+/** #4942: the record→legacy-view adapter the sidecar ingest path runs on
+ *  every committed record — exported so the hermetic seam suite can build a
+ *  sidecar against a stub backend with the SAME adapter the store uses. */
+export function recordToLegacyView(record: unknown): LegacySessionLike | null {
+    const s = buildSession(record as PersistedSession);
+    return toLegacyLike(s);
 }
 
 function buildSession(parsed: PersistedSession): Session {

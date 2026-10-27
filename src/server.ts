@@ -559,7 +559,7 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // (peekSession, then the on-disk store), so it has to be resident first.
     // The plugin conversation routing table is irrelevant to this sweep.
     try {
-        const adopted = reconcileDerivedLineage(listSessions(), {
+        const adopted = await reconcileDerivedLineage(listSessions(), {
             log,
             adoptionEnabled: opts.resumeInheritance !== false,
         });

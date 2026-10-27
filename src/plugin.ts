@@ -1224,13 +1224,15 @@ export function forkParentRevisionLegacy(session: Session): string {
     return forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents), contentStore: store });
 }
 
-function resolveForkConversation(id: string): Session | undefined {
+// #4942: async — on network storage backends the existence probes must be
+// able to reach the DB (the sync facade misses by design there).
+async function resolveForkConversation(id: string): Promise<Session | undefined> {
     if (peekSession(id)) return peekSession(id);
-    if (getStore().loadSync(id)) return getSession(id);
+    if (await getStore().loadAsync(id)) return getSession(id);
     const { session, entry } = resolveConversation(id);
     if (session) return session;
     const persistedId = entry?.sessionId ?? id;
-    if (!getStore().loadSync(persistedId)) return undefined;
+    if (!(await getStore().loadAsync(persistedId))) return undefined;
     return getSession(persistedId);
 }
 
@@ -1362,7 +1364,7 @@ function forkReply(res: ServerResponse, status: number, body: unknown): void {
 
 export async function handlePluginSnapshot(conversationId: string, res: ServerResponse): Promise<void> {
     if (!conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "conversationId is required" });
-    const session = resolveForkConversation(conversationId);
+    const session = await resolveForkConversation(conversationId);
     if (!session) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "unknown plugin conversation" });
     acquireInFlight(session);
     try {
@@ -1413,17 +1415,17 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
     try { request = parseForkRequest(payload); }
     catch (err) { return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: String(err) }); }
     const requestHash = forkHash(request);
-    const replay = (): boolean => {
-        const existing = resolveForkConversation(request.childConversationId);
+    const replay = async (): Promise<boolean> => {
+        const existing = await resolveForkConversation(request.childConversationId);
         if (!existing) return false;
         const receipt = existing.metadata.publicForkReceipt as { requestHash?: unknown; response?: unknown } | undefined;
         if (receipt?.requestHash === requestHash) forkReply(res, 200, { ...(receipt.response as Record<string, unknown>), replayed: true });
         else forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already exists or idempotency payload differs" });
         return true;
     };
-    if (replay()) return;
+    if (await replay()) return;
     if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
-    const parent = resolveForkConversation(request.parentConversationId);
+    const parent = await resolveForkConversation(request.parentConversationId);
     if (!parent) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "parent conversation not found" });
     acquireInFlight(parent);
     try {
@@ -1431,7 +1433,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
         // backend on network backends; withSessionLock accepts () => T |
         // Promise<T>, so the lock scope and ordering are unchanged.
         await withSessionLock(parent, async () => {
-            if (replay()) return;
+            if (await replay()) return;
             if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
             let snapshot: ReturnType<typeof forkSnapshot>;
             try { snapshot = forkSnapshot(parent); }
@@ -1556,7 +1558,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             }
             const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
-            publishForkSession(child);
+            await publishForkSession(child);
             recordPluginSession(request.childConversationId, child.id);
             // #4316 PR3/3: clone the parent's unified-store rows so the
             // child's cloned kernel refs keep pointing at the same ledger
@@ -1674,7 +1676,9 @@ function webSessionUrl(origin: string | undefined, sessionId: string): string | 
     return `${o}/__bili/#/session/${encodeURIComponent(sessionId)}`;
 }
 
-export function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false, trustedOrigin?: string): void {
+// #4942: async — the session resolution below must reach the DB on network
+// storage backends (the caller, handleAdminRoute, is already async).
+export async function handlePluginStatus(conversationId: string, res: import("node:http").ServerResponse, deps: PluginToolDeps, fallbackLatest = false, trustedOrigin?: string): Promise<void> {
     // #3862: the dsh client's Context tab reads this route CROSS-ORIGIN from
     // the dsh web app (its own loopback port / the dsh-app://app scheme). The
     // trusted-origin gate upstream of dispatch already admitted the request;
@@ -1685,7 +1689,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         if (trustedOrigin !== undefined && trustedOrigin.length > 0) h["access-control-allow-origin"] = trustedOrigin;
         return h;
     };
-    let session = resolveForkConversation(conversationId);
+    let session = await resolveForkConversation(conversationId);
     const entry = conversations.get(conversationId);
     let viaFallback = false;
     let resolvedConversationId = conversationId;
@@ -1939,7 +1943,7 @@ export async function handlePluginTool(
     let entry: ConversationEntry | undefined;
     let routedBy: "witness" | "body" | "arb" | "native" = "body";
     if (conversationId) {
-        session = resolveForkConversation(conversationId);
+        session = await resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
         if (session && witnessIds.size > 0 && !witnessIds.has(session.id)) {
             // #2601: a persona-lineage witness is not a spoof — the host stamps
@@ -2040,7 +2044,7 @@ export async function handlePluginTool(
         }
     }
     if (!session) {
-        session = resolveForkConversation(conversationId);
+        session = await resolveForkConversation(conversationId);
         entry = conversations.get(conversationId);
     }
     // #760: the verbatim-id fallback above can resolve a session with NO map
