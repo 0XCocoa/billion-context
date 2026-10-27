@@ -25,7 +25,7 @@ import * as path from "node:path";
 import { UnifiedStore } from "../src/storage/store.ts";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
 import { loadLegacyView, planIngest, type LegacySessionLike } from "../src/storage/ingest.ts";
-import { canonicalize, sha256 } from "../src/storage/canonical.ts";
+import { canonicalize, DIGEST_SKIPPED_KEYS, sha256 } from "../src/storage/canonical.ts";
 import type { CoreMessage } from "acp-kernel";
 
 process.env.BILI_PERSIST_ZSTD = "0";
@@ -123,6 +123,26 @@ test("#4392: arrays keep their order; Maps/Sets keep their canonical envelope", 
         JSON.stringify(canonicalize(new Map([["b", 1]]))),
         JSON.stringify({ __map__: [["b", 1]] }),
         "Map envelope shape unchanged",
+    );
+});
+
+// --- Unit: the skip table is ONE contract, not a per-producer list ---
+
+test("#4392: DIGEST_SKIPPED_KEYS is the single skip contract every digest path shares", () => {
+    // Pinned literally: dropping a key changes every golden pin, so it must be
+    // a conscious re-pin. The streamed `canonicalDigest` (#4532) imports THIS
+    // table instead of hand-copying a list — two hand-maintained skip lists are
+    // how the golden corpus and the shadow parity check end up hashing two
+    // different canonical forms of the same session.
+    assert.deepEqual(Object.keys(DIGEST_SKIPPED_KEYS).sort(), ["storageMode", "tailGaps"]);
+    assert.equal(
+        JSON.stringify(canonicalize({
+            state: { tailGaps: { m00002: 1 }, keep: "x" },
+            metadata: { storageMode: "full", biliVersion: "0.1.208" },
+            stats: { requests: 3 },
+        })),
+        JSON.stringify({ metadata: { biliVersion: "__VER__" }, state: { keep: "x" }, stats: { requests: 3 } }),
+        "skipped keys are dropped at every depth; biliVersion is masked, never dropped",
     );
 });
 
