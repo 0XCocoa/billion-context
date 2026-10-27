@@ -95,7 +95,7 @@ test("#1590: webserver/index-inject publishes __BILI__ while an origin is known 
     }
 });
 
-test("#1590: index-inject stays silent when no origin is known yet (spawn mode)", async () => {
+test("#1590/#4846: index-inject still publishes __BILI__ when no origin is known yet (spawn mode)", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
     try {
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: emptyConfigFile(home) }, async () => {
@@ -105,7 +105,38 @@ test("#1590: index-inject stays silent when no origin is known yet (spawn mode)"
             assert.equal(listeners.length, 1);
             const table: InjectRow[] = [];
             listeners[0](table);
-            assert.deepEqual(table, []);
+            // #4846: DSH Desktop captures this table once per app launch; dropping
+            // the whole row when the origin is not yet bound made dsh.contextTab
+            // fail open forever on desktop. The row now always lands — origin as a
+            // null placeholder, face flags intact (default keeps the tab on).
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: null, contextTab: true } }]);
+        });
+    } finally {
+        rmrf(home);
+    }
+});
+
+test("#4846: index-inject carries contextTab=false even before the origin is bound (desktop boot snapshot)", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-ui-"));
+    try {
+        const cfgFile = path.join(home, "bili-config.json");
+        fs.writeFileSync(cfgFile, JSON.stringify({ dsh: { contextTab: false } }));
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: undefined, BILI_CONFIG_FILE: cfgFile }, async () => {
+            _resetRegisterForTest(undefined);
+            const listeners: InjectListener[] = [];
+            apply(uiCtx(listeners) as Parameters<typeof apply>[0]);
+            const table: InjectRow[] = [];
+            listeners[0](table);
+            // The exact repro: config says hide, spawn mode has not bound an
+            // origin yet at snapshot time — the face flag must still ride the row
+            // so readCtxTabFace() hides the tab instead of failing open.
+            assert.deepEqual(table, [{ kind: "global", name: "__BILI__", value: { origin: null, contextTab: false } }]);
+            // And the live /bili/origin route agrees once polled (snapshot ≡ route).
+            const routes: RouteRow[] = [];
+            apply(routeCtx(routes, []) as Parameters<typeof apply>[0]);
+            const res = new FakeRes();
+            await routes.find((r) => r.path === "/bili/origin")!.handler({}, res);
+            assert.deepEqual(JSON.parse(res.body), { origin: null, contextTab: false });
         });
     } finally {
         rmrf(home);
