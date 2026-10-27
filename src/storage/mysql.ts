@@ -66,7 +66,9 @@ const SEQ_SPAN_QUERY_BATCH = 500;
  *  every verbatim JSON/bytes column (byte-exact round-trip; the JSON type
  *  re-orders keys), BIGINT for ms-epoch timestamps and seqs, VARCHAR keys
  *  sized to their guards. No literal defaults on LONGTEXT columns (MySQL
- *  forbids them) — every INSERT provides every column. */
+ *  forbids them), except the five sessions json columns: expression
+ *  defaults mirroring the sqlite twin's column defaults (#4924), which the
+ *  fork row clone's 5-column sessions INSERT relies on. */
 const MYSQL_DDL = `
 CREATE TABLE IF NOT EXISTS sessions (
     session_id        VARCHAR(255) NOT NULL PRIMARY KEY,
