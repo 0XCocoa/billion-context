@@ -31,11 +31,11 @@
 import { Worker, type WorkerOptions } from "node:worker_threads";
 
 export const WATCHDOG_HEARTBEAT_MS = 5_000;
-export const WATCHDOG_CHECK_INTERVAL_MS = 5_000;
+const WATCHDOG_CHECK_INTERVAL_MS = 5_000;
 export const WATCHDOG_SOFT_WARN_MS = 30_000;
 export const WATCHDOG_HARD_TIMEOUT_MS = 5 * 60_000;
 
-export type WatchdogVerdict = "ok" | "warn" | "trip";
+type WatchdogVerdict = "ok" | "warn" | "trip";
 
 /** Pure gap→verdict mapping — the worker's tick logic, unit-testable without
  *  spawning anything. `warned` prevents re-warning on every tick. */
@@ -45,12 +45,12 @@ export function watchdogVerdict(gapMs: number, warned: boolean, softWarnMs: numb
     return "ok";
 }
 
-export interface EventLoopWatchdogHandle {
+interface EventLoopWatchdogHandle {
     /** Stop heartbeating and terminate the worker. Idempotent. */
     stop(): void;
 }
 
-export interface ArmEventLoopWatchdogOptions {
+interface ArmEventLoopWatchdogOptions {
     /** File the worker appends forensic lines to (the configured bili.log).
      *  undefined/null = stderr only. */
     logFile?: string | null;
