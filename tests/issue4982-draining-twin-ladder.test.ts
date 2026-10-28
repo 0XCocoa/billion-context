@@ -248,6 +248,10 @@ function silentTcpListener(port: number): Promise<net.Server> {
             // EOF) and release the connection, or a dead prober pins server.close()
             // with CLOSE-WAIT sockets
             sock.resume();
+            // A killed prober (Windows kill() is a hard terminate) RSTs us mid-probe;
+            // without an error listener that surfaces as an uncaughtException AFTER
+            // the test ends and fails the whole file (win-only #5050 follow-up).
+            sock.on("error", () => {});
             sock.on("end", () => sock.destroy());
         });
         server.once("error", reject);
