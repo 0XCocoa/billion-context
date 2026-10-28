@@ -352,8 +352,24 @@ test("#4982 e2e: draining same-lane predecessor + squatter → newcomer ladders 
             s.once("error", reject);
         });
         heldRef = held;
+        // #5050: a destroyed pin must not leak a late ECONNRESET into a later
+        // test on platforms where teardown races differ (observed windows node 22).
+        held.on("error", () => {});
 
-        p1.child.kill("SIGTERM");
+        // #5050: kill("SIGTERM") is POSIX-only — Windows Node kills via
+        // TerminateProcess without delivering any signal, so the graceful path
+        // (and the portReleasedAt stamp) never ran there. The cross-platform
+        // seam is POST /__bili/shutdown (#3544): SIGTERM/SIGBREAK/HTTP all
+        // converge on the same shutdown(). A refused/hung response is fine —
+        // the stamp+refusal wait below is the real verification.
+        try {
+            await fetch(`http://127.0.0.1:${port}/__bili/shutdown`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: "{}",
+                signal: AbortSignal.timeout(10_000),
+            });
+        } catch {}
         const p1MarkerFile = path.join(stateHome, "billion-context", "instances", `${p1Marker.instanceId}.json`);
         await waitUntil(async () => {
             let stamped = false;
@@ -363,7 +379,7 @@ test("#4982 e2e: draining same-lane predecessor + squatter → newcomer ladders 
                 return false;
             }
             return stamped && (await tcpRefused(port));
-        }, 20_000, "P1 to stamp portReleasedAt and release the socket");
+        }, 30_000, "P1 to stamp portReleasedAt and release the socket");
 
         // The squatter takes the freed port BEFORE the newcomer starts — but
         // silently, so the newcomer's pre-bind claim probe sees no evidence.
