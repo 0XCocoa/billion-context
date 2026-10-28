@@ -242,8 +242,13 @@ async function killChild(child: ChildProcess): Promise<void> {
  *  EADDRINUSE decision path instead of the pre-bind foreign-owner ladder. */
 function silentTcpListener(port: number): Promise<net.Server> {
     return new Promise((resolve, reject) => {
-        const server = net.createServer(() => {
-            /* accept and hang — never answer HTTP */
+        const server = net.createServer((sock) => {
+            // accept and hang — never answer HTTP; drain the probe's bytes so peer
+            // EOF is actually delivered (a paused socket buffers them and never sees
+            // EOF) and release the connection, or a dead prober pins server.close()
+            // with CLOSE-WAIT sockets
+            sock.resume();
+            sock.on("end", () => sock.destroy());
         });
         server.once("error", reject);
         server.listen(port, "127.0.0.1", () => resolve(server));
@@ -374,7 +379,7 @@ test("#4982 e2e: draining same-lane predecessor + squatter → newcomer ladders 
         const p2Marker = readMarkers(stateHome).find((m) => m.pid === p2.child.pid);
         assert.equal(p2Marker?.lane, "pi");
         assert.equal(p2Marker?.port, result.servedPort);
-        assert.doesNotMatch(p2.out.value, /twin-collision/, "the stale claim must not produce a twin-collision verdict");
+        assert.doesNotMatch(p2.out.value, /already served by a same-build bili instance/, "the stale claim must not produce a twin-collision verdict");
 
         await killChild(p2.child);
         held.destroy();
@@ -430,7 +435,10 @@ test("#4982 e2e: unverified registry twin claim (unstamped marker) → ladder, n
         assert.notEqual(result.servedPort, port, "P2 must ladder off the contended port");
         const logText = fs.readFileSync(path.join(stateHome, "billion-context", "bili.log"), "utf8");
         assert.match(logText, /no longer answers as itself/, "the demotion from twin to foreign-held must be logged");
-        assert.doesNotMatch(logText, /twin-collision/, "an unverified claim must never reach the twin-collision verdict");
+        // The demotion warn above deliberately names "twin-collision" in prose, so pin
+        // the verdict by its unique log marker (shared by the early #4341 and the late
+        // path) instead of that substring.
+        assert.doesNotMatch(logText, /already served by a same-build bili instance/, "an unverified claim must never reach the twin-collision verdict");
 
         await killChild(p2.child);
         await new Promise<void>((resolve) => squatter.close(() => resolve()));
