@@ -4985,6 +4985,28 @@ export async function ensureProxyRunning(
         // port would strand every request.
         return attachTo(existing);
     }
+    // #5103: an explicit attachUrl target that discovery FOUND but every gate
+    // rejected was silent before — only an info-level skip diag per poll tick,
+    // so the user set the field, saw nothing, and waited hours for their own
+    // child. Name the target, the exact rejection reason, and the remedy once
+    // per bring-up, on both the visible channel and the durable log.
+    if (attachUrl !== undefined && existing === undefined) {
+        const target = probed.find((c) => normalizeOrigin(c.inst.origin) === normalizeOrigin(attachUrl));
+        let msg: string;
+        if (target !== undefined) {
+            const reason = instanceCompatible(target.inst, opts, codeFingerprint, foreignLanes);
+            const remedy = reason === "code-fingerprint-mismatch"
+                ? "the target runs different bili bytes than this lane (typical: global install vs host-managed copy right after an update) — restart the host once its copy converges to the same version, or stop the target"
+                : reason !== undefined
+                    ? `config shape mismatch (${reason}) — align the target's launch config with this lane's, or stop the target`
+                    : "it passes compatibility but fails the lifecycle gate (no armed watchdog) — set native.attachExternal=true or BILI_NATIVE_ATTACH_EXTERNAL=1 to attach anyway";
+            msg = `bili: explicit attach target ${attachUrl} (pid ${target.inst.pid}) is not attachable: ${reason ?? "lifecycle gate"} — ${remedy}`;
+        } else {
+            msg = `bili: no live instance registered at the explicit attach target ${attachUrl} — the proxy there never published an instance record or its owner pid is dead; check its startup log`;
+        }
+        console.error(msg);
+        attachDiag(msg);
+    }
     // #3544: nothing attachable above — but a strictly-older generation may
     // still hold our canonical port (its fingerprint differs by definition, so
     // it was never attachable). Rotate it instead of letting the update sit
@@ -5267,7 +5289,10 @@ export async function ensureProxyRunning(
             if (info?.ok) {
                 return selfHealthy
                     ? { text: `port ${port} finally answers healthy from our child (pid ${info.pid}) but its instance handshake never matched — check the instance-file/registry state dir`, selfHealthy }
-                    : { text: `port ${port} is held by a different process${info.pid !== undefined ? ` (pid ${info.pid})` : ""} — the spawned child never bound it`, selfHealthy: false };
+                    // #5103: name the remedy, not just the fact — a foreign holder
+                    // (often a manually started proxy) deadlocks every retry of
+                    // this lane until someone acts on this line.
+                    : { text: `port ${port} is held by a different process${info.pid !== undefined ? ` (pid ${info.pid})` : ""} — the spawned child never bound it. Kill that process (kill ${info.pid ?? "?"}) or set native.attachExternal=true / BILI_NATIVE_ATTACH_EXTERNAL=1 to attach to it instead`, selfHealthy: false };
             }
             // A 200 that is not bili's health payload (foreign dev servers
             // answer ANY path with their index page) must not fall into the
@@ -5359,8 +5384,12 @@ export async function ensureProxyRunning(
                     // #3575: self-recovering progress diagnostic — host-safe
                     // channel only; a raw console.* here lands on the TUI
                     // screen itself in native lanes (see agent/host-log.ts).
+                    // #5103: carry the remedy in the same line — when the child
+                    // never binds (e.g. it dies earlier on EPERM), THIS line is
+                    // all the user sees for hours, and "waiting" alone gives no
+                    // exit from the deadlock.
                     attachDiag(
-                        `bili: port ${port} answers health${info.pid !== undefined ? ` (pid ${info.pid})` : ""} but is not the proxy this launcher spawned (child pid ${child.pid ?? "?"}) — waiting for the spawned instance to report its real origin`,
+                        `bili: port ${port} answers health${info.pid !== undefined ? ` (pid ${info.pid})` : ""} but is not the proxy this launcher spawned (child pid ${child.pid ?? "?"}) — waiting for the spawned instance to report its real origin; if that never happens, kill pid ${info.pid ?? "?"} or set native.attachExternal=true / BILI_NATIVE_ATTACH_EXTERNAL=1 to attach to the holder instead`,
                     );
                 }
             }
