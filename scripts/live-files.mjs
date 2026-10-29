@@ -80,6 +80,9 @@ export const LIVE_FILES = [
     // #4762: in-process eval workers only (wedge probes), never bind a port -
     // the entry exists for the spawn tripwire alone, like #3890
     "tests/event-loop-watchdog.test.ts",
+    // #5012: logger-seam children only (stdio pipes, never bind a port) - the
+    // entry exists for the spawn tripwire alone, like #3890
+    "tests/issue5012-stdout-leg-mute.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
