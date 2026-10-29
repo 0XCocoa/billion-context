@@ -17,6 +17,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { shouldMuteStderrLegAfterFileLive } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
@@ -64,7 +65,7 @@ async function makeChild(dir: string, body: string[]): Promise<string> {
 }
 
 test("wiring: non-TTY + file leg → pipe goes silent after first DELIVERED byte (#5012)", async () => {
-    const dir = fs.mkdtempSync(path.join(ROOT, "tmp", "bili-5012-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5012-"));
     try {
         const logFile = path.join(dir, "bili.log");
         const script = await makeChild(dir, [
@@ -97,7 +98,7 @@ test("wiring: non-TTY + file leg → pipe goes silent after first DELIVERED byte
 });
 
 test("wiring: file leg OFF → tee survives end-to-end (crash fallback, ACP_LOG_FILE=off)", async () => {
-    const dir = fs.mkdtempSync(path.join(ROOT, "tmp", "bili-5012-"));
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-5012-"));
     try {
         const script = await makeChild(dir, [
             "configureLogger(process.env.ACP_LOG_FILE || undefined);",
