@@ -803,23 +803,23 @@ export async function handleIncrementalTurn(
             // #4316 PR2/3: seq stamps ride the same internal transport. The
             // canonical prefix carries its stamps from the unified rows
             // (parseCanonicalRows); this turn's delta tail has no rows yet,
-            // but the wrap-up will append them at maxSeq+1 in order — the
-            // projection is exact, and partial knowledge is never sent: if
-            // the prefix itself is unstamped (first resync, cold replay), the
-            // field stays absent and the kernel keeps its id-based behavior.
+            // but the wrap-up appends them at maxSeq+1 in order (#5155:
+            // asynchronously — the stamps may not have landed yet when the
+            // next turn assembles). Stamps always form a prefix of
+            // entry.msgs, so projecting the unstamped suffix from the last
+            // stamped seq (+1 from 0 when nothing is stamped yet — the first
+            // resync's rows settle in message order) is exact.
             let maxSeq = -1; // 0-based store seq of the last stamped message
             for (const m of entry.msgs) if (typeof m.ledgerSeq === "number") maxSeq = Math.max(maxSeq, m.ledgerSeq - 1);
-            if (maxSeq >= 0) {
-                let next = maxSeq + 1;
-                for (const m of entry.msgs) {
-                    if (typeof m.ledgerSeq !== "number") {
-                        m.ledgerSeq = next + 1;
-                        next++;
-                    }
+            let next = maxSeq + 1;
+            for (const m of entry.msgs) {
+                if (typeof m.ledgerSeq !== "number") {
+                    m.ledgerSeq = next + 1;
+                    next++;
                 }
             }
             const seqs = entry.msgs.map((m) => m.ledgerSeq);
-            if (seqs.every((s) => typeof s === "number")) body[MSG_SEQS_BODY_FIELD] = seqs;
+            body[MSG_SEQS_BODY_FIELD] = seqs;
         }
         const bodyBuf = laneBodyBuffer(body, itemsStr);
 
