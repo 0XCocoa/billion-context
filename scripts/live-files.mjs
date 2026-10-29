@@ -83,6 +83,13 @@ export const LIVE_FILES = [
     // #5012: logger-seam children only (stdio pipes, never bind a port) - the
     // entry exists for the spawn tripwire alone, like #3890
     "tests/issue5012-stdout-leg-mute.test.ts",
+    // #5152: spawns the beat-receiver fixture, which is listen(0) and publishes
+    // its port through a file; the sender under test is a worker_threads worker
+    // POSTing to that ephemeral port. No zone band is needed — the entry is for
+    // the tripwire. Concurrency reviewed: the fixture owns no shared port, its
+    // state lives under a per-run tmpdir, and each test uses its own receiver +
+    // origin, so the refcounted-worker table never sees cross-test collisions.
+    "tests/issue5152-owner-beat-survives-host-stall.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;

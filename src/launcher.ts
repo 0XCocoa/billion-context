@@ -34,6 +34,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { Worker } from "node:worker_threads";
 import { pathToFileURL } from "node:url";
 import { execFileSync, spawn, spawnSync, type StdioOptions } from "node:child_process";
 import { DEFAULT_MITM_DOMAINS } from "./mitm.js";
@@ -4743,16 +4744,40 @@ export function startOwnerHeartbeat(
     origin: string,
     pid: number,
     intervalMs: number = OWNER_HEARTBEAT_INTERVAL_MS,
-    post: (body: string) => Promise<unknown> = async (body: string) => {
-        await fetch(`${origin}/__bili/watcher`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body,
-            signal: AbortSignal.timeout(OWNER_HEARTBEAT_POST_TIMEOUT_MS),
-        });
-    },
+    post?: (body: string) => Promise<unknown>,
 ): (() => void) | undefined {
     if (pid !== process.pid) return undefined;
+    // #5152: the beat must be scheduled where a synchronous turn cannot starve
+    // it — and the host thread is exactly where such a turn runs (#5138: ~19
+    // minutes fully blocked). A main-thread beat is what let the proxy judge a
+    // LIVE owner dead (#4994); #5085 widened the confirmation COUNT, but a
+    // stall longer than count × tick exhausts it and reproduces the false
+    // death. A worker has its own event loop, so it keeps beating while the
+    // host thread is pinned (verified: a 4s host block delays zero worker
+    // beats). WHAT is posted is unchanged — only which loop schedules it.
+    //
+    // The `post` seam is preserved verbatim: an overriding caller (the #3544
+    // tests record beats without a live server) keeps the in-thread loop, so
+    // existing contracts and testability are untouched.
+    if (post !== undefined) return runOwnerHeartbeatLoop(post, pid, intervalMs);
+    return runOwnerHeartbeatWorker(origin, pid, intervalMs);
+}
+
+/** #5152: one worker per origin. Every attach path (spawn, attach, preferred
+ *  fallback) calls startOwnerHeartbeat, and a host with several lanes would
+ *  otherwise stack one worker per call for the same proxy. The worker is
+ *  idempotent per (origin, pid) — a repeat call returns a no-op stop().
+ *
+ *  Keyed by origin only: `pid` is always process.pid here (foreign pids return
+ *  above), so one host attests exactly one pid to a given proxy. */
+const ownerHeartbeatWorkers = new Map<string, { stop: () => void; refs: number }>();
+
+/** In-thread beat loop — the historical shape, kept for injected `post`. */
+function runOwnerHeartbeatLoop(
+    post: (body: string) => Promise<unknown>,
+    pid: number,
+    intervalMs: number,
+): () => void {
     let stopped = false;
     const beat = async (): Promise<void> => {
         while (!stopped) {
@@ -4771,6 +4796,120 @@ export function startOwnerHeartbeat(
     };
     void beat();
     return () => { stopped = true; };
+}
+
+/** Worker body for #5152. Bundled VERBATIM into dist, so it only uses builtins
+ *  and globals (fetch/AbortSignal are global in workers). The specifier goes
+ *  through a constant because scripts/check-dist-external.mjs text-scans for
+ *  quoted require forms — the same sanctioned indirection as
+ *  src/storage/integrity-check.ts. */
+const OWNER_HEARTBEAT_WORKER_SOURCE = `
+const { parentPort, workerData } = require("node:worker_threads");
+const { origin, pid, intervalMs, timeoutMs } = workerData;
+let stopped = false;
+parentPort.on("message", (m) => { if (m === "stop") stopped = true; });
+const beat = async () => {
+    while (!stopped) {
+        await new Promise((r) => { const t = setTimeout(r, intervalMs); t.unref?.(); });
+        if (stopped) return;
+        try {
+            await fetch(origin + "/__bili/watcher", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ pid, hb: true }),
+                signal: AbortSignal.timeout(timeoutMs),
+            });
+        } catch {
+            // transient — the next beat retries; the server-side grace window
+            // absorbs single misses
+        }
+    }
+    parentPort.postMessage("stopped");
+};
+void beat();
+`;
+
+/** #5152: the beat-worker surface this module drives — injectable so the
+ *  crash-fallback path can be exercised without a real thread death. */
+export interface OwnerBeatWorker {
+    on(event: "error", listener: (err: Error) => void): unknown;
+    unref(): void;
+    postMessage(message: string): void;
+    terminate(): Promise<number | undefined>;
+}
+
+/** Worker-owned beat (#5152). Falls back to the in-thread loop if the worker
+ *  cannot start OR dies mid-flight, so a host never loses liveness attestation
+ *  silently — a dead worker still holding its refcount slot would starve every
+ *  later attach for this origin of beats. */
+export function runOwnerHeartbeatWorker(
+    origin: string,
+    pid: number,
+    intervalMs: number,
+    spawn: (source: string, workerData: unknown) => OwnerBeatWorker =
+        (source, workerData) => new Worker(source, { eval: true, workerData }),
+): () => void {
+    const existing = ownerHeartbeatWorkers.get(origin);
+    if (existing !== undefined) {
+        // Same proxy, same host pid: the running worker already attests us.
+        // Refcount so the first stop() does not silence a later caller's beat.
+        existing.refs += 1;
+        let released = false;
+        return () => {
+            if (released) return;
+            released = true;
+            existing.refs -= 1;
+        };
+    }
+    let stopped = false;
+    let worker: OwnerBeatWorker | undefined;
+    let fallbackStop: (() => void) | undefined;
+    try {
+        worker = spawn(OWNER_HEARTBEAT_WORKER_SOURCE, { origin, pid, intervalMs, timeoutMs: OWNER_HEARTBEAT_POST_TIMEOUT_MS });
+        worker.unref();
+        worker.on("error", () => {
+            // Construction failure is covered by the catch below; this covers a
+            // thread that dies MID-FLIGHT: keep attesting from the in-thread
+            // loop (its fetch failures keep looping where a dead thread cannot).
+            if (!stopped && fallbackStop === undefined) {
+                fallbackStop = runOwnerHeartbeatLoop(defaultOwnerPost(origin), pid, intervalMs);
+            }
+        });
+    } catch {
+        return runOwnerHeartbeatLoop(defaultOwnerPost(origin), pid, intervalMs);
+    }
+    const entry = { refs: 1, stop: (): void => { /* replaced below */ } };
+    const stop = (): void => {
+        if (stopped) return;
+        stopped = true;
+        ownerHeartbeatWorkers.delete(origin);
+        // Best-effort: tell the worker to stop, then tear it down regardless so
+        // a wedged worker can never outlive the host that owns it.
+        try { worker?.postMessage("stop"); } catch { /* already gone */ }
+        setTimeout(() => { void worker?.terminate(); }, 50).unref?.();
+        fallbackStop?.();
+    };
+    entry.stop = stop;
+    ownerHeartbeatWorkers.set(origin, entry);
+    let released = false;
+    return () => {
+        if (released) return;
+        released = true;
+        entry.refs -= 1;
+        if (entry.refs <= 0) entry.stop();
+    };
+}
+
+/** The default in-thread beat sender (fallback path). */
+function defaultOwnerPost(origin: string): (body: string) => Promise<unknown> {
+    return async (body: string) => {
+        await fetch(`${origin}/__bili/watcher`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body,
+            signal: AbortSignal.timeout(OWNER_HEARTBEAT_POST_TIMEOUT_MS),
+        });
+    };
 }
 
 export async function ensureProxyRunning(
