@@ -19,6 +19,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { shouldMuteStderrLegAfterFileLive } from "../src/logger.ts";
 import { rmrf } from "./tmp-rm.ts";
 
@@ -58,7 +59,8 @@ async function makeChild(dir: string, body: string[]): Promise<string> {
     const script = path.join(dir, "child.mts");
     fs.writeFileSync(script, [
         `import { existsSync, statSync } from "node:fs";`,
-        `import { configureLogger, onFileLegLive, muteStderrLeg, shouldMuteStderrLegAfterFileLive, isStderrMuted, log, closeLogger } from ${JSON.stringify(path.join(ROOT, "src", "logger.ts"))};`,
+        // Windows ESM: a raw drive path (D:\...) is not a valid import specifier — file:// URL only
+        `import { configureLogger, onFileLegLive, muteStderrLeg, shouldMuteStderrLegAfterFileLive, isStderrMuted, log, closeLogger } from ${JSON.stringify(pathToFileURL(path.join(ROOT, "src", "logger.ts")).href)};`,
         ...body,
     ].join("\n"));
     return script;
