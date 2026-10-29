@@ -1678,6 +1678,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                         log("info", `[watchdog] kill-0 probe failed for pid ${pid} (code=${probe.errCode ?? "?"}) — requiring ${WATCHER_DEAD_CONFIRM_TICKS} consecutive failures before believing it (#3890)`);
                     }
                     deadStreak.set(pid, decision.streak);
+                    // #4994: a kill-0-failing tick DISAGREES with the heartbeat axis and must
+                    // break its run — otherwise a flapping probe (Windows OpenProcess) lets
+                    // stale ticks accumulate across the gap and confirm without N CONSECUTIVE
+                    // alive-stale readings. The pure function already reports hbStreak 0 here;
+                    // persist it (mirrors the alive branch clearing deadStreak).
+                    if ((hbStreaks.get(pid) ?? 0) > 0) {
+                        hbStreaks.delete(pid);
+                        log("info", `[watchdog] pid ${pid} kill-0 probe failing — clearing stale-heartbeat streak (#4994)`);
+                    }
                 }
             }
             if (dead.length > 0) lastDead = dead;
