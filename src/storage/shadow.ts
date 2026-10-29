@@ -737,10 +737,10 @@ export class UnifiedShadow {
         return this.sync.gcPlan(archiveAfterDays, now);
     }
 
-    rawMessages(sessionId: string): { seq: number; content: string }[] {
+    rawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string }[] {
         if (this.sync === null) return [];
         this.assertLive();
-        return this.sync.getMessages(sessionId).map((m) => ({ seq: m.seq, content: m.content }));
+        return this.sync.getMessages(sessionId, fromSeqExclusive !== undefined ? { fromSeqExclusive } : undefined).map((m) => ({ seq: m.seq, content: m.content }));
     }
 
     /** #3756 snapshot render: the logical view's seq pointer list
