@@ -1,4 +1,4 @@
-// #4999 / #5152: the watchdog's stale-heartbeat reading is sampled on the
+// #5152: the watchdog's stale-heartbeat reading is sampled on the
 // PROXY's own event loop, so it is only meaningful while that loop can run.
 //
 // Ticks are not time: a single synchronous turn longer than the whole staleness
@@ -42,7 +42,7 @@ class WatchdogTiming {
     }
 }
 
-test("#4999 the tick-drift measurement turns a long synchronous stall into a WORKING lag", () => {
+test("#5152 the tick-drift measurement turns a long synchronous stall into a WORKING lag", () => {
     const wd = new WatchdogTiming();
     const beatAt = 1_000_000;
     for (let i = 0; i < 5; i += 1) wd.tick(beatAt + i * TICK, beatAt);
@@ -53,7 +53,7 @@ test("#4999 the tick-drift measurement turns a long synchronous stall into a WOR
     assert.ok(wd.lastGrace >= GRACE + 1_100, `the grace must absorb the stall, got ${wd.lastGrace}ms`);
 });
 
-test("#4999 a 1.2s stall (2× the whole staleness window) does NOT remove a live owner", () => {
+test("#5152 a 1.2s stall (2× the whole staleness window) does NOT remove a live owner", () => {
     const wd = new WatchdogTiming();
     const beatAt = 1_000_000;
     for (let i = 0; i < 5; i += 1) wd.tick(beatAt + i * TICK, beatAt);
@@ -62,7 +62,7 @@ test("#4999 a 1.2s stall (2× the whole staleness window) does NOT remove a live
     assert.equal(wd.removed, false, "the stall was the proxy's own blindness, not the owner's death");
 });
 
-test("#4999 the SAME geometry DOES remove a live owner without the lag measurement (regression)", () => {
+test("#5152 the SAME geometry DOES remove a live owner without the lag measurement (regression)", () => {
     const beatAt = 1_000_000;
     const stallUntil = beatAt + 5 * TICK + 1_200;
     let streak: number | undefined;
@@ -75,7 +75,7 @@ test("#4999 the SAME geometry DOES remove a live owner without the lag measureme
     assert.equal(removed, true, "pre-fix: wall-clock age alone burns a stall the loop caused itself");
 });
 
-test("#4999 a genuinely dead owner is still removed once the lag-widened grace expires", () => {
+test("#5152 a genuinely dead owner is still removed once the lag-widened grace expires", () => {
     const wd = new WatchdogTiming();
     const beatAt = 1_000_000;
     for (let i = 0; i < 5; i += 1) wd.tick(beatAt + i * TICK, beatAt);
