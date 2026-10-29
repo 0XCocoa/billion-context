@@ -334,6 +334,23 @@ function processAlive(pid: number): boolean {
     }
 }
 
+/** #5046/B: a live foreign bili process holds <db>.lock and this open is not
+ *  a benign cross-lane share — thrown when the caller opted into
+ *  secondWriterPolicy:"degrade" so it can REFUSE to become a persistent
+ *  second writer instead of reporting-and-running (#3923/#3959). The foreign
+ *  lockfile is left untouched and the raw handle is closed before the throw
+ *  (a leaked WAL handle would defeat the isolation on Windows). */
+export class StorageSecondWriterError extends Error {
+    readonly pid: number;
+    readonly dbPath: string;
+    constructor(pid: number, dbPath: string) {
+        super(`another bili process (pid ${pid}) is already writing ${dbPath}`);
+        this.name = "StorageSecondWriterError";
+        this.pid = pid;
+        this.dbPath = dbPath;
+    }
+}
+
 export class UnifiedStore {
     readonly engine: SqliteEngineName;
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
@@ -363,7 +380,7 @@ export class UnifiedStore {
     static open(
         path: string,
         engine?: SqliteEngineName,
-        opts?: { walJournalSizeLimitBytes?: number },
+        opts?: { walJournalSizeLimitBytes?: number; secondWriterPolicy?: "report" | "degrade" },
     ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
@@ -439,6 +456,10 @@ export class UnifiedStore {
                     const benign = peer !== undefined && ownLane !== undefined && peer.lane !== undefined && peer.lane !== ownLane;
                     if (benign) {
                         loggerLog("info", `[storage] process (pid ${pid}, lane ${peer?.lane}, instance ${peer?.instanceId.slice(0, 8)}) is also using ${path} — different lanes sharing one sessions directory is the supported topology (#3923/#3959); informational only.`);
+                    } else if (opts?.secondWriterPolicy === "degrade") {
+                        // #5046/B (owner decision): a persistent second writer corrupts this db — refuse BEFORE taking over the lockfile; the caller owns the actionable user-facing line.
+                        db.close();
+                        throw new StorageSecondWriterError(pid, path);
                     } else {
                         loggerLog("error", `[storage] another process (pid ${pid}) is already writing ${path} — two processes on one index.db corrupt it (#3923/#3959). One session dir must have exactly one instance (#3633); this lane keeps running but the condition is reported.`);
                     }
@@ -447,6 +468,8 @@ export class UnifiedStore {
             }
             writeFileSync(lockPath, JSON.stringify({ pid: process.pid, boot: Date.now() }));
         } catch (err) {
+            // #5046/B: a second-writer refusal is a decision, not a skipped discipline — it must propagate to the caller's degrade path, not be absorbed here.
+            if (err instanceof StorageSecondWriterError) throw err;
             loggerLog("warn", `[storage] lockfile discipline skipped for ${path}: ${String(err)}`);
         }
         try {
