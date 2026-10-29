@@ -96,13 +96,26 @@ test("#5152 the owner heartbeat keeps POSTing while the sending thread is pinned
         stop?.();
         stop = undefined;
 
-        // Let the last in-flight POST land before reading the tally.
-        await wait(800);
-        const total = recv.beats().length;
+        // The contract is "the beat does not stop while the SENDER's loop is
+        // pinned"; pre-fix that is exactly ZERO additional beats, so a sustained
+        // trickle is already decisive. Demanding ~90% of the theoretical cadence
+        // would instead measure the runner's CPU budget: under --test-concurrency
+        // 4 the worker thread competes with other suites and a healthy fix can
+        // miss that bar on a loaded shard (observed once locally while a second
+        // node process was still running). Poll for a floor so the assertion is
+        // about the property, not the scheduler.
         const expectedDuringBlock = Math.floor(BLOCK_MS / BEAT_MS);
+        const floor = Math.max(1, Math.ceil(expectedDuringBlock / 2));
+        const tallyDeadline = Date.now() + 10_000;
+        while (recv.beats().length < beforeBlock + floor && Date.now() < tallyDeadline) {
+            await wait(50);
+        }
+        const total = recv.beats().length;
         assert.ok(
-            total >= beforeBlock + expectedDuringBlock - 2,
-            `a live owner must stay attested through its own stall: beats before=${beforeBlock}, total=${total}, expected >= ${beforeBlock + expectedDuringBlock - 2} (${expectedDuringBlock} more across a ${BLOCK_MS}ms block)`,
+            total >= beforeBlock + floor,
+            `a live owner must stay attested through its own stall: beats before=${beforeBlock}, total=${total}, ` +
+                `expected >= ${beforeBlock + floor} (>=${floor} of ${expectedDuringBlock} theoretical beats across a ` +
+                `${BLOCK_MS}ms block; pre-fix this is 0)`,
         );
     } finally {
         stop?.();
