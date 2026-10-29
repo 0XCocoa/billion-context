@@ -1516,14 +1516,14 @@ function changelogCatOf(rawLine) {
         // #5079: prompt_cache_key default-off upgrade notice — dismissal is
         // server-side (POST /__bili/notices/dismiss) so one close silences
         // every browser; the banner re-renders from the refetched overview.
-        const pb = $("pck-notice-banner");
-        if (pb) {
+        const nb = $("pck-notice-banner");
+        if (nb) {
             const pn = d.pckNotice && typeof d.pckNotice === "object" ? d.pckNotice : null;
             if (pn && pn.active === true) {
-                pb.hidden = false;
-                pb.classList.add("show");
-                pb.innerHTML = bili_pckNoticeBanner({ on: t("pckoff.on"), desc: t("pckoff.desc"), hint: t("pckoff.hint"), dismiss: t("pckoff.dismiss_btn") });
-                for (const btn of Array.from(pb.querySelectorAll(".pck-notice-dismiss"))) {
+                nb.hidden = false;
+                nb.classList.add("show");
+                nb.innerHTML = bili_pckNoticeBanner({ on: t("pckoff.on"), desc: t("pckoff.desc"), hint: t("pckoff.hint"), dismiss: t("pckoff.dismiss_btn") });
+                for (const btn of Array.from(nb.querySelectorAll(".pck-notice-dismiss"))) {
                     btn.addEventListener("click", async () => {
                         busy(btn, true);
                         try {
@@ -1538,9 +1538,9 @@ function changelogCatOf(rawLine) {
                     });
                 }
             } else {
-                pb.hidden = true;
-                pb.classList.remove("show");
-                pb.innerHTML = "";
+                nb.hidden = true;
+                nb.classList.remove("show");
+                nb.innerHTML = "";
             }
         }
         // #1682: global upstream-connection alert banner — visible on every view,
