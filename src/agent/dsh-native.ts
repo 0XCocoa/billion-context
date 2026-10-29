@@ -601,8 +601,17 @@ function effectiveContextWindow(ctx: PluginContext): number | undefined {
 function rawBodyStringOf(init: RequestInit | undefined): string | undefined {
     const body: unknown = init?.body;
     if (typeof body === "string") return body;
-    if (body instanceof Uint8Array) return new TextDecoder().decode(body);
-    if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
+    if (body instanceof Uint8Array || body instanceof ArrayBuffer) {
+        try {
+            return new TextDecoder().decode(body instanceof Uint8Array ? body : new Uint8Array(body));
+        } catch {
+            // #4912: undecodable buffer (>V8-max-string-length throws
+            // RangeError) → undefined; sharedBodyProvablyOverWindow then
+            // bills ALL bytes as core text (media=0) — the conservative
+            // refusal direction, same convention as no-init call sites.
+            return undefined;
+        }
+    }
     return undefined;
 }
 
@@ -1402,7 +1411,14 @@ async function bodyJsonOf(init: RequestInit | undefined): Promise<unknown> {
         const bytes = raw instanceof Uint8Array ? raw : new Uint8Array(raw);
         const encoding = contentEncodingOf(init);
         if (encoding === undefined) {
-            text = new TextDecoder().decode(bytes);
+            try {
+                text = new TextDecoder().decode(bytes);
+            } catch {
+                // #4912: undecodable buffer (>V8-max-string-length throws
+                // RangeError) → unreadable, same as any other parse failure
+                // below — every caller treats undefined as a clean skip.
+                return undefined;
+            }
         } else {
             try {
                 text = (await decodeRequestBody(encoding, Buffer.from(bytes), limitsDecodedBytes())).body.toString("utf8");
@@ -2371,6 +2387,22 @@ export function apply(ctx: PluginContext): void {
             }
         }
         return headers;
+    };
+
+    // #4894: window source for the degraded direct path. The shared guard in
+    // directSendOrRefuse measures against the stamped header — but headersFor
+    // only runs on the proxy branch, so a request that finds no live proxy
+    // (slow boot past the spawn budget, #4609) carried none and the guard
+    // stayed disarmed in exactly the state that produced the prompt_too_long
+    // storm. Same resolution headersFor stamps (#2381: the session's live
+    // model first, the host's global default as fallback, cached model info
+    // only), minus the tools/attribution gates those serve plugin-mode
+    // stamping — a miss anywhere answers undefined and the arm fails open,
+    // so this can never false-refuse from missing data.
+    state.declaredWindowForDirect = () => {
+        const target = sessionModelTargetOf(ctx) ?? globalModelTarget(modelInfo.services);
+        if (target !== undefined) refreshModelInfo(register.base, target);
+        return effectiveContextWindow(ctx);
     };
 
     // #2399: fork-child adoption runs before headersFor stamps the child's

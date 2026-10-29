@@ -5,7 +5,7 @@ import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
-import { loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
+import { effectivePromptCacheRouting, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
 import { applyCompressSettings, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
@@ -22,6 +22,7 @@ import { getUnrecognizedPathStats } from "./observability.js";
 import { getStore } from "../persist.js";
 import { BodyTooLargeError, headerValue, readBody } from "../server.js";
 import { dismissHostPlugin, visibleHostPluginNotices } from "../host-plugin-notice.js";
+import { PCK_NOTICE_ID, dismissUpgradeNotice, pckNoticeActive } from "../pck-notice.js";
 import { listSessions, memoryReport, peekSession, splitSessionWarnings, totalInFlight } from "../session.js";
 import { BILI_TUNNEL_HEADER } from "../tunnel-guard.js";
 import { isLoopbackAddress } from "../util.js";
@@ -31,8 +32,9 @@ import { formatUpstreamError, getUpstreamConnectionStatus, proxyDispatcher, reco
 import { detectStaleInstall, getLastInstall } from "../update.js";
 import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
-import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
+import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, handlePricingGet, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
 import { handleChangelogGet } from "../web/changelog.js";
+import { kickBlogRefresh } from "../web/blog-refresh.js";
 import { handleBlogAssetGet, handleBlogGet } from "../web/blogfeed.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
@@ -330,6 +332,9 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         return;
     }
     if (req.method === "GET" && req.url === "/__bili/config") return handleConfigGet(res);
+    // #4899: pricing editor data — resolved per-model prices (user overrides >
+    // models.dev snapshot) for the panel's billing settings card. Read-only.
+    if (req.method === "GET" && req.url === "/__bili/pricing") return handlePricingGet(res);
     // #3719: per-release notes for the panel's changelog section — same
     // read-only admin gating as every other /__bili/ GET above (the gates run
     // before dispatch). Always answers 200; offline degrades to empty+error.
@@ -339,6 +344,10 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // fail-soft, no config surface; same gating as every other /__bili/ GET above.
     if (req.method === "GET" && req.url === "/__bili/blog") {
         handleBlogGet(res);
+        // #4906: opportunistically pull newer master content in the background
+        // — fire-and-forget, single-flight + TTL-gated inside; this response
+        // still serves the bundled floor / last good overlay instantly.
+        kickBlogRefresh();
         return;
     }
     if (req.method === "GET" && req.url !== undefined && req.url.startsWith("/__bili/blog-assets/")) {
@@ -374,6 +383,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
             opts.auxProxyFallback = fresh.auxProxyFallback;
             opts.compress = fresh.compress;
             opts.compat = fresh.compat;
+            // #5079: routing must hot-apply too — the web switch changes it live.
+            opts.promptCache = fresh.promptCache;
             resetProxyCache();
             for (const k of Object.keys(opts.routes)) delete opts.routes[k];
             Object.assign(opts.routes, loadRoutes());
@@ -388,6 +399,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "POST" && req.url?.startsWith("/__bili/conflicts/clear")) return handleConflictsClear(req.url, res, log);
     // #2861: silence a known host-side plugin notice for this environment.
     if (req.method === "POST" && req.url === "/__bili/host-plugins/dismiss") return handleHostPluginDismiss(req, res, log);
+    // #5079: silence the prompt_cache.routing default-off upgrade notice.
+    if (req.method === "POST" && req.url === "/__bili/notices/dismiss") return handleNoticeDismiss(req, res, log);
     // #3923/#3959: dismiss the surfaced split-brain notice (body {"sessionId": string}).
     if (req.method === "POST" && req.url === "/__bili/storage/split-brain/ack") return handleSplitBrainAck(req, res, log);
     if (req.method === "GET" && req.url === "/__bili/upstream") {
@@ -966,6 +979,27 @@ async function handleHostPluginDismiss(req: http.IncomingMessage, res: http.Serv
     res.end(JSON.stringify({ ok: true }, null, 2));
 }
 
+// #5079: server-side dismissal of the pck default-off upgrade notice (body {"id": string}).
+async function handleNoticeDismiss(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
+    let id = "";
+    try {
+        const doc: unknown = JSON.parse((await readBody(req)).toString("utf8"));
+        if (doc && typeof doc === "object" && typeof (doc as { id?: unknown })["id"] === "string") id = (doc as { id: string })["id"];
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: 'expected JSON body {"id": "<notice id>"}' }, null, 2));
+        return;
+    }
+    if (!dismissUpgradeNotice(id)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `unknown notice: ${id}` }, null, 2));
+        return;
+    }
+    log("info", `[pck] notice ${id} dismissed via web UI`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }, null, 2));
+}
+
 // #3923/#3959: dismiss the surfaced split-brain notice (body {"sessionId": string}).
 async function handleSplitBrainAck(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
     let sessionId = "";
@@ -1252,6 +1286,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
         updatePolicy: updatePolicyPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),
         hostPluginNotices: visibleHostPluginNotices(process.env),
+        pckNotice: { id: PCK_NOTICE_ID, active: pckNoticeActive(effectivePromptCacheRouting(opts.promptCache)) },
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),

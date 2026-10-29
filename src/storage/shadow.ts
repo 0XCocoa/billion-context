@@ -401,13 +401,15 @@ export class UnifiedShadow {
                     this.driftedSessions.add(legacy.id);
                     // #4323: count CONSECUTIVE sampled drifts — membership alone
                     // caps at "repeat yes/no" and cannot distinguish 3+ samples.
-                    // N in a row proves structural divergence (multi-writer
-                    // #394): escalate ONCE at the threshold with a loud WARN
-                    // naming both sides' fold counts, then freeze THIS
-                    // process's envelope writes for the session so the ping-
-                    // pong stops churning the file copy (persist.ts consults
-                    // envelopeFrozen on every save route; the unified store
-                    // keeps receiving every save either way).
+                    // N in a row marks a STRUCTURAL divergence: the watermark
+                    // clear healed nothing. Note the drift can be a single-
+                    // instance artifact (#4392 — digest shape), not only the
+                    // multi-writer #394 case; escalate ONCE at the threshold
+                    // with a loud WARN naming both sides' fold counts, then
+                    // freeze THIS process's envelope writes for the session so
+                    // the ping-pong stops churning the file copy (persist.ts
+                    // consults envelopeFrozen on every save route; the unified
+                    // store keeps receiving every save either way).
                     const streak = (this.driftStreaks.get(legacy.id) ?? 0) + 1;
                     this.driftStreaks.set(legacy.id, streak);
                     if (streak === DRIFT_ESCALATE_STREAK) {
@@ -420,7 +422,7 @@ export class UnifiedShadow {
                         } catch {
                             // counts must never break the heal path
                         }
-                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}. This usually means MULTIPLE bili instances share one sessions dir (#394 anti-pattern; second-instance detection: #4177). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
+                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}. Both legs are built in THIS process, so a persistent gap is a digest-shape mismatch first (field only one leg builds, ordering) and only then a second writer: a second bili instance sharing one sessions dir (#394 anti-pattern; second-instance detection: #4177) is one cause among others (#4392). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
                     }
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
@@ -823,16 +825,16 @@ export class UnifiedShadow {
         return this.sync.lastLiveSeq(sessionId);
     }
 
-    /** #4316 PR3/3: fork adoption row clone. Works in shadow AND full —
-     *  cloning parent rows the shadow has already mirrored keeps the child
-     *  view self-consistent in both modes; a parent with no rows (never
-     *  mirrored) clones nothing and the fork proceeds kernel-only. */
+    /** #4316 PR3/3: fork adoption row clone (SYNC facade — sqlite only).
+     *  Works in shadow AND full mode: cloning parent rows the shadow has
+     *  already mirrored keeps the child view self-consistent in both modes;
+     *  a parent with no rows (never mirrored) clones nothing and reports
+     *  false so the fork proceeds kernel-only. Network backends
+     *  (sync === null) cannot serve this sync facade — the fork lane awaits
+     *  cloneSessionRowsAsync instead (#4911). */
     cloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
         this.assertLive();
-        if (this.sync !== null) {
-            this.sync.cloneSessionRows(parentId, childId, throughSeq);
-            return true;
-        }
+        if (this.sync !== null) return this.sync.cloneSessionRows(parentId, childId, throughSeq);
         return false;
     }
 
@@ -1113,6 +1115,55 @@ export class UnifiedShadow {
 
     tailViewRowsAsync(sessionId: string): Promise<MessageRow[]> {
         return this.viaAsync([], () => this.tailViewRows(sessionId), () => this.backend!.getMessages(sessionId));
+    }
+
+    /** #4730/#4911: async twin of lastLiveSeq — the fork endpoint's inclusive
+     *  throughSeq awaits this one. Network backends cannot serve the sync
+     *  facade; sqlite delegates to the identical sync body via viaAsync. */
+    lastLiveSeqAsync(sessionId: string): Promise<number | null> {
+        return this.viaAsync(null, () => this.lastLiveSeq(sessionId), async () => {
+            if (this.stats.disabled) return null;
+            try {
+                return await this.backend!.lastLiveSeq(sessionId);
+            } catch (err) {
+                loggerLog("warn", `[storage] lastLiveSeq failed for ${sessionId} (${String(err)}) — kernel-only fork bound`);
+                return null;
+            }
+        });
+    }
+
+    /** #4316 PR3/3, #4911: async twin of cloneSessionRows — routes the fork
+     *  adoption row clone through the backend on network backends; sqlite
+     *  delegates to the identical sync body. Serialized on the shadow queue
+     *  like every other write twin so it can never race a pending parent
+     *  ingest. A failed or disabled sidecar degrades to the kernel-only
+     *  fork (false) — the fork itself must never fail for a storage nicety. */
+    cloneSessionRowsAsync(parentId: string, childId: string, throughSeq: number): Promise<boolean> {
+        return this.viaAsync(false, () => this.cloneSessionRows(parentId, childId, throughSeq), async () => {
+            if (this.stats.disabled) return false;
+            try {
+                return await this.enqueue(() => this.backend!.cloneSessionRows(parentId, childId, throughSeq));
+            } catch (err) {
+                loggerLog("warn", `[storage] fork row clone ${parentId} -> ${childId} failed (${String(err)}) — kernel-only fork`);
+                return false;
+            }
+        });
+    }
+
+    /** Fork publication is strict: clone and initial state land together, or
+     * nothing lands. Unlike shadow mirrors, an error cannot mean success. */
+    createForkAsync(parentId: string, child: LegacySessionLike): Promise<boolean> {
+        if (this.stats.disabled) throw new Error("fork storage unavailable");
+        const initial = planIngest(child);
+        if (this.sync !== null) {
+            const throughSeq = this.sync.lastLiveSeq(parentId);
+            return Promise.resolve(this.sync.cloneSessionRows(parentId, child.id, throughSeq ?? -1, initial));
+        }
+        return this.enqueue(async () => {
+            if (this.stats.disabled) throw new Error("fork storage unavailable");
+            const throughSeq = await this.backend!.lastLiveSeq(parentId);
+            return this.backend!.cloneSessionRows(parentId, child.id, throughSeq ?? -1, initial);
+        });
     }
 
     getCcrAsync(sessionId: string): Promise<MessageContentStore | null> {
