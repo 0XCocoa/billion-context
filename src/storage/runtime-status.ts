@@ -27,8 +27,15 @@ import type { BootstrapOutcome, CooldownMarker } from "./engine-bootstrap.js";
 import { bootstrapFailureMarkerPath, COOLDOWN_MS, nodeSqliteUpgradeHint, readBootstrapFailureMarker } from "./engine-bootstrap.js";
 import { fileStorageAutoDownload, fileStorageJsonWriter, fileStorageUnified, fileStorageWalJournalSizeLimit, resolveStorageMode } from "../knobs.js";
 import { log as loggerLog } from "../logger.js";
+import { resolvedSqliteEngineInfo } from "./driver.js";
 import { MAX_CONSECUTIVE_FAILURES, sqliteOpenFailureHint, type UnifiedShadow } from "./shadow.js";
 import type { StorageMode } from "./shadow.js";
+
+/** The driver's no-engine error text — one predicate, used wherever the
+ *  "is this actually an engine problem?" distinction matters (#5108). */
+function isNoEngineError(errStr: string): boolean {
+    return /no SQLite engine available/i.test(errStr);
+}
 
 interface RuntimeState {
     /** Recorded by the SessionStore constructor; null only before first store build. */
@@ -160,7 +167,13 @@ function pidAlive(pid: number): boolean {
 /** Short one-line form of a raw error for interpolation into banner text. */
 function shortenError(err: string): string {
     const oneLine = err.replace(/\s+/g, " ").trim();
-    return oneLine.length > 160 ? `${oneLine.slice(0, 157)}...` : oneLine;
+    if (oneLine.length <= 160) return oneLine;
+    // #5108/#4816: both ends carry signal — the error class up front, the
+    // errno/detail at the end (e.g. "quarantine rename failed: EPERM") — so
+    // cut the MIDDLE (usually a long path) instead of the tail. Head-only
+    // truncation made the actionable detail invisible on exactly the
+    // long-path machines (Windows user profiles) this fix targets.
+    return `${oneLine.slice(0, 78)}…${oneLine.slice(-78)}`;
 }
 
 function degradeReason(): string {
@@ -183,7 +196,7 @@ function degradeReason(): string {
         const e = shortenError(state.sidecarOpenError);
         // The driver's no-engine error surfaces through the same open path —
         // say what it actually is instead of "index database failed to open".
-        if (/no SQLite engine available/i.test(e)) {
+        if (isNoEngineError(e)) {
             return `no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)${nodeSqliteUpgradeHint()}`;
         }
         return `index database failed to open (${e})${sqliteOpenFailureHint(state.sidecarOpenError)}`;
@@ -277,7 +290,14 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         degraded,
         intentionalOptOut,
         reason: degraded ? degradeReason() : null,
-        engine: sidecar ? sidecar.engineInfo : null,
+        // #5108: an open failure AFTER the engine resolved (corrupt index.db,
+        // …) must not report "engine: none" — that misdirected triage toward
+        // an engine problem when the engine was fine and the file was not.
+        engine: sidecar
+            ? sidecar.engineInfo
+            : state.sidecarOpenError !== null && !isNoEngineError(state.sidecarOpenError)
+                ? resolvedSqliteEngineInfo()
+                : null,
         bootstrap: state.bootstrap?.status ?? null,
         bootstrapFailure: cd.marker,
         cooldownRemainingMs: cd.remainingMs,
@@ -369,7 +389,7 @@ export function storageDiagnosticsLines(ctx: { sessions: number; storageLogLines
         `requested mode: ${st.requested}`,
         `effective mode: ${st.effective}${st.intentionalOptOut ? " (BILI_ENCRYPTION_KEY opt-out — intentional)" : ""}`,
         ...(st.degraded && st.reason ? [`degrade reason: ${st.reason}`] : []),
-        `engine: ${st.engine ? `${st.engine.name}/${st.engine.source}` : "none"}`,
+        `engine: ${st.engine ? `${st.engine.name}/${st.engine.source}${state.sidecarOpenError !== null && !isNoEngineError(state.sidecarOpenError) ? " (resolved, but index.db open failed — see degrade reason)" : ""}` : "none"}`,
         `engine bootstrap: ${st.bootstrap ?? "not run"}`,
         ...(st.bootstrapFailure ? [
             `bootstrap failure marker: at=${new Date(st.bootstrapFailure.atMs).toISOString()} reason="${st.bootstrapFailure.reason}"${st.cooldownRemainingMs ? ` (cooldown ~${Math.round(st.cooldownRemainingMs / 60_000)}m remaining, until ${new Date(st.bootstrapFailure.atMs + COOLDOWN_MS).toISOString()})` : ""}`,
