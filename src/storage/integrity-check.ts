@@ -157,7 +157,15 @@ try {
     const verdict = rows.map((row) => String(row.quick_check ?? "")).join(" ").trim();
     parentPort.postMessage({ ok: true, verdict });
 } catch (err) {
-    parentPort.postMessage({ ok: false, error: String(err) });
+    // #5108/#4816: a corruption-shaped THROW out of quick_check (truncated file,
+    // garbage header, broken overflow chain) is a FAIL VERDICT, not "could not
+    // run" — classify it exactly like src/storage/sqlite-errors.ts does (inlined
+    // here because this string is bundled verbatim and cannot import modules;
+    // keep the two in sync, the worker-facet regression test pins both).
+    const m = String((err && err.message) || err);
+    const c = String((err && err.code) || "").toUpperCase();
+    const corrupt = c === "SQLITE_CORRUPT" || c === "SQLITE_NOTADB" || m.includes("database disk image is malformed") || m.includes("file is not a database");
+    parentPort.postMessage(corrupt ? { ok: false, corrupt: true, error: m } : { ok: false, error: m });
 }
 `;
 
@@ -169,7 +177,7 @@ const inflight = new Set<string>();
  * (#4609). Records the outcome, caches it (ok or fail — a cached fail makes
  * the NEXT open throw and quarantine via the #4175 path), and tells the
  * caller's store instance so a clean close can refresh the cache key. */
-export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok: boolean) => void): void {
+export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok: boolean, detail?: string) => void): void {
     const size = statPart(dbPath)?.s ?? 0;
     loggerLog("info", `[storage] background quick_check started for ${dbPath} (${(size / (1024 * 1024)).toFixed(1)} MiB over the ${Math.round(effectiveSyncThreshold() / (1024 * 1024))} MiB sync threshold) — serving continues; the verdict lands in /__bili/status (#4609)`);
     inflight.add(dbPath);
@@ -190,7 +198,7 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
             worker.unref();
         }
     };
-    worker.on("message", (msg: { ok?: boolean; verdict?: string; error?: string }) => {
+    worker.on("message", (msg: { ok?: boolean; corrupt?: boolean; verdict?: string; error?: string }) => {
         finish(() => {
             if (msg.ok === true) {
                 const verdict = String(msg.verdict ?? "");
@@ -207,8 +215,25 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
                     recordIntegrityOutcome(dbPath, false, 0, verdict.slice(0, 400));
                     writeIntegrityCache(dbPath, false, verdict.slice(0, 400));
                     loggerLog("error", `[storage] background quick_check FAILED for ${dbPath}: ${verdict.slice(0, 400)} — verdict cached; the next open quarantines this file set and reopens fresh (JSON envelopes remain the recovery source, #4175/#4609)`);
-                    onVerdict?.(false);
+                    // Detail rides with the verdict so a clean close can
+                    // refresh the FAIL cache onto post-checkpoint stats
+                    // (#5108/#4816) — without it the verdict would go stale
+                    // after the first clean restart and never quarantine.
+                    onVerdict?.(false, verdict.slice(0, 400));
                 }
+            } else if (msg.corrupt === true) {
+                // #5108/#4816: the scan itself threw a corruption-shaped error
+                // (the throwing shapes of CORRUPT/NOTADB). Same consequences as
+                // a bad verdict row: record loudly and cache the fail so the
+                // NEXT open quarantines + reopens fresh (#4175 path). Without
+                // this branch the throw fell into "could not run" below and the
+                // fail verdict was never recorded — a large corrupt store stayed
+                // unverified boot after boot with no quarantine ever running.
+                const detail = String(msg.error ?? "").slice(0, 400);
+                recordIntegrityOutcome(dbPath, false, 0, detail);
+                writeIntegrityCache(dbPath, false, detail);
+                loggerLog("error", `[storage] background quick_check threw a corruption-shaped error for ${dbPath}: ${detail} — FAIL verdict cached; the next open quarantines this file set and reopens fresh (JSON envelopes remain the recovery source, #5108/#4175)`);
+                onVerdict?.(false, detail);
             } else {
                 loggerLog("warn", `[storage] background quick_check could not run for ${dbPath}: ${String(msg.error)} — the store serves unverified; the next boot rechecks`);
             }

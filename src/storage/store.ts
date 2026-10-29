@@ -25,6 +25,7 @@ import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.
 import { identityOfStoredContent } from "./identity.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
+import { sqliteCorruptionDetail } from "./sqlite-errors.js";
 import { listInstances, type RegistryEntry } from "../instance.js";
 import type { MessageContentStore } from "acp-kernel";
 
@@ -350,6 +351,13 @@ export class UnifiedStore {
      * verdict cache onto the post-checkpoint stats so the next boot skips
      * the rescan. Never true while a check is still in flight or failed. */
     private lastIntegrityOk = false;
+    /** #5108/#4816: a completed check said the file set is CORRUPT — a clean
+     * close refreshes the FAIL verdict onto post-checkpoint stats so the
+     * next boot's cached-fail path quarantines instead of rescan-looping
+     * (a clean close moves the WAL, which would otherwise invalidate the
+     * cache key and send a large corrupt store back to unverified forever).
+     * Outranks lastIntegrityOk at close time. */
+    private lastIntegrityFailDetail: string | null = null;
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null, dbPath: string) {
         this.db = db;
@@ -401,8 +409,16 @@ export class UnifiedStore {
                 // before rethrowing — the #2771 fallback tells operators to
                 // DELETE the file, and Windows refuses to delete a file this
                 // process still holds (unlink EBUSY, #4347 probe).
+                // #5108/#4816: corruption-shaped THROWS (truncated file, garbage
+                // header, broken overflow chain) must become StorageIntegrityError
+                // like the verdict-row path does — the raw rethrow escaped the
+                // shadow's quarantine guard (#4175) and left the corrupt set in
+                // place forever. Transient shapes (BUSY/IOERR/CANTOPEN) stay raw:
+                // quarantining a locked-but-healthy index would be the bug.
                 recordIntegrityOutcome(path, false, Date.now() - started, String(err).slice(0, 400));
                 db.close();
+                const detail = sqliteCorruptionDetail(err);
+                if (detail !== null) throw new StorageIntegrityError(path, detail.slice(0, 400));
                 throw err;
             }
             const durationMs = Date.now() - started;
@@ -459,7 +475,12 @@ export class UnifiedStore {
             // file to reset the index — and Windows refuses to delete a file a
             // live process still holds open. Close, then rethrow for the
             // shadow's legacy-only degradation.
+            // #5108/#4816: large stores (> sync threshold) skip the pre-migration
+            // scan, so a corruption can surface HERE first — classify it the same
+            // way so the shadow quarantines instead of degrading forever.
             db.close();
+            const detail = sqliteCorruptionDetail(err);
+            if (detail !== null) throw new StorageIntegrityError(path, detail.slice(0, 400));
             throw err;
         }
         // #3250: converge the WAL an unclean exit left behind (SIGKILL / power
@@ -480,7 +501,7 @@ export class UnifiedStore {
         // read-only connection — open() returns immediately; the verdict
         // lands in runtime-status and the cache (a cached failure makes the
         // NEXT open quarantine + reopen fresh via the #4175 path).
-        if (mode.kind === "async") scheduleBackgroundIntegrityCheck(path, (ok) => { if (ok) store.noteIntegrityOk(); });
+        if (mode.kind === "async") scheduleBackgroundIntegrityCheck(path, (ok, detail) => { if (ok) store.noteIntegrityOk(); else if (detail !== undefined) store.noteIntegrityFail(detail); });
         return store;
     }
 
@@ -489,6 +510,12 @@ export class UnifiedStore {
      * verdict cache onto the post-checkpoint stats. */
     noteIntegrityOk(): void {
         this.lastIntegrityOk = true;
+    }
+
+    /** #5108/#4816: mirror of noteIntegrityOk for a completed FAIL verdict —
+     * see lastIntegrityFailDetail for why the close-time refresh needs it. */
+    noteIntegrityFail(detail: string): void {
+        this.lastIntegrityFailDetail = detail;
     }
 
     close(): void {
@@ -504,10 +531,13 @@ export class UnifiedStore {
         this.db.close();
         // #4609: a clean close of a verified store refreshes the verdict
         // cache onto the post-checkpoint stats — the normal restart path then
-        // skips the rescan. Deferred while a background check is still in
-        // flight (its own completion writes the cache). Best-effort.
-        if (this.lastIntegrityOk && !backgroundIntegrityInflightForTests(this.dbPath)) {
-            writeIntegrityCache(this.dbPath, true);
+        // skips the rescan. #5108/#4816: the same refresh carries a FAIL
+        // verdict (fail outranks ok — never cache ok for a corrupt file).
+        // Deferred while a background check is still in flight (its own
+        // completion writes the cache). Best-effort.
+        if (!backgroundIntegrityInflightForTests(this.dbPath)) {
+            if (this.lastIntegrityFailDetail !== null) writeIntegrityCache(this.dbPath, false, this.lastIntegrityFailDetail);
+            else if (this.lastIntegrityOk) writeIntegrityCache(this.dbPath, true);
         }
         // #4175: release the ownership lockfile on a clean close so the next
         // open in another process is not told a dead pid holds it. When a
