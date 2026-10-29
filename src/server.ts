@@ -2654,6 +2654,21 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
         && payloadUpperNow >= session.stats.lastInputTokens * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
         && payloadUpperNow >= session.stats.lastUsagePayloadUpper! * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
         && payloadUpperNow - session.stats.lastInputTokens > SIDE_LANE_ANCHOR_MIN_ABS_DELTA;
+    // #5135: pending compress credit proves THIS session executed its own fold
+    // since the last settle — applyRanges (stream.ts) already netted the
+    // savings out of lastInputTokens while lastUsageGradeTokens still carries
+    // the pre-fold report. Until processTurn materializes the fold and clears
+    // the credit, the resent history still contains the covered originals, so
+    // the raw inbound upper bound legitimately towers over the last OUTBOUND
+    // snapshot on long sessions — letting anchorImpossible stand would refuse
+    // this session's own honest anchor and hand the meter the stale pre-fold
+    // grade (false pressure-T2 right after a successful T1). Credit can only
+    // be minted by this conversation's own folds (foreign usage samples write
+    // none), so it exempts exactly this window; the #4805/#4849 anchor-
+    // pollution refusal stays fully armed when credit == 0. #4383's cycle-stale guard
+    // still wins (#4383: newer unreported sends ride their own measurements);
+    // zero is a valid drained reading (kernel treats 0 as unknown).
+    if (!anchorStale && session.stats.lastInputTokensSource === "usage" && (session.stats.compressCreditTokens ?? 0) > 0 && session.stats.lastInputTokens >= 0) return { tokens: session.stats.lastInputTokens, source: "usage" };
     if (!anchorStale && !anchorImpossible && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,
