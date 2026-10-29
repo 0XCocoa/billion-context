@@ -12,7 +12,7 @@ import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
+import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
@@ -59,6 +59,7 @@ import { getSession, hasProcessedState, listSessions, peekSession, type PendingR
 import { detectStaleInstall } from "./update.js";
 import { decideEaddrinuse, eaddrinuseExitCode, isPortBusyError, postBindCanLadder, UPGRADE_REPLACEMENT_ENV, type FailFastReason } from "./listen-policy.js";
 import { getAdvisoryState, cannotResolveTarget } from "./advisory.js";
+import { pckNoticeActive } from "./pck-notice.js";
 import { PACKAGE_NAME, VERSION } from "./version.js";
 import {
     coreToGoogle,
@@ -1290,6 +1291,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                     (opts.passthroughSource === "env"
                         ? "Unset ACP_PASSTHROUGH (or drop --passthrough) and restart to re-enable compression."
                         : "Clear it in the web UI (概览 page) or remove \"passthrough\": true from the config file to re-enable compression."),
+            );
+        }
+        // #5079: first upgrade onto the default-off pck switch — tell relay /
+        // account-pool users their affinity signal is off until they opt back in.
+        if (pckNoticeActive(effectivePromptCacheRouting(opts.promptCache))) {
+            log(
+                "info",
+                `[pck] prompt_cache_key self-stamping is OFF by default now (#5079). ` +
+                    "Upstreams that route prefix cache by this key (relays like workbuddy panel/hub, account pools) need it ON — set promptCache.routing=auto (or ACP_PROMPT_CACHE_ROUTING=auto) or use the web UI switch; direct official-API users can ignore this.",
             );
         }
         // #2090 plan A: signed requests refused earlier that the user has not
@@ -2686,6 +2696,21 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
         && payloadUpperNow >= session.stats.lastInputTokens * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
         && payloadUpperNow >= session.stats.lastUsagePayloadUpper! * SIDE_LANE_ANCHOR_IMPOSSIBLE_RATIO
         && payloadUpperNow - session.stats.lastInputTokens > SIDE_LANE_ANCHOR_MIN_ABS_DELTA;
+    // #5135: pending compress credit proves THIS session executed its own fold
+    // since the last settle — applyRanges (stream.ts) already netted the
+    // savings out of lastInputTokens while lastUsageGradeTokens still carries
+    // the pre-fold report. Until processTurn materializes the fold and clears
+    // the credit, the resent history still contains the covered originals, so
+    // the raw inbound upper bound legitimately towers over the last OUTBOUND
+    // snapshot on long sessions — letting anchorImpossible stand would refuse
+    // this session's own honest anchor and hand the meter the stale pre-fold
+    // grade (false pressure-T2 right after a successful T1). Credit can only
+    // be minted by this conversation's own folds (foreign usage samples write
+    // none), so it exempts exactly this window; the #4805/#4849 anchor-
+    // pollution refusal stays fully armed when credit == 0. #4383's cycle-stale guard
+    // still wins (#4383: newer unreported sends ride their own measurements);
+    // zero is a valid drained reading (kernel treats 0 as unknown).
+    if (!anchorStale && session.stats.lastInputTokensSource === "usage" && (session.stats.compressCreditTokens ?? 0) > 0 && session.stats.lastInputTokens >= 0) return { tokens: session.stats.lastInputTokens, source: "usage" };
     if (!anchorStale && !anchorImpossible && session.stats.lastInputTokens > 0 && (session.stats.lastInputTokensSource === "usage" || session.stats.lastInputTokensSource === "overflow-arm") && staleSmallAnchorFallback(session.stats, session.stats.lastInputTokens) === null) return { tokens: session.stats.lastInputTokens, source: "usage" };
     // #1820: right after a preflight rebuild the usage-grade baseline above is
     // momentarily absent (the rebuild request's own report hasn't landed yet,
