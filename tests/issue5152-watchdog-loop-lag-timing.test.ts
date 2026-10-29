@@ -7,8 +7,11 @@
 // fix measures the ticker's OWN scheduling drift and widens the window by it —
 // blindness the loop caused must not be charged to the owner.
 //
-// This file pins the TIMING path against master's immediate-removal semantics;
-// the pure seam is pinned in tests/issue5152-watchdog-own-loop-blindness.test.ts
+// This file pins the TIMING path in both directions: the lag-widened window
+// must survive a stall the loop caused itself, and the RAW window must still
+// burn the same geometry (the death completing over #4994's consecutive
+// confirmation — this file isolates the grace axis, not the confirmation one).
+// The pure seam is pinned in tests/issue5152-watchdog-own-loop-blindness.test.ts
 // and the sender side in tests/issue5152-owner-beat-survives-host-stall.test.ts.
 // Scale-invariant: the same geometry runs at TICK=100ms / GRACE=600ms.
 import test from "node:test";
@@ -19,7 +22,8 @@ import type { PidProbe } from "../src/instance.ts";
 const TICK = 100;
 const GRACE = 600;
 const CONFIRM = 3;
-const OPTS = { confirmTicks: CONFIRM };
+const HB_CONFIRM = 5;
+const OPTS = { confirmTicks: CONFIRM, heartbeatConfirmTicks: HB_CONFIRM };
 const alive: PidProbe = { alive: true };
 
 /** Mirrors the production watchdog tick: measure this ticker's OWN scheduling
@@ -27,6 +31,7 @@ const alive: PidProbe = { alive: true };
 class WatchdogTiming {
     private prevTickAt: number | null = null;
     private streak: number | undefined;
+    private hbStreak: number | undefined;
     removed = false;
     lastLag = 0;
     lastGrace = GRACE;
@@ -36,8 +41,9 @@ class WatchdogTiming {
         this.prevTickAt = nowMs;
         this.lastLag = lag;
         this.lastGrace = effectiveHeartbeatGrace(GRACE, lag);
-        const d = tickWatchedPid(alive, lastSeenAt, nowMs, this.streak, { ...OPTS, heartbeatGraceMs: this.lastGrace });
+        const d = tickWatchedPid(alive, lastSeenAt, nowMs, this.streak, this.hbStreak, { ...OPTS, heartbeatGraceMs: this.lastGrace });
         this.streak = d.streak;
+        this.hbStreak = d.hbStreak;
         if (d.removed) this.removed = true;
     }
 }
@@ -66,13 +72,15 @@ test("#4999 the SAME geometry DOES remove a live owner without the lag measureme
     const beatAt = 1_000_000;
     const stallUntil = beatAt + 5 * TICK + 1_200;
     let streak: number | undefined;
+    let hbStreak: number | undefined;
     let removed = false;
-    for (let i = 0; i < 6; i += 1) {
-        const d = tickWatchedPid(alive, beatAt, stallUntil + i * TICK, streak, { ...OPTS, heartbeatGraceMs: GRACE });
+    for (let i = 0; i < HB_CONFIRM + 1; i += 1) {
+        const d = tickWatchedPid(alive, beatAt, stallUntil + i * TICK, streak, hbStreak, { ...OPTS, heartbeatGraceMs: GRACE });
         streak = d.streak;
+        hbStreak = d.hbStreak;
         removed = removed || d.removed;
     }
-    assert.equal(removed, true, "pre-fix: wall-clock age alone burns a stall the loop caused itself");
+    assert.equal(removed, true, "pre-fix: wall-clock age alone burns a stall the loop caused itself (confirmation completes within the run)");
 });
 
 test("#4999 a genuinely dead owner is still removed once the lag-widened grace expires", () => {
@@ -81,9 +89,10 @@ test("#4999 a genuinely dead owner is still removed once the lag-widened grace e
     for (let i = 0; i < 5; i += 1) wd.tick(beatAt + i * TICK, beatAt);
     const stallUntil = beatAt + 5 * TICK + 1_200;
     wd.tick(stallUntil, beatAt);
-    // The owner never beats again: silence past the widened window is death.
-    const silentUntil = stallUntil + GRACE + 10_000 + TICK * 4;
-    wd.tick(silentUntil, beatAt);
+    // The owner never beats again and the loop recovers (no further lag), so
+    // the window snaps back to the constant and silence confirms over
+    // consecutive ticks — #3544's anti-reuse guarantee survives.
+    for (let i = 1; i <= HB_CONFIRM; i += 1) wd.tick(stallUntil + i * TICK, beatAt);
     assert.equal(wd.removed, true, "#3544's anti-reuse guarantee survives: silence past the window is death");
 });
 

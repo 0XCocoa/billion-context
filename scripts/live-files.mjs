@@ -77,6 +77,9 @@ export const LIVE_FILES = [
     // spawns a bare `node -e` child that only prints env — no ports, no
     // servers, so the zone band is irrelevant; the entry is for the tripwire
     "tests/preload-sandbox-dirs.test.ts",
+    // #5012: logger-seam children only (stdio pipes, never bind a port) - the
+    // entry exists for the spawn tripwire alone, like #3890
+    "tests/issue5012-stdout-leg-mute.test.ts",
     // #5152: spawns the beat-receiver fixture, which is listen(0) and publishes
     // its port through a file; the sender under test is a worker_threads worker
     // POSTing to that ephemeral port. No zone band is needed — the entry is for
