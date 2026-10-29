@@ -241,7 +241,7 @@ export class UnifiedShadow {
             if (err instanceof StorageSecondWriterError) {
                 loggerLog(
                     "error",
-                    `[storage] unified storage REFUSED for this instance: another bili process (pid ${err.pid}) already writes ${err.dbPath} — two processes on one index.db corrupt it (#3923/#3959). DEGRADED to legacy-only until isolated: CCR / checkpoints / the unified fast-read path are OFF. Fix: give each install its own sessions dir — set BILI_SESSIONS_DIR (and BILI_CONFIG_FILE if the configs differ) for THIS install, then restart (README "Running multiple instances", #5046).`,
+                    `[storage] unified storage REFUSED for this instance (pid ${process.pid}): another bili process (pid ${err.pid}) already writes ${err.dbPath} — sharing one sessions dir across lanes is the supported topology (#5082/#5091), but two processes writing the SAME sessions dir can split-brain it (#3923/#3959), so this one refuses to co-write rather than risk it. DEGRADED to legacy-only (defense-in-depth) until isolated: CCR / checkpoints / the unified fast-read path are OFF. Fix: give each install its own sessions dir — set BILI_SESSIONS_DIR (and BILI_CONFIG_FILE if the configs differ) for THIS install, then restart (README "Running multiple instances", #5046/#5068).`,
                 );
                 recordSidecarOpenFailure(`second-writer: another bili process (pid ${err.pid}) owns index.db — isolate via BILI_SESSIONS_DIR(+BILI_CONFIG_FILE); unified features off until then (#5046)`);
                 return null;
