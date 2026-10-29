@@ -1617,10 +1617,25 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         let lastStaleHb: number[] = [];
         // #3890: consecutive failed kill-0 probes per pid (see WATCHER_DEAD_CONFIRM_TICKS).
         const deadStreak = new Map<number, number>();
+        // #5152: the stale-heartbeat reading is taken on THIS event loop, so it
+        // is only trustworthy while this loop can run at all. A long synchronous
+        // turn starves the /__bili/watcher handler AND this ticker equally, so
+        // the pause is blindness that must not be charged to the owner. Measured
+        // from the ticker's OWN scheduling drift (the timer is armed for
+        // WATCHER_TICK_MS; any excess is the loop being unable to run) — a
+        // parallel sampling timer would be starved by the very stall it is
+        // supposed to report, and reads 0.
+        let prevTickAt: number | null = null;
+        const observedLoopLagMs = (tickAt: number): number => {
+            const lag = prevTickAt === null ? 0 : tickAt - prevTickAt - WATCHER_TICK_MS;
+            prevTickAt = tickAt;
+            return lag;
+        };
         const watcher = setInterval(() => {
             const dead: number[] = [];
             const staleByHeartbeat: number[] = [];
             const tickNow = Date.now();
+            const heartbeatGraceMs = effectiveHeartbeatGrace(WATCHER_HEARTBEAT_GRACE_MS, observedLoopLagMs(tickNow));
             for (const pid of proxyWatchers) {
                 const probe = probePid(pid);
                 // #3544: heartbeat-opted owners ALSO die by liveness-proof
@@ -1630,7 +1645,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 // CONFIRMED over consecutive ticks before it removes the pid —
                 // one transient OpenProcess failure used to be enough to kill
                 // the whole proxy while its parent lived on.
-                const decision = tickWatchedPid(probe, watcherLastSeen.get(pid), tickNow, deadStreak.get(pid), { heartbeatGraceMs: WATCHER_HEARTBEAT_GRACE_MS, confirmTicks: WATCHER_DEAD_CONFIRM_TICKS });
+                const decision = tickWatchedPid(probe, watcherLastSeen.get(pid), tickNow, deadStreak.get(pid), { heartbeatGraceMs, confirmTicks: WATCHER_DEAD_CONFIRM_TICKS });
                 if (decision.removed) {
                     proxyWatchers.delete(pid);
                     watcherLastSeen.delete(pid);
@@ -1670,7 +1685,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 if (lastStaleHb.length > 0) reason += ` [stale-heartbeat pids: ${lastStaleHb.join(", ")}]`;
                 shutdown(reason);
             }
-        }, 2_000);
+        }, WATCHER_TICK_MS);
         watcher.unref?.();
     }
     return server;
@@ -1947,6 +1962,13 @@ export function resolveKnownOutputCeiling(
 // proxy still disappears promptly.
 const WATCHER_IDLE_GRACE_MS = 5_000;
 
+// How often the watchdog re-probes every watched pid. Named because the tick
+// interval is also the BASELINE for #5152's lag measurement: a tick that
+// arrives WATCHER_TICK_MS later than its predecessor was a tick the event loop
+// could not run — that excess is the proxy's own blindness, not evidence about
+// the owner.
+const WATCHER_TICK_MS = 2_000;
+
 // #3544: how long a heartbeat-opted owner may go silent before the watchdog
 // counts it dead even though its pid still exists (recycled). 3 missed beats
 // at the 5s client interval, tolerant of scheduler skew on a busy host.
@@ -1961,6 +1983,28 @@ const WATCHER_HEARTBEAT_GRACE_MS = 15_000;
 export function watcherIsDead(alive: boolean, lastSeen: number | undefined, nowMs: number, heartbeatGraceMs: number): boolean {
     if (!alive) return true;
     return lastSeen !== undefined && nowMs - lastSeen > heartbeatGraceMs;
+}
+
+/** #5152: widen the heartbeat grace by the event-loop lag the watchdog itself
+ *  observed. The stale-heartbeat reading is taken on the proxy's OWN loop, so
+ *  when the loop could not run for N ms, an age that grew by N ms carries no
+ *  information about the owner: the honest window is `grace + N`.
+ *
+ *  Deliberately UNCAPPED. A 2-minute cap was the obvious first instinct, but it
+ *  is wrong for the failure it targets — #5138 records a ~19 MINUTE full-loop
+ *  block, and any cap below the real stall reintroduces exactly the false death
+ *  the change exists to stop. No cap is needed for safety: the extension is not
+ *  sticky. Every tick takes a FRESH measurement, so once the loop recovers the
+ *  window snaps back to the constant and a genuinely recycled pid (#3544) is
+ *  removed normally — the guarantee is delayed only by the duration of a stall
+ *  the proxy itself suffered, which is precisely the time it could not have
+ *  observed anything.
+ *
+ *  Unknown, zero or nonsensical lag falls through to the historical constant,
+ *  preserving pre-fix behavior bit-for-bit whenever no measurement exists. */
+export function effectiveHeartbeatGrace(heartbeatGraceMs: number, loopLagMs: number | undefined): number {
+    if (loopLagMs === undefined || !Number.isFinite(loopLagMs) || loopLagMs <= 0) return heartbeatGraceMs;
+    return heartbeatGraceMs + loopLagMs;
 }
 
 // #3890: the shutdown backstop window, and how many times it may RE-ARM while
