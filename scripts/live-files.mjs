@@ -73,6 +73,10 @@ export const LIVE_FILES = [
     // in-memory-only value, so no zone band is needed — the entry is for the
     // tripwire
     "tests/issue4982-draining-twin-ladder.test.ts",
+    // #5114: contract test for the storage-baseline preload's XDG dir sandbox;
+    // spawns a bare `node -e` child that only prints env — no ports, no
+    // servers, so the zone band is irrelevant; the entry is for the tripwire
+    "tests/preload-sandbox-dirs.test.ts",
     // #4762: in-process eval workers only (wedge probes), never bind a port -
     // the entry exists for the spawn tripwire alone, like #3890
     "tests/event-loop-watchdog.test.ts",
