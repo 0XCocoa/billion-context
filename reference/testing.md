@@ -108,6 +108,13 @@ the developer's real data tree. Two layers enforce this:
    false-positive case: `BILI_TEST_LEAK_GUARD=0 npm test`
    (reference/env-vars.md).
 
+Bare targeted runs outside `npm test` do NOT load the preloads on their
+own — carry them explicitly or they resolve the real default roots:
+
+```bash
+node --import ./tests/preload-test-env.mjs --import tsx --test tests/<file>.test.ts
+```
+
 ## Local Testing & Install
 
 Test against the REAL published artifact:
