@@ -2918,8 +2918,9 @@ function parseStreamErrorShape(value: unknown): "protocol" | "completion" {
 }
 
 export function parsePromptCacheRouting(value: string | undefined): PromptCacheRouting {
-    // #5079: absent/unknown falls back to "disabled" (was "auto") — self-stamping is opt-in now.
-    return value === "enabled" || value === "disabled" ? value : "disabled";
+    // #5079: absent/unknown falls back to "disabled" (was "auto") — self-stamping is opt-in now;
+    // explicit "auto" keeps its pre-#5079 meaning so existing configs migrate unchanged.
+    return value === "auto" || value === "enabled" || value === "disabled" ? value : "disabled";
 }
 
 export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxyMode {
