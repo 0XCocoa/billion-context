@@ -78,7 +78,8 @@ export const LIVE_FILES = [
     // (the 1899x ports appear only in tmpdir log-file names) — like #3890's
     // the entry is for the tripwire (its SPAWN_RE hit is the identifier
     // "spawnLogOffset" in a code comment)
-    "tests/issue4994-spawn-timeout-adopt.test.ts",];
+    "tests/issue4994-spawn-timeout-adopt.test.ts",
+];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
  *  32 gives every file's in-file ladder more headroom than any suite uses
