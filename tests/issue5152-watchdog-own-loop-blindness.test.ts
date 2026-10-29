@@ -8,7 +8,7 @@
 //
 // This file pins the pure seam (`effectiveHeartbeatGrace`) and the removal
 // semantics it must not break. The real timing geometry is pinned separately in
-// tests/issue4999-watchdog-loop-lag-timing.test.ts, and the sender side in
+// tests/issue5152-watchdog-loop-lag-timing.test.ts, and the sender side in
 // tests/issue5152-owner-beat-survives-host-stall.test.ts.
 import test from "node:test";
 import assert from "node:assert/strict";

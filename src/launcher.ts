@@ -4829,12 +4829,25 @@ const beat = async () => {
 void beat();
 `;
 
+/** #5152: the beat-worker surface this module drives — injectable so the
+ *  crash-fallback path can be exercised without a real thread death. */
+export interface OwnerBeatWorker {
+    on(event: "error", listener: (err: Error) => void): unknown;
+    unref(): void;
+    postMessage(message: string): void;
+    terminate(): Promise<number | undefined>;
+}
+
 /** Worker-owned beat (#5152). Falls back to the in-thread loop if the worker
- *  cannot start, so a locked-down host never loses liveness attestation. */
-function runOwnerHeartbeatWorker(
+ *  cannot start OR dies mid-flight, so a host never loses liveness attestation
+ *  silently — a dead worker still holding its refcount slot would starve every
+ *  later attach for this origin of beats. */
+export function runOwnerHeartbeatWorker(
     origin: string,
     pid: number,
     intervalMs: number,
+    spawn: (source: string, workerData: unknown) => OwnerBeatWorker =
+        (source, workerData) => new Worker(source, { eval: true, workerData }),
 ): () => void {
     const existing = ownerHeartbeatWorkers.get(origin);
     if (existing !== undefined) {
@@ -4848,19 +4861,24 @@ function runOwnerHeartbeatWorker(
             existing.refs -= 1;
         };
     }
-    let worker: Worker | undefined;
+    let stopped = false;
+    let worker: OwnerBeatWorker | undefined;
+    let fallbackStop: (() => void) | undefined;
     try {
-        worker = new Worker(OWNER_HEARTBEAT_WORKER_SOURCE, {
-            eval: true,
-            workerData: { origin, pid, intervalMs, timeoutMs: OWNER_HEARTBEAT_POST_TIMEOUT_MS },
-        });
+        worker = spawn(OWNER_HEARTBEAT_WORKER_SOURCE, { origin, pid, intervalMs, timeoutMs: OWNER_HEARTBEAT_POST_TIMEOUT_MS });
         worker.unref();
-        worker.on("error", () => { /* fallback covered at construction; observed via the proxy */ });
+        worker.on("error", () => {
+            // Construction failure is covered by the catch below; this covers a
+            // thread that dies MID-FLIGHT: keep attesting from the in-thread
+            // loop (its fetch failures keep looping where a dead thread cannot).
+            if (!stopped && fallbackStop === undefined) {
+                fallbackStop = runOwnerHeartbeatLoop(defaultOwnerPost(origin), pid, intervalMs);
+            }
+        });
     } catch {
         return runOwnerHeartbeatLoop(defaultOwnerPost(origin), pid, intervalMs);
     }
     const entry = { refs: 1, stop: (): void => { /* replaced below */ } };
-    let stopped = false;
     const stop = (): void => {
         if (stopped) return;
         stopped = true;
@@ -4869,6 +4887,7 @@ function runOwnerHeartbeatWorker(
         // a wedged worker can never outlive the host that owns it.
         try { worker?.postMessage("stop"); } catch { /* already gone */ }
         setTimeout(() => { void worker?.terminate(); }, 50).unref?.();
+        fallbackStop?.();
     };
     entry.stop = stop;
     ownerHeartbeatWorkers.set(origin, entry);
