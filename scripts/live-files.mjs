@@ -77,6 +77,9 @@ export const LIVE_FILES = [
     // spawns a bare `node -e` child that only prints env — no ports, no
     // servers, so the zone band is irrelevant; the entry is for the tripwire
     "tests/preload-sandbox-dirs.test.ts",
+    // #4762: in-process eval workers only (wedge probes), never bind a port -
+    // the entry exists for the spawn tripwire alone, like #3890
+    "tests/event-loop-watchdog.test.ts",
     // #5012: logger-seam children only (stdio pipes, never bind a port) - the
     // entry exists for the spawn tripwire alone, like #3890
     "tests/issue5012-stdout-leg-mute.test.ts",
