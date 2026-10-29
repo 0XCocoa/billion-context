@@ -74,7 +74,7 @@ export interface StorageBackend {
     /** #4316 PR3/3: raw id → canonical seq (single-row ids only). */
     seqByRaw(sessionId: string): Promise<Map<string, number> | null>;
     /** #4316 PR3/3: fork adoption row clone (idempotent). */
-    cloneSessionRows(parentId: string, childId: string, throughSeq: number): Promise<boolean>;
+    cloneSessionRows(parentId: string, childId: string, throughSeq: number, initial?: IngestSessionInput): Promise<boolean>;
     getMessages(sessionId: string): Promise<(MessageRow & { contentHash: string })[]>;
     getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]>;
     getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]>;
@@ -187,9 +187,8 @@ export class SqliteBackend implements StorageBackend {
     seqByRaw(sessionId: string): Promise<Map<string, number> | null> {
         return Promise.resolve(this.store.seqByRaw(sessionId));
     }
-    cloneSessionRows(parentId: string, childId: string, throughSeq: number): Promise<boolean> {
-        this.store.cloneSessionRows(parentId, childId, throughSeq);
-        return Promise.resolve(true);
+    cloneSessionRows(parentId: string, childId: string, throughSeq: number, initial?: IngestSessionInput): Promise<boolean> {
+        return Promise.resolve(this.store.cloneSessionRows(parentId, childId, throughSeq, initial));
     }
     getMessages(sessionId: string): Promise<(MessageRow & { contentHash: string })[]> {
         return Promise.resolve(this.store.getMessages(sessionId));
@@ -387,7 +386,7 @@ export function backendSelectionNotice(name: string): string | undefined {
     if (!name || name === "sqlite") return undefined;
     if ((REGISTERED_BACKENDS as readonly string[]).includes(name)) {
         if (name === "mysql") {
-            return `[storage] storage.backend="mysql" opens via the StorageBackend contract (#3388/#3931 step 2) — export/replica/checkpoint paths speak it; the proxy hot path (shadow ingest) swaps to the async contract in step 3 and stays on "sqlite" until then`;
+            return `[storage] storage.backend="mysql" rides the StorageBackend contract (#3388/#3931) — saves ingest through the async shadow queue; replicas/ext/GC/export/fork speak the async twins; SYNC reads ride the JSON envelope (sync facades miss by design); writerOff stays sqlite-only`;
         }
         return `[storage] storage.backend="${name}" is registered but not implemented — the unified store stays on "sqlite"`;
     }
