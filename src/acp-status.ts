@@ -21,6 +21,7 @@ import { getUnrecognizedPathStats } from "./server/observability.js";
 import { ccrEnabled, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { coveredRefSpan } from "./decompress-shared.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
+import { withoutTurnSeparators } from "./turn-separator.js";
 import { forkAdoptionSkippedOf } from "./fork-adoption.js";
 import { preCompactionArchiveOf, statusInputBaseline, type Session } from "./session.js";
 import { compressBreakerDetail, compressLastFailureCause } from "./stream.js";
@@ -73,7 +74,10 @@ export function excludeDeadRefRanges<T extends { startRef: string; endRef: strin
 
 export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision; ranges: CompressibleRange[] } | undefined {
     const turn = ctx.core.processTurn({
-        messages: ctx.messages,
+        // #5141: the send view's outbound-only ordering markers have no ids in
+        // the apply view — endpoints landing on them die at projection and
+        // their whole units vanish from the offer silently.
+        messages: withoutTurnSeparators(ctx.messages),
         state: ctx.session.state,
         config: ccrLoopConfig(ctx.session, ctx.config),
         tokenCount: statusInputBaseline(ctx.session),
