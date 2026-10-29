@@ -5120,7 +5120,11 @@ export async function ensureProxyRunning(
         const failureHint = (): string => {
             try {
                 const size = fs.statSync(logPath).size;
-                const start = Math.max(0, size - 1024);
+                // #5096 review follow-up: classify THIS spawn's bytes only
+                // (#4811 discipline) — a stale permission signature from an
+                // earlier spawn would misattribute this failure; a shrunken
+                // file means rotation happened, so everything left is ours.
+                const start = size < spawnLogOffset ? Math.max(0, size - 1024) : Math.max(spawnLogOffset, size - 1024);
                 const len = Math.min(1024, size - start);
                 if (len <= 0) return "";
                 const fd = fs.openSync(logPath, "r");

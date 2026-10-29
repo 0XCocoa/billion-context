@@ -85,6 +85,24 @@ test("#5096 serveStartupFailurePage stays a no-op without the launcher token or 
     }
 });
 
+test("#5096 serveStartupFailurePage resolves false when the port cannot be bound", async () => {
+    const blocker = http.createServer();
+    await new Promise<void>((r) => blocker.listen(0, "127.0.0.1", r));
+    const port = (blocker.address() as { port: number }).port;
+    const saved = process.env.BILI_LAUNCH_TOKEN;
+    process.env.BILI_LAUNCH_TOKEN = "test-token";
+    try {
+        assert.equal(
+            await serveStartupFailurePage({ host: "127.0.0.1", port }, new Error("EPERM open combined-ca.pem")),
+            false,
+        );
+    } finally {
+        if (saved === undefined) delete process.env.BILI_LAUNCH_TOKEN;
+        else process.env.BILI_LAUNCH_TOKEN = saved;
+        await new Promise<void>((r) => blocker.close(() => r()));
+    }
+});
+
 const PORT = 47841;
 const LOG_FILE = path.join(os.tmpdir(), `bili-proxy-${PORT}.log`);
 
@@ -192,4 +210,41 @@ test("#5096 launcher: crash without the permission signature — tail sample sti
     assert.ok(msg.includes("EADDRINUSE"), msg);
     assert.ok(msg.includes('child output tail: "'), msg);
     assert.ok(!msg.includes("possible cause:"), `no hint without the signature: ${msg}`);
+});
+
+test("#5096 launcher: a stale permission signature from an EARLIER spawn must not be attributed to this one", async () => {
+    cleanupLog();
+    // Pre-spawn remnant (below spawnLogOffset): an earlier crash left its
+    // EPERM line in the append-only port log. This spawn's own output has no
+    // permission signature — the hint must stay silent (#4811 discipline).
+    fs.appendFileSync(
+        LOG_FILE,
+        `bili: failed to start: Error: EPERM: operation not permitted, open 'C:\\Users\\u\\.local\\share\\billion-context\\ca\\combined-ca.pem'\n`,
+    );
+    const clock = childOutputSleep(
+        `starting up\n`.repeat(40) + `bili: failed to start: Error: listen EADDRINUSE: address already in use 127.0.0.1:${PORT}\n`,
+    );
+    let err: unknown;
+    try {
+        await ensureProxyRunning(
+            { host: "127.0.0.1", port: PORT, passthrough: false, debug: false },
+            {
+                fetchImpl: async () => ({ ok: false }),
+                fetchHealthInfo: async () => undefined,
+                fetchDetailImpl: async (): Promise<ProbeOutcome> => ({ ok: false, detail: "ECONNREFUSED" }),
+                spawnImpl: (() => makeExittingChild(42482, 1)) as SpawnFn,
+                now: clock.now,
+                sleep: clock.sleep,
+                readInstanceFile: () => undefined,
+            },
+        );
+        assert.fail("expected rejection");
+    } catch (e) {
+        err = e;
+    } finally {
+        cleanupLog();
+    }
+    const msg = (err as Error).message;
+    assert.match(msg, /exited before becoming healthy \(code 1\)/);
+    assert.ok(!msg.includes("possible cause:"), `stale signature from the previous spawn leaked into the hint: ${msg}`);
 });
