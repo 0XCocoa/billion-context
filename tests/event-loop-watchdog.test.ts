@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { Worker } from "node:worker_threads";
 import {
     WATCHDOG_HEARTBEAT_MS,
     WATCHDOG_HARD_TIMEOUT_MS,
@@ -101,4 +102,84 @@ test("worker spawn failure degrades to unwatched and never throws (#4762)", () =
     });
     assert.equal(handle, undefined);
     assert.ok(failure instanceof Error && /spawn denied/.test(failure.message));
+});
+
+/** Pipe-capturing spawn seam: the worker's stdio becomes readable streams
+ *  instead of inherited fds, so the test can prove WHICH leg carried a line.
+ *  (A blocking pipe cannot be proven — only structurally excluded, which is
+ *  exactly what the gate under test is.) */
+function armWithCapturedStderr(
+    opts: Parameters<typeof armEventLoopWatchdog>[0],
+): { handle: ReturnType<typeof armEventLoopWatchdog>, stderrBuf: () => string } {
+    let buf = "";
+    const handle = armEventLoopWatchdog({
+        ...opts,
+        spawnWorker: (code, o) => {
+            // per-stream pipe flags (the pinned @types model these as
+            // booleans; runtime maps them onto the stdio array)
+            const w = new Worker(code, { ...o, eval: true, stdout: true, stderr: true });
+            w.stderr?.on("data", (d) => { buf += String(d); });
+            return w;
+        },
+    });
+    return { handle, stderrBuf: () => buf };
+}
+
+async function waitUntil(fn: () => boolean, ms: number): Promise<void> {
+    const end = Date.now() + ms;
+    while (!fn() && Date.now() < end) await sleep(10);
+}
+
+test("forensic lines stay OFF the worker's stderr when a file leg exists and stderr is not a TTY (#4762/#5012)", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-watchdog-"));
+    const logFile = path.join(dir, "bili.log");
+    const { handle, stderrBuf } = armWithCapturedStderr({
+        logFile,
+        version: "0.0.0-test",
+        heartbeatMs: 20,
+        checkIntervalMs: 20,
+        softWarnMs: 60,
+        hardTimeoutMs: 150,
+        fatalMode: "report",
+        stderrTty: false,
+    });
+    try {
+        assert.ok(handle);
+        await sleep(50);
+        blockMainLoop(400);
+        await sleep(80);
+        await waitUntil(() => /FATAL/.test(fs.existsSync(logFile) ? fs.readFileSync(logFile, "utf8") : ""), 500);
+        const content = fs.readFileSync(logFile, "utf8");
+        assert.match(content, /FATAL: main event loop silent/); // file leg carries the record
+        await waitUntil(() => stderrBuf().length > 0, 200);
+        assert.equal(stderrBuf().trim(), "", "non-TTY stderr is a dead-pipe risk on Windows — never touched (#5012)");
+    } finally {
+        handle?.stop();
+        await sleep(20);
+        await rmrf(dir);
+    }
+});
+
+test("with NO file leg the worker's stderr is the sole forensic record and must carry the FATAL line (#4762)", async () => {
+    const { handle, stderrBuf } = armWithCapturedStderr({
+        logFile: null,
+        version: "0.0.0-test",
+        heartbeatMs: 20,
+        checkIntervalMs: 20,
+        softWarnMs: 60,
+        hardTimeoutMs: 150,
+        fatalMode: "report",
+        stderrTty: false,
+    });
+    try {
+        assert.ok(handle);
+        await sleep(50);
+        blockMainLoop(400);
+        await sleep(80);
+        await waitUntil(() => /FATAL/.test(stderrBuf()), 500);
+        assert.match(stderrBuf(), /FATAL: main event loop silent/);
+    } finally {
+        handle?.stop();
+        await sleep(20);
+    }
 });

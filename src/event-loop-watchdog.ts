@@ -27,6 +27,15 @@
  * Degradation: if the worker cannot be spawned (restricted environments), the
  * proxy continues UNWATCHED with a single warning — availability over
  * guardrail, same posture as every other best-effort facility here.
+ *
+ * Forensic-line routing: the worker appends to bili.log when a file leg is
+ * configured; its STDERR leg ships only when stderr is a TTY (a human terminal
+ * drains by design) or when there is no file leg at all (stderr is then the
+ * sole record). Rationale: Node writes to a PIPE are blocking, and a full,
+ * undrained pipe never emits an error event (#5012 class) — a worker that
+ * wrote its FATAL line into exactly that dead pipe would wedge ITSELF instead
+ * of tripping the exit. try/catch cannot rescue a synchronous blocking write,
+ * so the condition has to be structural, not defensive.
  */
 import { Worker, type WorkerOptions } from "node:worker_threads";
 
@@ -70,6 +79,9 @@ interface ArmEventLoopWatchdogOptions {
     onTrip?: (gapMs: number) => void;
     /** Called once when the worker fails to spawn or dies early. */
     onSpawnFailure?: (err: unknown) => void;
+    /** Test seam: pin the TTY verdict so both directions of the stderr gate
+     *  run deterministically regardless of the runner's terminal. */
+    stderrTty?: boolean;
 }
 
 interface WatchdogInitMsg {
@@ -80,6 +92,7 @@ interface WatchdogInitMsg {
     hardTimeoutMs: number;
     checkIntervalMs: number;
     fatalMode: "exit" | "report";
+    stderrTty: boolean;
 }
 interface WatchdogBeatMsg {
     type: "beat";
@@ -107,6 +120,7 @@ const WORKER_CODE = [
     "let warned = false;",
     "let tripped = false;",
     "let timer = null;",
+    "let emitStderr = false;",
     "",
     "function verdict(gap) {",
     "  if (gap >= hardTimeoutMs) return \"trip\";",
@@ -121,7 +135,7 @@ const WORKER_CODE = [
     "function line(level, msg) {",
     "  const row = new Date().toISOString() + \" [\" + level + \"][v=\" + version + \"] \" + msg + \"\\n\";",
     "  try { if (logFile !== null) require(\"fs\").appendFileSync(logFile, row); } catch (e) {}",
-    "  try { process.stderr.write(row); } catch (e) {}",
+    "  if (emitStderr) { try { process.stderr.write(row); } catch (e) {} }",
     "}",
     "",
     "function tick() {",
@@ -142,6 +156,7 @@ const WORKER_CODE = [
     "  if (!m || typeof m !== \"object\") return;",
     "  if (m.type === \"init\") {",
     "    logFile = typeof m.logFile === \"string\" ? m.logFile : null;",
+    "    emitStderr = (logFile === null) || m.stderrTty === true;",
     "    version = String(m.version ?? \"\");",
     "    softWarnMs = Number(m.softWarnMs) || 0;",
     "    hardTimeoutMs = Number(m.hardTimeoutMs) || 0;",
@@ -206,6 +221,7 @@ export function armEventLoopWatchdog(opts: ArmEventLoopWatchdogOptions = {}): Ev
             hardTimeoutMs,
             checkIntervalMs,
             fatalMode,
+            stderrTty: opts.stderrTty ?? process.stderr.isTTY === true,
         } satisfies WatchdogInitMsg);
     } catch (err) {
         clearInterval(beatTimer);
@@ -213,6 +229,12 @@ export function armEventLoopWatchdog(opts: ArmEventLoopWatchdogOptions = {}): Ev
         opts.onSpawnFailure?.(err);
         return undefined;
     }
+
+    // #4762 review: the safety net must not hold the process hostage — an
+    // un-unref'd worker would delay a clean natural exit of a SHUTTING-DOWN
+    // proxy (exit paths here end in process.exit, but availability over
+    // guardrail says the watchdog degrades away rather than lingers).
+    worker.unref?.();
 
     return {
         stop(): void {

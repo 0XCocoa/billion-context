@@ -94,14 +94,14 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
-import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, logTimestamp } from "./logger.js";
+import { log as loggerLog, configureLogger, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, logTimestamp } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest } from "./storage/runtime-status.js";
 import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
-import { armEventLoopWatchdog } from "./event-loop-watchdog.js"; (fix: self-exit on event-loop wedge + name wedged port holders on EADDRINUSE (#4762))
+import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
@@ -641,6 +641,21 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
         modelMaxOutputs: { ...LAUNCHER_MODEL_MAX_OUTPUTS },
     };
+    // #4762: arm the event-loop wedge detector as EARLY as startServer runs —
+    // startup phases (twin probes, engine/storage init, hydrate) carry their
+    // own sync-I/O hotspots and a stderr-pipe wedge (#5012 class) can arrive
+    // any time logging flows, so arming only after markBootReady left those
+    // windows unwatched. configureLogger here mirrors the early-twin path
+    // below (idempotent — createEngineContext re-configures the same path);
+    // plugin-injection mode never calls startServer, so the host process can
+    // still never trip the self-exit.
+    const watchLogFile = configureLogger(opts.logFile ?? defaultLogFile());
+    armEventLoopWatchdog({
+        logFile: watchLogFile,
+        version: VERSION,
+        onSpawnFailure: (err) => logMsg(opts, "warn", `[event-loop-watchdog] could not arm (${String(err)}) — continuing unwatched (#4762)`),
+    });
+
     const earlyTwin = await findVerifiedSameLaneTwin(
         listInstances(),
         opts.port,
@@ -1338,17 +1353,9 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
         // #2941: LAST statement — registration above is done; degraded boots
         // (best-effort write failed) still flip ready, serving as before.
+        // The event-loop watchdog was armed at startServer entry (#4762):
+        // arming only here would leave startup-phase wedges unwatched.
         engine.markBootReady();
-        // #4762: armed only here — startServer runs in standalone proxy
-        // processes only, so plugin-injection mode (host process) can never
-        // trip the self-exit. A wedged main loop must not hold the listen
-        // socket forever; the worker thread outlives the wedge and exits us
-        // so the spawner respawns onto the freed port.
-        armEventLoopWatchdog({
-            logFile: getLogPath(),
-            version: VERSION,
-            onSpawnFailure: (err) => log("warn", `[event-loop-watchdog] could not arm (${String(err)}) — continuing unwatched (#4762)`),
-        });
     };
     // #2941: after a successful bind, verify we are the SOLE owner of the
     // port before registering. Where socket semantics tolerate a concurrent
