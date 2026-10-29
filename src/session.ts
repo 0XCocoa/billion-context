@@ -1191,6 +1191,7 @@ function adoptOrCreate(id: string, meta: SessionMeta | undefined, reloaded: Sess
 }
 
 export function getSession(id: string, meta?: SessionMeta): Session {
+    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
     const existing = sessions.get(id);
     if (existing) {
         stampExisting(existing, meta);
@@ -1209,6 +1210,10 @@ export function getSession(id: string, meta?: SessionMeta): Session {
  *  restart. On sqlite this is loadSync plus a microtask: identical behavior.
  *  Concurrent first-touches of the same id share ONE load (single-flight). */
 export async function getSessionAsync(id: string, meta?: SessionMeta): Promise<Session> {
+    // #5044 publication race ported to the async seam: a request landing on a
+    // child id while its fork is mid-publication must fail loudly instead of
+    // adopting a fresh empty session that would wedge the publication.
+    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
     const existing = sessions.get(id);
     if (existing) {
         stampExisting(existing, meta);
@@ -1243,14 +1248,22 @@ export function createSession(id: string, meta?: Session["meta"]): Session {
     };
 }
 
+const publishingForks = new Set<string>();
+
 // #4942: async — the existence probe must reach the DB on network storage
 // backends, or a fork could silently clobber a DB-only child row.
-export async function publishForkSession(session: Session): Promise<void> {
+export async function publishForkSession(session: Session, parentId: string): Promise<void> {
+    if (publishingForks.has(session.id)) throw new Error("child fork publication in progress");
     if (sessions.has(session.id) || (await getStore().loadAsync(session.id))) throw new Error("child session already exists");
-    makeResidentRoom(sessionWeight(session));
-    if (!getStore().flushSync(session)) throw new Error("fork persistence failed");
-    session.persisted = getStore().enabled;
-    sessions.set(session.id, session);
+    publishingForks.add(session.id);
+    try {
+        makeResidentRoom(sessionWeight(session));
+        await getStore().persistForkSession(parentId, session);
+        session.persisted = getStore().enabled;
+        sessions.set(session.id, session);
+    } finally {
+        publishingForks.delete(session.id);
+    }
 }
 
 /** Mark a session as in-use by a request. Must be paired with releaseInFlight.
@@ -1812,7 +1825,7 @@ export function foldCoverage(
 // — the storage seam needs them without session.ts's built-acp-kernel import;
 // the doc comments live there now). Re-exported so existing consumers keep the
 // session.js import path.
-export { RESPONSES_TURN_SEPARATOR_ID_PREFIX, isResponsesTurnSeparatorId, scrubTurnSeparatorIds } from "./turn-separator.js";
+export { RESPONSES_TURN_SEPARATOR_ID_PREFIX, isResponsesTurnSeparatorId, scrubTurnSeparatorIds, withoutTurnSeparators } from "./turn-separator.js";
 
 /** #2627: the REAL-history coverage set — active blocks' effective ids minus
  *  outbound-only turn separators. Single source for every drift consumer (the
