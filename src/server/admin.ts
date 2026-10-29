@@ -5,7 +5,7 @@ import type { CompressionCore, Config } from "acp-kernel";
 import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unresolvedRefusals } from "../apig-resign.js";
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
-import { loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
+import { effectivePromptCacheRouting, loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
 import { applyCompressSettings, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
@@ -1286,7 +1286,7 @@ async function sendOverview(res: http.ServerResponse, opts: ProxyOptions, laneHo
         updatePolicy: updatePolicyPayload(),
         pluginAdvisories: detectCostAdvisories(process.env),
         hostPluginNotices: visibleHostPluginNotices(process.env),
-        pckNotice: { id: PCK_NOTICE_ID, active: pckNoticeActive(opts.promptCache.routing) },
+        pckNotice: { id: PCK_NOTICE_ID, active: pckNoticeActive(effectivePromptCacheRouting(opts.promptCache)) },
         inFlight: totalInFlight(),
         blindTunnels: getBlindTunnelStats(),
         conflicts: summarizeConflicts(listSessions()),

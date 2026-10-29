@@ -12,7 +12,7 @@ import type { ProxyOptions, ResignSettings } from "./config.js";
 export type { ProxyOptions } from "./config.js";
 import { loadNamedProviders, loadOptions, loadRoutes } from "./config.js";
 import { resetProxyCache } from "./upstream-proxy.js";
-import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
+import { effectivePromptCacheRouting, FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveResignSettings } from "./config.js";
 import { contextFromRegistry, loadRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "./registry.js";
 import { codexAlignedWindow } from "./codex-models.js";
 import { fetchWithTimeout, upstreamTimeoutMs } from "./fetch-util.js";
@@ -1269,7 +1269,7 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         }
         // #5079: first upgrade onto the default-off pck switch — tell relay /
         // account-pool users their affinity signal is off until they opt back in.
-        if (pckNoticeActive(opts.promptCache.routing)) {
+        if (pckNoticeActive(effectivePromptCacheRouting(opts.promptCache))) {
             log(
                 "info",
                 `[pck] prompt_cache_key self-stamping is OFF by default now (#5079). ` +

@@ -4,6 +4,7 @@ import { isRenderedSummaryMessage, renderNudgeText, viableRanges } from "acp-ker
 import { coreToOpenai, injectOpenaiSystem, openaiToCore, type BiliMessage, type OpenAIRequestBody, type OpenAITool } from "acp-kernel/wire";
 import type { CompressReasoningConfig } from "../reasoning-drop.js";
 import type { ProxyOptions } from "../config.js";
+import { effectivePromptCacheRouting } from "../config.js";
 import { currentCalibrationFactor, hardenOpenaiAssistantContent, systemToUser } from "../util.js";
 import { conversationHeaderSource, resolveRelayAffinityPck } from "../session-id.js";
 import { pluginAgentHeader } from "../plugin.js";
@@ -469,7 +470,7 @@ export async function prepareOpenai(
     // A/B seam as the rejection backstop; disabled never emits a bili-owned
     // key but still forwards genuine client keys verbatim (and still honors
     // an A/B ablation against them).
-    const pckDecision = resolveRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin, opts.promptCache.routing, session.id, modelIdOf(parsed));
+    const pckDecision = resolveRelayAffinityPck(conversationHeaderSource(req.headers)?.name, parsed.prompt_cache_key, billingUpstream, upstreamOrigin, effectivePromptCacheRouting(opts.promptCache), session.id, modelIdOf(parsed));
     if (pckDecision === "stamp") {
         rebuilt.prompt_cache_key = session.id;
     } else if (pckDecision === "drop") {

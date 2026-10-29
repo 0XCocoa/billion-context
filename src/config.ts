@@ -2923,6 +2923,13 @@ export function parsePromptCacheRouting(value: string | undefined): PromptCacheR
     return value === "auto" || value === "enabled" || value === "disabled" ? value : "disabled";
 }
 
+export function effectivePromptCacheRouting(promptCache: { routing?: string } | undefined): PromptCacheRouting {
+    // Partial ServerOptions (hand-built test harnesses, sub-lane constructions) may omit the
+    // promptCache section entirely — fall back exactly like parsePromptCacheRouting(undefined);
+    // never crash on a missing section mid-request or at startup.
+    return parsePromptCacheRouting(promptCache?.routing);
+}
+
 export function parseUpstreamProxyMode(value: string | undefined): UpstreamProxyMode {
     return value === "manual" || value === "auto" ? value : "direct";
 }
