@@ -5247,7 +5247,12 @@ export async function ensureProxyRunning(
                 return "";
             }
         };
-        const diagnosePort = async (childAlive: boolean): Promise<string> => {
+        // #4994: returns the structured verdict beside the prose — at budget
+        // exhaustion "our child serves the preferred port" (health pid === the
+        // pid we spawned) is an adoption DECISION, not just a diagnosis. The
+        // same identity proof already vouches in the stale-record fallback
+        // above; the timeout path must be able to act on it instead of killing.
+        const diagnosePort = async (childAlive: boolean): Promise<{ text: string; selfHealthy: boolean }> => {
             const origin = proxyOrigin(opts.host, port);
             let info: HealthInfo | undefined;
             let det: ProbeOutcome = { ok: false, detail: "probe error" };
@@ -5258,31 +5263,32 @@ export async function ensureProxyRunning(
             } catch {
                 /* observability only — keep the generic clause */
             }
+            const selfHealthy = Boolean(info?.ok && child.pid !== undefined && info.pid === child.pid);
             if (info?.ok) {
-                return info.pid === child.pid
-                    ? `port ${port} finally answers healthy from our child (pid ${info.pid}) but its instance handshake never matched — check the instance-file/registry state dir`
-                    : `port ${port} is held by a different process${info.pid !== undefined ? ` (pid ${info.pid})` : ""} — the spawned child never bound it`;
+                return selfHealthy
+                    ? { text: `port ${port} finally answers healthy from our child (pid ${info.pid}) but its instance handshake never matched — check the instance-file/registry state dir`, selfHealthy }
+                    : { text: `port ${port} is held by a different process${info.pid !== undefined ? ` (pid ${info.pid})` : ""} — the spawned child never bound it`, selfHealthy: false };
             }
             // A 200 that is not bili's health payload (foreign dev servers
             // answer ANY path with their index page) must not fall into the
             // generic "probe failed" clause — the probe SUCCEEDED.
             if (det.ok) {
-                return `port ${port} answered but not with bili's health payload — a foreign service likely holds it`;
+                return { text: `port ${port} answered but not with bili's health payload — a foreign service likely holds it`, selfHealthy: false };
             }
             const d = det.detail ?? "unknown error";
             if (/^(ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|EPIPE)$/i.test(d)) {
-                return `nothing is listening on port ${port} — the spawned child (${childAlive ? "still alive" : "already exited"}, pid ${child.pid ?? "?"}) never bound it`;
+                return { text: `nothing is listening on port ${port} — the spawned child (${childAlive ? "still alive" : "already exited"}, pid ${child.pid ?? "?"}) never bound it`, selfHealthy: false };
             }
             if (/^HTTP \d{3}$/.test(d)) {
-                return `port ${port} answered ${d} — the listener there is not reporting bili health`;
+                return { text: `port ${port} answered ${d} — the listener there is not reporting bili health`, selfHealthy: false };
             }
             // #3654: a timeout with a live TCP listener underneath is the
             // event-loop-saturation signature (connect succeeds, JS never runs)
             // — name it instead of letting it read as a dead port.
             if (/^timeout after \d+ms$/i.test(d) && (await (deps.isConnectable ?? tcpConnectable)(origin))) {
-                return `port ${port} accepts TCP connections but never answers /__bili/health within the probe budget — the instance there is BUSY (event loop saturated, typically a large compression), not dead (#3654)`;
+                return { text: `port ${port} accepts TCP connections but never answers /__bili/health within the probe budget — the instance there is BUSY (event loop saturated, typically a large compression), not dead (#3654)`, selfHealthy: false };
             }
-            return `last health probe failed with ${d}`;
+            return { text: `last health probe failed with ${d}`, selfHealthy: false };
         };
 
         const deadline = now() + SPAWN_BUDGET_MS;
@@ -5295,7 +5301,7 @@ export async function ensureProxyRunning(
             if (!slowStartNoticed && now() >= deadline - SLOW_START_GRACE_MS) {
                 slowStartNoticed = true;
                 console.error(
-                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (${await diagnosePort(true)}) (log: ${logPath}${logTail()})`,
+                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (${(await diagnosePort(true)).text}) (log: ${logPath}${logTail()})`,
                 );
             }
             await sleepImpl(HEALTH_POLL_INTERVAL_MS);
@@ -5425,22 +5431,82 @@ export async function ensureProxyRunning(
             const detail = childExit.code !== null
                 ? `code ${childExit.code}${childExit.code === TWIN_ADOPT_EXIT_CODE ? " (twin-collision signal)" : ""}`
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
-            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${await diagnosePort(false)} (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
+            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${(await diagnosePort(false)).text} (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
         }
+        // #4994: where THIS child says it bound, parsed from its own log
+        // segment ([spawnLogOffset..end] — no other spawn's lines can answer;
+        // a shrunken file means rotation under us, so sample the tail instead).
+        // The listen line carries the child's pid (`acp-proxy v… (pid N, id …)
+        // listening on http://host:port`), which must match OUR spawned pid AND
+        // be corroborated by a live health probe before anything trusts it.
+        const childLogBoundOrigin = (): { origin: string; port: number } | undefined => {
+            try {
+                const size = fs.statSync(logPath).size;
+                let start = spawnLogOffset;
+                if (size < start) start = Math.max(0, size - 8192);
+                if (size <= start) return undefined;
+                const fd = fs.openSync(logPath, "r");
+                let seg: Buffer;
+                try {
+                    seg = Buffer.alloc(size - start);
+                    const n = fs.readSync(fd, seg, 0, seg.length, start);
+                    seg = seg.subarray(0, n);
+                } finally {
+                    fs.closeSync(fd);
+                }
+                const text = seg.toString("utf8");
+                const re = /\(pid (\d+), id [^)]+\) listening on (https?:\/\/\S+)/g;
+                let m: RegExpExecArray | null;
+                let last: RegExpExecArray | undefined;
+                while ((m = re.exec(text)) !== null) last = m;
+                if (!last || Number(last[1]) !== child.pid) return undefined;
+                const u = new URL(last[2]);
+                const p = Number(u.port);
+                if (!Number.isInteger(p) || p <= 0) return undefined;
+                return { origin: u.origin, port: p };
+            } catch {
+                return undefined;
+            }
+        };
         // #2260(A)/#2187: the timeout is the ONE terminal path where the
         // spawned child is STILL ALIVE. Abandoning it leaked a detached proxy
         // per failed bring-up — dsh plan-time retries re-arm every 10s, so a
         // persistently slow host accumulated ~1 zombie per ~70s (each also
-        // stranding the lane sticky-port ladder). Hard-kill before failing.
+        // stranding the lane sticky-port ladder). Hard-kill before failing —
+        // EXCEPT when the spawner itself can identify a healthy victim (#4994):
+        // killing a child you just proved is serving was the defect, and the
+        // leak rationale does not apply to a child that is serving.
         // #3116: classify the port WHILE THE CHILD IS STILL ALIVE — probing
         // after the kill turns "bound but hung" into a misleading
         // ECONNREFUSED.
         const diagnosis = await diagnosePort(true);
+        if (diagnosis.selfHealthy) {
+            // Rung 1: the preferred port answers healthy with OUR child's pid —
+            // the same identity proof the stale-record fallback trusts per-poll,
+            // reached here because clobbered records starved it for the budget.
+            settleZonePort(port);
+            startOwnerHeartbeat(proxyOrigin(opts.host, port), watchPid);
+            attachDiag(`bili: adopting our own healthy child (pid ${child.pid}) at ${proxyOrigin(opts.host, port)} after ${SPAWN_BUDGET_MS}ms — the instance handshake never matched but the health probe proves this child serves the port; keeping it instead of killing (#4994)`);
+            return { origin: proxyOrigin(opts.host, port), port, child, logPath };
+        }
+        // Rung 2: the child laddered off the preferred port (EADDRINUSE hop) and
+        // its records were clobbered too — find where IT says it bound and prove
+        // identity there before adopting.
+        const bound = childLogBoundOrigin();
+        if (bound) {
+            const info = await fetchHealthInfo(bound.origin);
+            if (info?.ok && info.pid === child.pid) {
+                settleZonePort(bound.port);
+                startOwnerHeartbeat(bound.origin, watchPid);
+                attachDiag(`bili: adopting our own healthy child (pid ${child.pid}) at ${bound.origin} after ${SPAWN_BUDGET_MS}ms — it bound ${bound.port} per its own listen line and answers health under our pid; keeping it instead of killing (#4994)`);
+                return { origin: bound.origin, port: bound.port, child, logPath };
+            }
+        }
         killAbandonedChild(child);
         console.error(
-            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis} (log: ${logPath}${logTail()})`,
+            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis.text} (log: ${logPath}${logTail()})`,
         );
-        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis} (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
+        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis.text} (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }

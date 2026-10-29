@@ -1283,6 +1283,18 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 + (opts.mitm.enabled ? ` — MITM proxy on (whitelist)${opts.mitm.domains.length ? ` +${opts.mitm.domains.join(",")}` : ""}` : "")
                 + (opts.passthrough ? " — PASSTHROUGH (compression OFF)" : ""),
         );
+        // #4994 rung 2: the spawner's timeout adoption parses THIS child's
+        // pid-tagged listen line out of the per-port log when it laddered off
+        // the preferred port — but post-#2864 the muted stderr leg means the
+        // banner above never reaches that file (same explicit-write pattern
+        // as the listen-failed paths below; the line names the actual bound
+        // origin while the file stays keyed on the preferred port).
+        if (launchToken !== undefined) {
+            writeSpawnPortLog(
+                opts.port,
+                `${logTimestamp()} [info] acp-proxy v${VERSION} (pid ${process.pid}, id ${instanceId.slice(0, 8)}) listening on http://${displayHost}:${actualPort}`,
+            );
+        }
         if (opts.passthrough) {
             log(
                 "warn",

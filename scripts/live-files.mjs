@@ -73,6 +73,12 @@ export const LIVE_FILES = [
     // in-memory-only value, so no zone band is needed — the entry is for the
     // tripwire
     "tests/issue4982-draining-twin-ladder.test.ts",
+    // #4994: ensureProxyRunning timeout-adoption rows drive fully mocked
+    // children + a fake clock; nothing is spawned and no socket is bound
+    // (the 1899x ports appear only in tmpdir log-file names) — like #3890's
+    // the entry is for the tripwire (its SPAWN_RE hit is the identifier
+    // "spawnLogOffset" in a code comment)
+    "tests/issue4994-spawn-timeout-adopt.test.ts",
     // #5114: contract test for the storage-baseline preload's XDG dir sandbox;
     // spawns a bare `node -e` child that only prints env — no ports, no
     // servers, so the zone band is irrelevant; the entry is for the tripwire
