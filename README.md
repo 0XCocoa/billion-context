@@ -50,7 +50,8 @@
 
 QQ Group:
 1056132097 (full)
-1108730198 (open)
+1108730198 (full)
+1129868472 (open)
 
 ---
 
@@ -378,10 +379,11 @@ report above.
 **Can I query sessions and config over the web?** Yes — open
 [http://localhost:8787](http://localhost:8787): an overview dashboard, session
 list with per-session detail, live logs, a config editor, and an upstream
-connectivity test. A Blog view renders a few bundled notes and long-form
-articles inside the panel itself (offline-readable; the full always-fresh
-library lives on GitHub Pages). Everything else is also plain JSON for scripting
-(`/__bili/stats`, `/__bili/sessions`, `/__bili/config`, …).
+connectivity test. A Blog view renders notes and long-form articles inside the
+panel itself — bundled with the install, refreshed from GitHub master on a
+~1-hour throttle while online (fail-soft to the bundled copy when offline);
+the full library also lives on GitHub Pages. Everything else is also plain JSON
+for scripting (`/__bili/stats`, `/__bili/sessions`, `/__bili/config`, …).
 
 **When does compression happen?** It is model-driven: the injected context
 tools are called by the model as context grows, gentle growth nudges
