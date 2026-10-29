@@ -417,9 +417,18 @@ if (!env.XDG_STATE_HOME || !st.startsWith(env.XDG_STATE_HOME)) { console.error("
 if (cf !== env.BILI_CONFIG_FILE) { console.error("configFile escaped isolation:", cf); process.exit(9); }
 console.log(JSON.stringify({ s, d, st }));
 `;
+    // Scrub the ambient path vars so the ONLY thing isolating this child is the
+    // explicit --import below: the suite's own parent process already runs under
+    // the preload (wrapper wiring), and an inheriting child would pass even with
+    // a broken/renamed preload file — the gate must actually gate (#3617).
+    const scrubbed = { ...process.env } as NodeJS.ProcessEnv;
+    for (const k of ["BILI_SESSIONS_DIR", "BILI_CONFIG_FILE", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) {
+        delete scrubbed[k];
+    }
     const r = spawnSync(NODE, ["--import", "tsx", "--input-type=module", "--import", "./tests/preload-test-env.mjs", "-e", probe], {
         cwd: ROOT,
         encoding: "utf8",
+        env: scrubbed,
     });
     assert.equal(r.status, 0, `probe failed: ${r.stderr ?? r.stdout}`);
     const parsed = JSON.parse(r.stdout.trim().split("\n").pop()!) as { s: string; d: string; st: string };
