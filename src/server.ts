@@ -2597,8 +2597,8 @@ export function effectiveTokenCount(session: Session, msgs: CoreMessage[], inbou
     // this session's own honest anchor and hand the meter the stale pre-fold
     // grade (false pressure-T2 right after a successful T1). Credit can only
     // be minted by this conversation's own folds (foreign usage samples write
-    // none), so it exempts exactly this window; the #4805/#4849 side-lane
-    // defense stays fully armed when credit == 0. #4383's cycle-stale guard
+    // none), so it exempts exactly this window; the #4805/#4849 anchor-
+    // pollution refusal stays fully armed when credit == 0. #4383's cycle-stale guard
     // still wins (#4383: newer unreported sends ride their own measurements);
     // zero is a valid drained reading (kernel treats 0 as unknown).
     if (!anchorStale && session.stats.lastInputTokensSource === "usage" && (session.stats.compressCreditTokens ?? 0) > 0 && session.stats.lastInputTokens >= 0) return { tokens: session.stats.lastInputTokens, source: "usage" };
