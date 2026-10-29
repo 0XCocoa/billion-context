@@ -284,7 +284,9 @@ export function snapshotSessionsTree(dir) {
     const record = (p) => {
         try {
             const st = statSync(p);
-            out.set(path.relative(dir, p), [st.mtimeMs, st.size]);
+            // posix-normalize the relpath key: Windows path.relative yields '\\',
+            // and the diff, banner and tests all compare '/'-separated paths (#4599).
+            out.set(path.relative(dir, p).split(path.sep).join("/"), [st.mtimeMs, st.size]);
         } catch {
             /* vanished mid-walk — skip */
         }
