@@ -1,7 +1,7 @@
 /**
- * #4338: the corrupt index.db degrade scenarios run in a spawned CHILD
- * process, and this file is both the child program and the shared helper
- * module the two parent test files import.
+ * #4338: the corrupt-index and no-engine-banner scenarios run in a spawned
+ * CHILD process, and this file is both the child program and the shared
+ * helper module the two parent test files import.
  *
  * Why a child: on Windows, node:sqlite's FAILED open of a corrupt index.db
  * can leave an OS file handle held with no JS-side instance to release
@@ -34,7 +34,7 @@ import { spawnSync } from "node:child_process";
 import http from "node:http";
 import { once } from "node:events";
 import assert from "node:assert/strict";
-import { mkdirSync, realpathSync, writeFileSync, writeSync } from "node:fs";
+import { mkdirSync, realpathSync, writeSync } from "node:fs";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -42,6 +42,7 @@ import { defaultConfig } from "acp-kernel";
 import type { ProxyOptions } from "../src/config.ts";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
 import { loadLegacyView, toLegacyLike } from "../src/storage/ingest.ts";
 import { canonicalize, sha256, sortObjectKeys } from "./golden-canonical.ts";
 
@@ -192,24 +193,32 @@ export function makeOpts(upstreamPort: number): ProxyOptions {
 // sides reference these constants, so the coverage list cannot drift.
 // ---------------------------------------------------------------------------
 
+// #4816: throwing-shape corruption (header garbage / truncation) is now
+// quarantined and the store RECOVERS to full mode on a fresh index.db —
+// these checks pin that recovery plus the original #2781/#4357 leak guards.
 const ENGPROOF_CHECK_NAMES = {
-    fallbackRead: "legacy fallback returned a session over the corrupt index",
-    midFlowGuard: "no live handle after the corrupt-index read (#2781 rename guard)",
-    stateDigest: "corrupt-index fallback state digest matches the clean full-mode read",
-    writeNow: "writeNow keeps working over the legacy path after the corrupt-index degrade",
+    quarantine: "corrupt index.db was renamed aside (index.db.corrupt-* kept for forensics)",
+    freshIndex: "a fresh index.db replaced the quarantined one",
+    lazyImport: "session reloaded from the legacy envelope into the recovered index",
+    midFlowGuard: "no live handle on the QUARANTINED file (#2781/#4357 rename guard)",
+    stateDigest: "recovered-index state digest matches the clean full-mode read",
+    writeNow: "writeNow keeps working over the recovered full mode",
     postCloseGuard: "no live handle after the final close (post-close rename guard)",
     fdGuard: "no open fd into the corrupt index dir after close (/proc/self/fd, Linux)",
 } as const;
 export const ENGPROOF_CHECKS: readonly string[] = Object.values(ENGPROOF_CHECK_NAMES);
 
+// #4816: a corrupt index.db no longer degrades — it quarantines and recovers
+// (see engproof). The banner wire shape is pinned here through the remaining
+// deterministic cross-platform degrade cause: the engine ladder exhausted.
 const BANNER_CHECK_NAMES = {
     overviewAnswers: "/__bili/overview answers 200 with JSON",
     requestedFull: "storage.requested is full",
     effectiveLegacy: "storage.effective is legacy",
-    degraded: "storage.degraded is true (corrupt index.db trips the warning)",
+    degraded: "storage.degraded is true (the no-engine degrade trips the warning)",
     intentionalOptOut: "storage.intentionalOptOut is false",
-    reason: "storage.reason matches /index database failed to open/",
-    engine: "storage.engine is null",
+    reason: "storage.reason names the missing engine",
+    engine: "storage.engine is null when no engine resolved",
 } as const;
 export const BANNER_CHECKS: readonly string[] = Object.values(BANNER_CHECK_NAMES);
 
@@ -331,28 +340,48 @@ async function engproofScenario(argv: string[], run: CheckRun): Promise<void> {
     fs.writeSync(fd, Buffer.alloc(512, 0x5a), 0, 512, 0);
     fs.closeSync(fd);
 
-    // THE #2771 regression: construction must survive, reads must fall
-    // back to the legacy file, and the digest must be exact.
+    // THE #2771 regression: construction must survive. Since #4816 the
+    // throwing-shape corruption is quarantined and the store recovers to
+    // full mode on a fresh index.db — reads lazily import the session back
+    // from the legacy envelope, and the digest must be exact.
     const store2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
+    await run.run(ENGPROOF_CHECK_NAMES.quarantine, () => {
+        const names = fs.readdirSync(dir);
+        const q = names.find((n) => n.startsWith("index.db.corrupt-"));
+        assert.ok(q, `no quarantined index.db.corrupt-* in ${names.join(", ")}`);
+    });
+    await run.run(ENGPROOF_CHECK_NAMES.freshIndex, () =>
+        assert.ok(fs.existsSync(path.join(dir, "index.db")), "fresh index.db absent after quarantine"));
     const reloaded = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
     store2.cancelAll();
     try {
-        await run.run(ENGPROOF_CHECK_NAMES.fallbackRead, () =>
-            assert.ok(reloaded, "legacy fallback returned null over a corrupt index"));
+        await run.run(ENGPROOF_CHECK_NAMES.lazyImport, () =>
+            assert.ok(reloaded, "recovered store returned null for a session whose legacy envelope exists"));
         if (!reloaded) return;
 
-        // Regression (#2781): the failed open must have CLOSED its handle.
-        await runGuard(run, ENGPROOF_CHECK_NAMES.midFlowGuard, dir, "-moved");
+        // Leak guard (#2781/#4357): the DEAD quarantined file must carry no
+        // live handle. The whole-dir rename used pre-#4816 is wrong now —
+        // the store legitimately holds the FRESH index.db, and only a
+        // handle on the dead file is the leak class this guard hunts.
+        await run.run(ENGPROOF_CHECK_NAMES.midFlowGuard, () => {
+            const q = fs.readdirSync(dir).find((n) => n.startsWith("index.db.corrupt-"));
+            assert.ok(q, "quarantined file vanished before the leak guard ran");
+            const src = path.join(dir, q!);
+            const probe = `${src}-moved`;
+            fs.renameSync(src, probe);
+            fs.renameSync(probe, src);
+        });
 
         // #4316 PR3/3: the clean full-mode read carried the one-time ledger
-        // alignment; the legacy fallback over the corrupt index did not. The
-        // parent passes its digest already modulo that alignment (single
-        // definition), so strip it here too before comparing.
+        // alignment; the recovered load applies it again. The parent passes
+        // its digest already modulo that alignment (single definition), so
+        // strip it here too before comparing.
         await run.run(ENGPROOF_CHECK_NAMES.stateDigest, () =>
             assert.equal(viewStateDigest(stripOneTimeAlignment(toLegacyLike(reloaded))), expectedStateDigest,
-                "corrupt-index fallback state digest drift vs clean full-mode read"));
+                "recovered-index state digest drift vs clean full-mode read"));
 
-        // Writes must keep working (legacy path) — no throw, file refreshed.
+        // Writes must keep working (full path into the fresh index) — no
+        // throw, files refreshed.
         await run.run(ENGPROOF_CHECK_NAMES.writeNow, () => store2.writeNow(reloaded));
     } finally {
         store2.closeQuietly();
@@ -394,7 +423,10 @@ async function bannerScenario(argv: string[], run: CheckRun): Promise<void> {
     if (!base) throw new Error("banner mode needs <base>");
     const dir = path.join(base, "sessions");
     mkdirSync(dir, { recursive: true });
-    writeFileSync(path.join(dir, "index.db"), Buffer.from("this is definitely not a sqlite database file".repeat(8)));
+    // #4816: the former corrupt-index cause here now quarantines and recovers
+    // instead of degrading — force the engine ladder exhausted (deterministic
+    // on every platform) as the degrade trigger for the banner wire shape.
+    setSqliteEnginesUnavailableForTests(true);
     const store = new SessionStore({ dir, enabled: true });
     _setStoreForTest(store);
     const upstreamPort = await freePort();
@@ -415,9 +447,9 @@ async function bannerScenario(argv: string[], run: CheckRun): Promise<void> {
         if (!storage) return;
         await run.run(BANNER_CHECK_NAMES.requestedFull, () => assert.equal(storage.requested, "full"));
         await run.run(BANNER_CHECK_NAMES.effectiveLegacy, () => assert.equal(storage.effective, "legacy"));
-        await run.run(BANNER_CHECK_NAMES.degraded, () => assert.equal(storage.degraded, true, "corrupt index.db trips the warning"));
+        await run.run(BANNER_CHECK_NAMES.degraded, () => assert.equal(storage.degraded, true, "no-engine degrade trips the warning"));
         await run.run(BANNER_CHECK_NAMES.intentionalOptOut, () => assert.equal(storage.intentionalOptOut, false));
-        await run.run(BANNER_CHECK_NAMES.reason, () => assert.match(storage.reason ?? "", /index database failed to open/));
+        await run.run(BANNER_CHECK_NAMES.reason, () => assert.match(storage.reason ?? "", /no SQLite engine available/));
         await run.run(BANNER_CHECK_NAMES.engine, () => assert.equal(storage.engine, null));
     } finally {
         await close(proxy);
