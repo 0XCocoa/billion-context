@@ -6,6 +6,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 ## [Unreleased]
 
 ### Fixed
+- **shadow 摘要漂移的单实例成因(#4392 / #4986)**:`canonicalize` 曾按 `Object.entries` 插入序参与哈希,而 live 腿(kernel 状态,`byRef` 按发号顺序)与 replay 腿(`loadLegacyView` 按账本 `ord` 重建 `messageRefs`)对同一份等值状态给出不同键序 → 单进程自我报告 `[diverged: state]`,连续 3 次即冻结本进程的信封写入并清掉入库水位。现在任意深度按键排序(数组保序,Map/Set 形态不变),跳过的键(去掉 `storageMode`/`tailGaps`)集中成 `canonical.ts` 导出的 `DIGEST_SKIPPED_KEYS`,供流式摘要路径共用;升级文案不再断言「多个 bili 实例」。storage-corpus manifest 随摘要定义重钉(只有 10 个摘要值变化,文件清单/格式不动);storage-render 金标无需改动——那套驱动在 harness 侧已先 `sortObjectKeys`,排键只改 shadow 腿与 corpus 摘要。`tests/issue4986-digest-drift-ref-order.test.ts`(取自 #4997)钉住 #4986 的 folded-corpus 面。
 - 出站不变量判官新增 I3 配对不变量（#4862 出口校验缺口）：此前判官只对账入站↔出站连续性（I1/I2），折叠区内完全免检，于是「折叠拆断一对 tool_use/tool_result」的出站体拿到 clean fold verdict 直接放行，直到上游用 400 `tool_use ids were found without tool_result blocks` 说出真相。现在每个 tool-call 必须有同 id 的 tool-result 在其后、每个 tool-result 必须有同 id 的 tool-call 在其前，折叠区不再豁免；归因保持“谁的错”职责（宿主自己发来的断对不计 bili、compress 在途调用豁免、id 重铸不可洗白）。纯检测不拦截，受 diagnostics.invariantJudge 旋钮控制。
 - 块区间边界在重存时不再回退:折叠后客户端重发的视图不含已覆盖原文,重入库时该批次无法重新解析区间(-1/-1),旧逻辑会把已解析的真实区间抹掉。现在区间证据一旦解析即持久(入库 `CASE` 保留;sqlite/mysql 双后端),未知块保持诚实缺口(#4608)。
 - 优雅停机(SIGTERM → dispose)的 writer 标记现在记录 `stoppedAt`:重启流程(杀旧进程→立即重绑)不再对已确认死亡的前任实例误报 [split-brain]——30s 新鲜度回退从此只覆盖无法证明死亡的崩溃场景(#3923;release-gate lane A 代理重启时观察到误报)。
