@@ -27,6 +27,7 @@ import type { BootstrapOutcome, CooldownMarker } from "./engine-bootstrap.js";
 import { bootstrapFailureMarkerPath, COOLDOWN_MS, nodeSqliteUpgradeHint, readBootstrapFailureMarker } from "./engine-bootstrap.js";
 import { fileStorageAutoDownload, fileStorageJsonWriter, fileStorageUnified, fileStorageWalJournalSizeLimit, resolveStorageMode } from "../knobs.js";
 import { log as loggerLog } from "../logger.js";
+import { safePrefix, safeSuffix } from "../text-safe.js";
 import { resolvedSqliteEngineInfo } from "./driver.js";
 import { MAX_CONSECUTIVE_FAILURES, sqliteOpenFailureHint, type UnifiedShadow } from "./shadow.js";
 import type { StorageMode } from "./shadow.js";
@@ -173,7 +174,7 @@ function shortenError(err: string): string {
     // cut the MIDDLE (usually a long path) instead of the tail. Head-only
     // truncation made the actionable detail invisible on exactly the
     // long-path machines (Windows user profiles) this fix targets.
-    return `${oneLine.slice(0, 78)}…${oneLine.slice(-78)}`;
+    return `${safePrefix(oneLine, 78)}…${safeSuffix(oneLine, 78)}`;
 }
 
 function degradeReason(): string {

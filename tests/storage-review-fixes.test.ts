@@ -136,7 +136,7 @@ test("review 2: destroyed-substrate blocks are deleted and cannot resurrect on a
     });
 });
 
-test("review 3: corrupt index.db degrades to legacy-only instead of bricking the proxy", async () => {
+test("review 3: corrupt index.db auto-quarantines and recovers instead of bricking the proxy", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-review-corrupt-"));
     try {
         const session = loadCorpusCase(dir, "folded", "corpus-folded", "anthropic");
@@ -151,8 +151,14 @@ test("review 3: corrupt index.db degrades to legacy-only instead of bricking the
             store = new SessionStore({ dir, debounceMs: 1, enabled: true }); // must NOT throw
             await store.writeNow(session);
             const reloaded = store.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-            assert.ok(reloaded, "legacy fallback load must succeed");
-            assert.equal(store.replicasAvailable(), false, "shadow is unavailable while degraded");
+            assert.ok(reloaded, "session load must succeed");
+            // #5124/#4816 behavior change (a): this corruption shape makes
+            // quick_check THROW, so the store quarantines the corrupt file set
+            // and recovers a fresh index — it no longer degrades legacy-only.
+            assert.equal(store.replicasAvailable(), true, "throwing corruption must be quarantined + recovered, not stay legacy-only");
+            const names = fs.readdirSync(dir);
+            assert.ok(names.some((n) => n.startsWith("index.db.corrupt-")), `quarantined copy kept for forensics, got ${names.join(", ")}`);
+            assert.ok(fs.existsSync(path.join(dir, "index.db")), "fresh index.db exists after quarantine");
             await store.flushAll(); // flush the JSON record to disk (closeQuietly only cancels)
         } finally {
             store!.closeQuietly();
@@ -163,7 +169,7 @@ test("review 3: corrupt index.db degrades to legacy-only instead of bricking the
         process.env.BILI_STORAGE_UNIFIED = "shadow";
         try {
             const again = new SessionStore({ dir, debounceMs: 1, enabled: true });
-            assert.ok(again.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" }), "second process must load via legacy");
+            assert.ok(again.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" }), "second process must load the session");
             again.closeQuietly();
         } finally {
             delete process.env.BILI_STORAGE_UNIFIED;

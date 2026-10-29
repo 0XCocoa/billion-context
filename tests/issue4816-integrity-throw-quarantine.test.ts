@@ -169,6 +169,13 @@ test("#4816 shadow: throwing corruption is quarantined and the store recovers to
 
 test("#4816 shadow: a failed quarantine rename degrades loudly with the errno, no doomed reopen", { skip: SKIP_RENAME_FAIL }, () => {
     const dir = tmpDir();
+    // The wire reason below resolves `requested` from the REAL process env
+    // (runtime-status records it only via SessionStore), and the CI baseline
+    // preload pins BILI_STORAGE_UNIFIED=legacy for the non-storage corpus
+    // (#2815) — under legacy there is nothing to report degraded. Pin full to
+    // match the mode maybeOpen is asked for; restore afterwards.
+    const prevUnified = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "full";
     try {
         seedValidDb(join(dir, "index.db"));
         truncateHalf(join(dir, "index.db"));
@@ -187,6 +194,8 @@ test("#4816 shadow: a failed quarantine rename degrades loudly with the errno, n
             _resetStorageRuntimeStatusForTest();
         }
     } finally {
+        if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = prevUnified;
         rmSync(dir, { recursive: true, force: true });
     }
 });
