@@ -63,6 +63,7 @@ import { logHostEvent } from "./agent/host-log.js";
 import { compactionDisablePatchRows } from "./agent/dsh-compaction-disable.js";
 import { log as teeLog, logTimestamp } from "./logger.js";
 import { VERSION } from "./version.js";
+import { classifyStartupFailure } from "./startup-failure-page.js";
 import { isVersionNewer } from "./update.js";
 import { winCmdUnsafeToken, winCmdRefusalError } from "./win-cmd.js";
 
@@ -5225,6 +5226,60 @@ export async function ensureProxyRunning(
                 return "";
             }
         };
+        // #5096: the fatal line of a startup crash sits at the END of this
+        // spawn's output — the head sample above (#4811) can quote nothing but
+        // the first warnings and actively hide it. Sample the tail too, but
+        // only when this spawn wrote enough that the tail is not the head
+        // again (and never quote a pre-spawn remnant as this child's tail).
+        const logTailSample = (): string => {
+            try {
+                const size = fs.statSync(logPath).size;
+                if (size >= spawnLogOffset && size - spawnLogOffset <= 256) return "";
+                const start = size < spawnLogOffset ? Math.max(0, size - 256) : Math.max(spawnLogOffset, size - 256);
+                const len = Math.min(256, size - start);
+                if (len <= 0) return "";
+                const fd = fs.openSync(logPath, "r");
+                try {
+                    const buf = Buffer.alloc(len);
+                    const n = fs.readSync(fd, buf, 0, len, start);
+                    if (n === 0) return "";
+                    let s = buf.subarray(0, n).toString("utf8").replace(/\s+/g, " ").trim();
+                    if (s.length > 200) s = `…${s.slice(s.length - 200)}`;
+                    return ` — child output tail: "${s}"`;
+                } finally {
+                    fs.closeSync(fd);
+                }
+            } catch {
+                return "";
+            }
+        };
+        // #5096: turn the sampled bytes into a human cause when the signature
+        // is known (EPERM/EACCES/… on the bili data dir) — the field case had
+        // users staring at a truncated EPERM head with no idea what to do.
+        const failureHint = (): string => {
+            try {
+                const size = fs.statSync(logPath).size;
+                // #5096 review follow-up: classify THIS spawn's bytes only
+                // (#4811 discipline) — a stale permission signature from an
+                // earlier spawn would misattribute this failure; a shrunken
+                // file means rotation happened, so everything left is ours.
+                const start = size < spawnLogOffset ? Math.max(0, size - 1024) : Math.max(spawnLogOffset, size - 1024);
+                const len = Math.min(1024, size - start);
+                if (len <= 0) return "";
+                const fd = fs.openSync(logPath, "r");
+                try {
+                    const buf = Buffer.alloc(len);
+                    const n = fs.readSync(fd, buf, 0, len, start);
+                    if (n === 0) return "";
+                    const hint = classifyStartupFailure(buf.subarray(0, n).toString("utf8"));
+                    return hint ? ` (${hint})` : "";
+                } finally {
+                    fs.closeSync(fd);
+                }
+            } catch {
+                return "";
+            }
+        };
         const logTail = (): string => {
             try {
                 const size = fs.statSync(logPath).size;
@@ -5242,7 +5297,7 @@ export async function ensureProxyRunning(
                 const rotated = rotatedFile ? `; earlier output rotated to ${logPath}.old` : "";
                 if (size === 0) return `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}`;
                 if (size === spawnLogOffset && !rotatedFile) return `, ${size} bytes — this child appended nothing of its own (earlier content stays on disk until rotation)`;
-                return `, ${size} bytes${rotated}${logHeadSample()}`;
+                return `, ${size} bytes${rotated}${logHeadSample()}${logTailSample()}`;
             } catch {
                 return "";
             }
@@ -5431,7 +5486,7 @@ export async function ensureProxyRunning(
             const detail = childExit.code !== null
                 ? `code ${childExit.code}${childExit.code === TWIN_ADOPT_EXIT_CODE ? " (twin-collision signal)" : ""}`
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
-            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${(await diagnosePort(false)).text} (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
+            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${(await diagnosePort(false)).text} (runtime: ${runtime}) (log: ${logPath}${logTail()})${failureHint()}`);
         }
         // #4994: where THIS child says it bound, parsed from its own log
         // segment ([spawnLogOffset..end] — no other spawn's lines can answer;
@@ -5506,7 +5561,7 @@ export async function ensureProxyRunning(
         console.error(
             `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis.text} (log: ${logPath}${logTail()})`,
         );
-        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis.text} (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
+        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis.text} (runtime: ${runtime}) (log: ${logPath}${logTail()})${failureHint()}`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }
