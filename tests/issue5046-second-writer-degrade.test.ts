@@ -142,7 +142,7 @@ test("#5046/B negative: live DIFFERENT-lane foreign holder ⇒ still opens (supp
     withEnv({ XDG_STATE_HOME: state, BILI_LAUNCHER_LANE: "dsh" }, () => {
         const shadow = UnifiedShadow.maybeOpen(sessions, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
         assert.ok(shadow, "cross-lane sharing is the supported topology — must still open");
-        assert.ok(logs.some((m) => m.includes("informational only")), "benign notice expected");
+        assert.ok(logs.some((m) => m.includes("supported topology")), "#5091 shared-topology info notice expected");
         assert.equal(lockHolderPid(sessions), process.pid, "cross-lane takeover keeps the existing behavior");
         shadow!.close();
     });
@@ -213,7 +213,7 @@ test("#5046/B: default policy (CLI/export direct open) stays report-only — sto
     withEnv({ XDG_STATE_HOME: state, BILI_LAUNCHER_LANE: "dsh" }, () => {
         const store = UnifiedStore.open(path.join(sessions, "index.db"));
         assert.ok(store, "report-only paths (export/maintenance) keep running as before");
-        assert.ok(logs.some((m) => m.includes("keeps running but the condition is reported")), "existing report line unchanged");
+        assert.ok(logs.some((m) => m.includes("supported topology")), "#5091 report-only coexistence info line");
         assert.equal(lockHolderPid(sessions), process.pid, "report-only takeover unchanged");
         store.close();
     });

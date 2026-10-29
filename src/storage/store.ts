@@ -432,10 +432,18 @@ export class UnifiedStore {
             integrityOk = true;
         }
         // #4175: second-process-on-the-same-db detection. A live foreign pid
-        // is reported loudly (web wire + banner) but never blocks — blocking
-        // would brick the second lane outright; the documented posture is one
-        // #3633 instance per session directory. A dead pid means a stale
-        // lock: take it over.
+        // is surfaced (web wire + banner); the default policy never blocks
+        // (blocking would brick the second lane outright) — a caller that opts
+        // into secondWriterPolicy:"degrade" may instead refuse unified storage
+        // and degrade to legacy-only (#5046/B), which preserves availability.
+        // #5082: coexistence on one index.db
+        // is the SUPPORTED topology — SQLite WAL is multi-process safe on a
+        // local filesystem and the machine-global sessions dir is
+        // deliberately shared — so the foreign pid is informational WHATEVER
+        // lane it maps to (or none: inline lanes never register). The real
+        // hazard, two instances writing the SAME session, has its own
+        // per-session alarm (the #3923 split-brain contest). A dead pid means
+        // a stale lock: take it over.
         const lockPath = `${path}.lock`;
         let foreignLockHolder: { pid: number } | null = null;
         try {
@@ -444,26 +452,29 @@ export class UnifiedStore {
                 const pid = typeof parsed.pid === "number" ? parsed.pid : null;
                 if (pid !== null && pid !== process.pid && processAlive(pid)) {
                     foreignLockHolder = { pid };
-                    // #3923/#3959: a live foreign pid that maps to a KNOWN bili
-                    // instance of a DIFFERENT lane is the deliberate shared-directory
-                    // topology — informational, not a corruption alarm. When stale
-                    // entries share the pid (restarted instance), the newest
-                    // startedAt is the live one.
+                    // When stale entries share the pid (restarted instance),
+                    // the newest startedAt is the live one.
                     const peer = listInstances()
                         .filter((e) => e.pid === pid)
                         .reduce<RegistryEntry | undefined>((best, e) => (best === undefined || (e.startedAt ?? 0) > (best.startedAt ?? 0) ? e : best), undefined);
+                    // #5046/B (owner decision 2026-10-29): the degrade POLICY decides whether
+                    // THIS caller may become a persistent second writer. Cross-lane sharing is
+                    // the supported topology (#5082/#3923) — stay open. Same-lane, or a peer whose
+                    // lane is unknown (inline lanes never register / pre-#5046 markers carry none),
+                    // is the risky double-write shape — refuse BEFORE taking over the lockfile when
+                    // degrade is opted in; the caller owns the actionable user-facing line.
                     const ownLane = process.env.BILI_LAUNCHER_LANE?.trim() || undefined;
-                    const benign = peer !== undefined && ownLane !== undefined && peer.lane !== undefined && peer.lane !== ownLane;
-                    if (benign) {
-                        loggerLog("info", `[storage] process (pid ${pid}, lane ${peer?.lane}, instance ${peer?.instanceId.slice(0, 8)}) is also using ${path} — different lanes sharing one sessions directory is the supported topology (#3923/#3959); informational only.`);
-                    } else if (opts?.secondWriterPolicy === "degrade") {
-                        // #5046/B (owner decision): a persistent second writer corrupts this db — refuse BEFORE taking over the lockfile; the caller owns the actionable user-facing line.
+                    const crossLaneSafe = peer !== undefined && ownLane !== undefined && peer.lane !== undefined && peer.lane !== ownLane;
+                    if (opts?.secondWriterPolicy === "degrade" && !crossLaneSafe) {
                         db.close();
                         throw new StorageSecondWriterError(pid, path);
-                    } else {
-                        loggerLog("error", `[storage] another process (pid ${pid}) is already writing ${path} — two processes on one index.db corrupt it (#3923/#3959). One session dir must have exactly one instance (#3633); this lane keeps running but the condition is reported.`);
                     }
-                    recordSecondProcessOwner(pid, { lane: peer?.lane, instanceId: peer?.instanceId, benign });
+                    // #5091/#5082: reporting is INFORMATIONAL for every live foreign holder —
+                    // SQLite WAL multi-process open is safe on a local disk; the real hazard (two
+                    // instances writing the SAME session) alarms separately (split-brain contest).
+                    const peerOf = peer !== undefined ? ` (lane ${peer.lane ?? "?"}, instance ${peer.instanceId.slice(0, 8)})` : "";
+                    loggerLog("info", `[storage] process pid ${pid}${peerOf} is also using ${path} — multiple instances sharing one sessions dir is the supported topology (#5082/#3923); two instances walking the SAME session alarm separately (split-brain contest)`);
+                    recordSecondProcessOwner(pid, { lane: peer?.lane, instanceId: peer?.instanceId, benign: true });
                 }
             }
             writeFileSync(lockPath, JSON.stringify({ pid: process.pid, boot: Date.now() }));
