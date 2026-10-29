@@ -94,7 +94,7 @@ import { reapOrphanBlocks } from "./orphan-gc.js";
 import { conflictScanEnabled, isDesignBenign, scanClientPlugins, sniffScanClient } from "./thirdparty-scan.js";
 import { clearConflictEvents, recordConflict, summarizeConflicts } from "./conflict-watch.js";
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
-import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, logTimestamp } from "./logger.js";
+import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
@@ -495,15 +495,21 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // %TEMP%/bili-proxy-<port>.log (raw append fd, no rotation) — with the
     // file leg live that pipe is a pure unbounded duplicate of bili.log
     // (31.7MB/5 days observed, other sessions' traces included). Mute it:
-    // the port log degrades to a pre-logger crash sink only. Manual starts
-    // (no launch token) keep the terminal tee; a dead file leg keeps the
-    // stderr fallback. #3857: the decision waits for the file leg to be
-    // PROVEN live (onFileLegLive) — liveness means the first byte was
-    // DELIVERED, not merely opened: on win32 (observed node 22) some paths
-    // hand out an fd whose writes then always fail, and at startup the stream
-    // is only pending anyway; deciding on either muted stderr over a dead leg
-    // and every line vanished with zero trace.
-    if (process.env.BILI_LAUNCH_TOKEN?.trim()) {
+    // the port log degrades to a pre-logger crash sink only. #3857: the
+    // decision waits for the file leg to be PROVEN live (onFileLegLive) —
+    // liveness means the first byte was DELIVERED, not merely opened: on win32
+    // (observed node 22) some paths hand out an fd whose writes then always
+    // fail, and at startup the stream is only pending anyway; deciding on
+    // either muted stderr over a dead leg and every line vanished with zero
+    // trace. #5012: the same reasoning extends beyond launcher children to ANY
+    // non-terminal stderr — a host that spawns bili and captures stderr into a
+    // buffer without draining it fills the ~64KB pipe; Node pipe writes are
+    // blocking and a full pipe NEVER emits an error event, so the proxy's
+    // event loop wedged mid-write: no crash, no error line, silent file leg,
+    // the "App frozen" symptom class. A terminal (isTTY) drains by design and
+    // keeps the tee; everything else gets the durable bili.log only (a dead
+    // file leg still restores the stderr fallback, warnReopenFailed).
+    if (shouldMuteStderrLegAfterFileLive(Boolean(process.env.BILI_LAUNCH_TOKEN?.trim()), process.stderr.isTTY)) {
         onFileLegLive(() => muteStderrLeg());
     }
     const core = createCore();
