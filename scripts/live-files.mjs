@@ -77,6 +77,10 @@ export const LIVE_FILES = [
     // spawns a bare `node -e` child that only prints env — no ports, no
     // servers, so the zone band is irrelevant; the entry is for the tripwire
     "tests/preload-sandbox-dirs.test.ts",
+    // #5046/B: spawns one bare `node -e` dummy child purely as a live PID
+    // holder for the lock-file fixtures — no ports, no servers, so the zone
+    // band is irrelevant; the entry is for the tripwire
+    "tests/issue5046-second-writer-degrade.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
