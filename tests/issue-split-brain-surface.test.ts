@@ -362,7 +362,8 @@ test("#3959 web: status carries secondProcess/splitBrain; ack endpoint clears; p
         assert.ok(WEB_CLIENT.includes('t("sys.split_brain", {'), "client composes the localized sentence");
         assert.ok(WEB_CLIENT.includes('API_ROOT + "/storage/split-brain/ack"'), "dismiss button POSTs the ack endpoint");
         assert.ok(WEB_CLIENT.includes('"btn sm"'), "dismiss button follows the sm button convention");
-        assert.ok(!WEB_CLIENT.includes('classList.add("warn")'), "#5082: the corruption-alarm styling path is gone — the second-process banner is informational only");
+        assert.ok(!WEB_CLIENT.includes('t("sys.storage_second_process",'), "#5082: the corruption-alarm copy is gone from the client");
+        assert.ok(!WEB_CLIENT.includes('storage_second_process_cross_lane'), "#5082: the old cross-lane keys are fully replaced");
         assert.ok(WEB_CLIENT.includes("#5082"), "client cites #5082 where coexistence is declared supported");
         assert.ok(WEB_CLIENT.includes('t("sys.storage_second_process_shared"'), "informational branch uses the shared-topology copy");
         assert.ok(WEB_CLIENT.includes('classList.add("info")'), "informational branch swaps to info styling");
