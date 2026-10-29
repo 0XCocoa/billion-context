@@ -300,6 +300,11 @@ export type Session = {
      *  one upstream usage report. Persisted; survives restart. */
     stats: {
         requests: number;
+        /** #4899: cumulative USD spend ledger (input / cacheRead / cacheWrite /
+         *  output), billed at the per-request stamped price
+         *  (metadata.billingPrice). Absent while no price resolves — the UI
+         *  shows tokens only, never fabricated dollars. */
+        costUsd?: { input: number; cacheRead: number; cacheWrite: number; output: number };
         /** Approximate tokens saved by compression (legacy/rough — kept for
          *  backward compat with old session files, not shown in UI). */
         tokensSaved: number;
@@ -1141,6 +1146,7 @@ export function zeroStats(): Session["stats"] {
 }
 
 export function getSession(id: string, meta?: { protocol?: Session["meta"]["protocol"]; upstreamOrigin?: string; label?: string }): Session {
+    if (publishingForks.has(id)) throw new Error("child fork publication in progress");
     const existing = sessions.get(id);
     if (existing) {
         existing.lastSeen = Date.now();
@@ -1199,12 +1205,20 @@ export function createSession(id: string, meta?: Session["meta"]): Session {
     };
 }
 
-export function publishForkSession(session: Session): void {
+const publishingForks = new Set<string>();
+
+export async function publishForkSession(session: Session, parentId: string): Promise<void> {
+    if (publishingForks.has(session.id)) throw new Error("child fork publication in progress");
     if (sessions.has(session.id) || getStore().loadSync(session.id)) throw new Error("child session already exists");
-    makeResidentRoom(sessionWeight(session));
-    if (!getStore().flushSync(session)) throw new Error("fork persistence failed");
-    session.persisted = getStore().enabled;
-    sessions.set(session.id, session);
+    publishingForks.add(session.id);
+    try {
+        makeResidentRoom(sessionWeight(session));
+        await getStore().persistForkSession(parentId, session);
+        session.persisted = getStore().enabled;
+        sessions.set(session.id, session);
+    } finally {
+        publishingForks.delete(session.id);
+    }
 }
 
 /** Mark a session as in-use by a request. Must be paired with releaseInFlight.
@@ -1766,7 +1780,7 @@ export function foldCoverage(
 // — the storage seam needs them without session.ts's built-acp-kernel import;
 // the doc comments live there now). Re-exported so existing consumers keep the
 // session.js import path.
-export { RESPONSES_TURN_SEPARATOR_ID_PREFIX, isResponsesTurnSeparatorId, scrubTurnSeparatorIds } from "./turn-separator.js";
+export { RESPONSES_TURN_SEPARATOR_ID_PREFIX, isResponsesTurnSeparatorId, scrubTurnSeparatorIds, withoutTurnSeparators } from "./turn-separator.js";
 
 /** #2627: the REAL-history coverage set — active blocks' effective ids minus
  *  outbound-only turn separators. Single source for every drift consumer (the
