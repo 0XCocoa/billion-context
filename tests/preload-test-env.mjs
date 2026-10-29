@@ -16,7 +16,7 @@
 // suite must not depend on the host layout either way. HOME is untouched —
 // bili's path resolution only consults homedir() as the XDG fallback, and
 // spawned tools (npm/git) need the real HOME.
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -27,3 +27,10 @@ process.env.XDG_DATA_HOME = path.join(root, "data");
 process.env.XDG_STATE_HOME = path.join(root, "state");
 process.env.XDG_CACHE_HOME = path.join(root, "cache");
 process.env.XDG_CONFIG_HOME = path.join(root, "config");
+// Materialize every advertised dir (#5121 CI red): an explicit BILI_SESSIONS_DIR
+// pointing at a MISSING dir is not the pristine default layout — #2180/#1937
+// deliberately keep that loud (walkSessionFiles top-level ENOENT propagates,
+// /__bili/overview 500s instead of resolving to an empty index), so the harness
+// must point at dirs that exist. An existing EMPTY dir is the normal
+// "no sessions yet" state the read paths already handle.
+for (const name of ["sessions", "data", "state", "cache", "config"]) mkdirSync(path.join(root, name), { recursive: true });
