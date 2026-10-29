@@ -77,12 +77,9 @@ export const LIVE_FILES = [
     // spawns a bare `node -e` child that only prints env — no ports, no
     // servers, so the zone band is irrelevant; the entry is for the tripwire
     "tests/preload-sandbox-dirs.test.ts",
-    // #4994: ensureProxyRunning timeout-adoption rows drive fully mocked
-    // children + a fake clock; nothing is spawned and no socket is bound
-    // (the 1899x ports appear only in tmpdir log-file names) — like #3890's
-    // the entry is for the tripwire (its SPAWN_RE hit is the identifier
-    // "spawnLogOffset" in a code comment)
-    "tests/issue4994-spawn-timeout-adopt.test.ts",
+    // #5012: logger-seam children only (stdio pipes, never bind a port) - the
+    // entry exists for the spawn tripwire alone, like #3890
+    "tests/issue5012-stdout-leg-mute.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
