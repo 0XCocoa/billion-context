@@ -24,7 +24,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { startOwnerHeartbeat } from "../src/launcher.ts";
+import { runOwnerHeartbeatWorker, startOwnerHeartbeat, type OwnerBeatWorker } from "../src/launcher.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const RECEIVER = path.join(HERE, "fixtures", "issue5152-beat-receiver.mjs");
@@ -171,6 +171,48 @@ test("#5152 one worker per origin: repeated attach paths share, refcounted stop"
         s1?.();
         s2?.();
         await wait(1_200);
+        recv.stop();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("#5152 a worker that dies mid-flight falls back to the in-thread loop", async () => {
+    // A dead worker must not keep its refcount slot while attesting nothing —
+    // that would starve every later attach for this origin of beats and hand
+    // the proxy back the very false death (#5152) this heartbeat prevents.
+    const dir = path.join(tmpdir(), `bili-5152-crash-${process.pid}-${Date.now()}`);
+    mkdirSync(dir, { recursive: true });
+    const recv = await startReceiver(dir);
+    const BEAT_MS = 300;
+    let stop: (() => void) | undefined;
+    let errorListener: ((err: Error) => void) | undefined;
+    try {
+        const fakeWorker: OwnerBeatWorker = {
+            on(event, listener) { if (event === "error") errorListener = listener; },
+            unref() { /* the fake holds no loop resource */ },
+            postMessage() { /* dead worker */ },
+            terminate() { return Promise.resolve(undefined); },
+        };
+        stop = runOwnerHeartbeatWorker(`http://127.0.0.1:${recv.port}`, process.pid, BEAT_MS, () => fakeWorker);
+        assert.equal(typeof stop, "function");
+
+        // Negative direction: while the (pretended) worker is alive, NO beat may
+        // come from an in-thread loop — the fallback must not arm prematurely.
+        await wait(900);
+        assert.equal(recv.beats().length, 0, "no in-thread loop may run before the crash");
+
+        assert.equal(typeof errorListener, "function", "the worker's error handler must be armed");
+        errorListener!(new Error("simulated thread death"));
+        await wait(1_200);
+        assert.ok(recv.beats().length >= 1, `the in-thread fallback must keep attesting after the worker dies (got ${recv.beats().length} beats)`);
+
+        stop!();
+        stop = undefined;
+        const frozen = recv.beats().length;
+        await wait(900);
+        assert.equal(recv.beats().length, frozen, "stop() must silence the fallback together with the entry");
+    } finally {
+        stop?.();
         recv.stop();
         rmSync(dir, { recursive: true, force: true });
     }
