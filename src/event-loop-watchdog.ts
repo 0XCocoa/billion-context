@@ -198,6 +198,11 @@ export function armEventLoopWatchdog(opts: ArmEventLoopWatchdogOptions = {}): Ev
             // worker already gone — nothing left to heartbeat to.
         }
     }, heartbeatMs);
+    // #4762 review follow-up: unref like the worker below — a ref'd heartbeat
+    // keeps every startServer caller (incl. all 362 test files that drive it)
+    // alive forever after their last real handle closed. Retention-only change:
+    // while the loop runs, beats still fire, so wedge detection is untouched.
+    beatTimer.unref();
 
     worker.on("message", (msg: unknown) => {
         const m = msg as Partial<WatchdogTripMsg>;
