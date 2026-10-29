@@ -147,14 +147,35 @@ export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
         : undefined;
 }
 
-/** dsh lane classifier: any of the four evidence-backed carriers → its
- *  canonical durable identity. */
+/** dsh time-context identity (#5109): per-step clock readings injected by
+ *  @deepseek-ai/dsh-time-context as user-role messages
+ *  ("Time sampled while preparing turn N, step M: ..."; source:
+ *  deepseek-ai/deepseek-harness packages/context/time-context/src/index.ts
+ *  renderText — the same text family src/server.ts already treats as an
+ *  auto-injected notification, #2286). Deliberately OUTSIDE the `durable/`
+ *  namespace: readings are resent every eligible step, so unlike the four
+ *  durable carriers a fold is self-healing and latest-pin protection would
+ *  only pin stale clocks and bloat context — the recorded "time-context stays
+ *  foldable" decision. The path still matters: kernel Rule 3 refuses
+ *  virtual-path messages the last-user anchor (#5109), so a stale clock
+ *  reading can never displace the newest human request from the protected
+ *  zone. #2766: model echoes are never carriers (assistant gate below). */
+export function dshTimeContextPath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Time sampled while preparing turn")
+        ? "injected/time-context"
+        : undefined;
+}
+
+/** dsh lane classifier: any of the five evidence-backed identities → its
+ *  canonical path (four durable carriers + the foldable time-context
+ *  injection, #5109). */
 function dshDurableToolPath(msg: CoreMessage): string | undefined {
     return (
         dshSkillCatalogPath(msg) ??
         dshWorkspaceInstructionsPath(msg) ??
         dshRuntimeContextPath(msg) ??
-        dshMcpCatalogPath(msg)
+        dshMcpCatalogPath(msg) ??
+        dshTimeContextPath(msg)
     );
 }
 
