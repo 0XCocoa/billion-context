@@ -61,7 +61,7 @@ function history(): CoreMessage[] {
   ];
 }
 
-test("#5101: truncating a protected result cannot seed a shared latch or corrupt another call", () => {
+test("#5102: truncating a protected result cannot seed a shared latch or corrupt another call", () => {
   const core = createCore();
   const messages = history();
   const first = core.processTurn({
@@ -100,7 +100,7 @@ test("#5101: truncating a protected result cannot seed a shared latch or corrupt
 });
 
 for (const tokenCount of [100, 9800]) {
-  test(`#5101: discard persisted duplicate BLOCKED entries at tokenCount=${tokenCount}`, () => {
+  test(`#5102: discard persisted duplicate BLOCKED entries at tokenCount=${tokenCount}`, () => {
     const core = createCore();
     const messages = history();
     const initial = core.processTurn({
@@ -140,7 +140,7 @@ for (const tokenCount of [100, 9800]) {
   });
 }
 
-test("#5101: clean old BLOCKED entries while retaining a valid unique-ref clip", () => {
+test("#5102: clean old BLOCKED entries while retaining a valid unique-ref clip", () => {
   const core = createCore();
   const messages = history();
   messages.unshift({

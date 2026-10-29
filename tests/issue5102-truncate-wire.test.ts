@@ -14,7 +14,7 @@ import {
 import type { CoreMessage } from "acp-kernel";
 import { isMcpBiliHardProtected } from "../src/config.js";
 
-test("#5101: hydrated shared latch cannot alter MCP arguments in any outbound codec", () => {
+test("#5102: hydrated shared latch cannot alter MCP arguments in any outbound codec", () => {
   const toolName = "mcp__bili__acp_rule";
   const args = '{"action":"remove","id":"rule1"}';
   const messages: CoreMessage[] = [
