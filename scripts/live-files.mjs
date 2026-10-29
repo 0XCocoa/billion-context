@@ -73,6 +73,10 @@ export const LIVE_FILES = [
     // in-memory-only value, so no zone band is needed — the entry is for the
     // tripwire
     "tests/issue4982-draining-twin-ladder.test.ts",
+    // #5114: contract test for the storage-baseline preload's XDG dir sandbox;
+    // spawns a bare `node -e` child that only prints env — no ports, no
+    // servers, so the zone band is irrelevant; the entry is for the tripwire
+    "tests/preload-sandbox-dirs.test.ts",
     // #5152: spawns the beat-receiver fixture, which is listen(0) and publishes
     // its port through a file; the sender under test is a worker_threads worker
     // POSTing to that ephemeral port. No zone band is needed — the entry is for
