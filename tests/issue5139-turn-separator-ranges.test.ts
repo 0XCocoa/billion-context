@@ -1,4 +1,4 @@
-// #5141 regression: the Responses ordering repair inserts acp_turn_sep_* USER
+// #5139 regression: the Responses ordering repair inserts acp_turn_sep_* USER
 // markers into the SEND view only — they never exist in the original history
 // (the apply view). Range candidates derived from the send view can therefore
 // endpoint on a marker ref; screened against the apply view those endpoints
@@ -34,7 +34,7 @@ const reasoningMsg = (id: string, text: string): CoreMessage => ({ id, role: "as
 const callMsg = (id: string, callId: string): CoreMessage => ({ id, role: "assistant", contentType: "tool-call", toolCallId: callId, toolName: "bash", text: JSON.stringify({ cmd: `step ${callId}` }) });
 const resultMsg = (id: string, callId: string, text: string): CoreMessage => ({ id, role: "tool", contentType: "tool-result", toolCallId: callId, text });
 
-/** Geometry chosen so the ONLY candidate loss is the #5141 separator defect:
+/** Geometry chosen so the ONLY candidate loss is the #5139 separator defect:
  *  tA → rB are consecutive assistant items in the original (one run), so the
  *  ordering repair splits them with acp_turn_sep_1 in the send view — the repro
  *  precondition. The foldable MID mass is a single USER message placed right
@@ -89,14 +89,14 @@ interface Fixture {
     original: CoreMessage[];
     session: ReturnType<typeof getSession>;
     /** Round-1 send view: the prepared folded view + ordering repair — the
-     *  exact array class the relay hands tools as `messages` (#5141 wiring). */
+     *  exact array class the relay hands tools as `messages` (#5139 wiring). */
     sendView: CoreMessage[];
     refs: Record<string, string>;
 }
 
 function setupFixture(build: () => CoreMessage[]): Fixture {
     const core = createCore();
-    const session = getSession(`issue5141-${randomUUID()}`);
+    const session = getSession(`issue5139-${randomUUID()}`);
     const config = makeConfig();
     const original = build();
     const prep = core.processTurn({ messages: original, state: session.state, config, tokenCount: 0, renderTags: "text-only" });
@@ -118,7 +118,7 @@ function spanCovers(r: { startRef: string; endRef: string }, lo: number, hi: num
     return a <= lo && b >= hi;
 }
 
-/** The #5141 acceptance contract: every recommended endpoint must resolve in
+/** The #5139 acceptance contract: every recommended endpoint must resolve in
  *  the apply view (original history) — marker refs must never be advertised. */
 function assertEndpointsResolve(label: string, ranges: Array<{ startRef: string; endRef: string }>, refs: Record<string, string>): void {
     const applyRefs = new Set(Object.values(refs));
@@ -128,7 +128,7 @@ function assertEndpointsResolve(label: string, ranges: Array<{ startRef: string;
     }
 }
 
-test("#5141: withoutTurnSeparators strips only outbound-only markers (no-op otherwise)", () => {
+test("#5139: withoutTurnSeparators strips only outbound-only markers (no-op otherwise)", () => {
     const plain = [textMsg("a", "user", "hi"), textMsg("b", "assistant", "yo")];
     assert.equal(withoutTurnSeparators(plain), plain, "no markers → identical array (zero-copy fast path)");
     const mixed = [
@@ -142,7 +142,7 @@ test("#5141: withoutTurnSeparators strips only outbound-only markers (no-op othe
     assert.ok(isResponsesTurnSeparatorId("acp_turn_sep_1") && !isResponsesTurnSeparatorId("a_turn_sep_1"));
 });
 
-test("#5141: acp_status offers the full recoverable mass when the send view carries ordering separators", () => {
+test("#5139: acp_status offers the full recoverable mass when the send view carries ordering separators", () => {
     const fx = setupFixture(buildOriginal);
     assert.ok(fx.sendView.some((m) => isResponsesTurnSeparatorId(m.id)), "repro precondition: ordering repair inserted a separator into the send view");
 
@@ -168,7 +168,7 @@ test("#5141: acp_status offers the full recoverable mass when the send view carr
     assert.ok(!report.includes("UNCOVERED HISTORY"), `offer and uncovered audit disagree:\n${report}`);
 });
 
-test("#5141: post-compress internal re-request keeps offering everything around the new block", () => {
+test("#5139: post-compress internal re-request keeps offering everything around the new block", () => {
     const fx = setupFixture(buildOriginal);
     assert.ok(fx.sendView.some((m) => isResponsesTurnSeparatorId(m.id)), "repro precondition: separator present in the round-1 send view");
 
@@ -204,7 +204,7 @@ test("#5141: post-compress internal re-request keeps offering everything around 
     assert.ok(!report.includes("UNCOVERED HISTORY"), `surfaces disagree post-fold:\n${report}`);
 });
 
-test("#5141 control: a normal request without ordering separators is unaffected", () => {
+test("#5139 control: a normal request without ordering separators is unaffected", () => {
     const fx = setupFixture(buildPlainOriginal);
     assert.ok(!fx.sendView.some((m) => isResponsesTurnSeparatorId(m.id)), "control precondition: no separator inserted");
 

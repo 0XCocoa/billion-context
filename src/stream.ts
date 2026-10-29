@@ -588,7 +588,7 @@ function postCompressTail(ctx: RewriteCtx, cleanSuccess: boolean, submitted: Arr
         let nudge: NudgeDecision | undefined;
         try {
             const turn = ctx.core.processTurn({
-                // #5141: same view-class fix as liveCompressionRanges — outbound-only
+                // #5139: same view-class fix as liveCompressionRanges — outbound-only
                 // markers must not endpoint ranges screened against the apply view.
                 messages: withoutTurnSeparators(ctx.messages),
                 state: ctx.session.state,

@@ -74,7 +74,7 @@ export function excludeDeadRefRanges<T extends { startRef: string; endRef: strin
 
 export function liveCompressionRanges(ctx: AcpStatusCtx): { nudge: NudgeDecision; ranges: CompressibleRange[] } | undefined {
     const turn = ctx.core.processTurn({
-        // #5141: the send view's outbound-only ordering markers have no ids in
+        // #5139: the send view's outbound-only ordering markers have no ids in
         // the apply view — endpoints landing on them die at projection and
         // their whole units vanish from the offer silently.
         messages: withoutTurnSeparators(ctx.messages),

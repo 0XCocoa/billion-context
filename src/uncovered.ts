@@ -91,7 +91,7 @@ function inAnyWindow(n: number, windows: readonly SpanWindow[]): boolean {
 
 export function uncoveredHistoryRuns(input: UncoveredAuditInput): UncoveredRun[] {
   const { core, state, config } = input;
-  // #5141: the internal offer passes screen against the apply view, so the
+  // #5139: the internal offer passes screen against the apply view, so the
   // send view's outbound-only markers must not take part in them.
   const messages = withoutTurnSeparators(input.messages);
 

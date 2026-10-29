@@ -20,7 +20,7 @@ export function isResponsesTurnSeparatorId(id: string): boolean {
     return id.startsWith(RESPONSES_TURN_SEPARATOR_ID_PREFIX);
 }
 
-/** #5141: the markers exist ONLY in the send view — the apply view has none of
+/** #5139: the markers exist ONLY in the send view — the apply view has none of
  *  these ids, so any analysis pass screened against the apply view must run on
  *  the send view minus them, or range endpoints landing on a marker ref vanish
  *  at projection (BoundaryNotFoundError → silent demotion). No-op when absent. */
