@@ -73,6 +73,9 @@ export const LIVE_FILES = [
     // in-memory-only value, so no zone band is needed — the entry is for the
     // tripwire
     "tests/issue4982-draining-twin-ladder.test.ts",
+    // #4762: in-process eval workers only (wedge probes), never bind a port -
+    // the entry exists for the spawn tripwire alone, like #3890
+    "tests/event-loop-watchdog.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
