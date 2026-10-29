@@ -217,3 +217,26 @@ test("#5152 a worker that dies mid-flight falls back to the in-thread loop", asy
         rmSync(dir, { recursive: true, force: true });
     }
 });
+
+test("#5152 a host where the worker cannot start keeps beating from the in-thread loop", async () => {
+    // The other direction of the same gate: construction itself fails (a
+    // locked-down runtime without usable worker threads) ⇒ fall back BEFORE
+    // anything is armed, and still attest.
+    const dir = path.join(tmpdir(), `bili-5152-nostart-${process.pid}-${Date.now()}`);
+    mkdirSync(dir, { recursive: true });
+    const recv = await startReceiver(dir);
+    const BEAT_MS = 300;
+    let stop: (() => void) | undefined;
+    try {
+        stop = runOwnerHeartbeatWorker(`http://127.0.0.1:${recv.port}`, process.pid, BEAT_MS, () => {
+            throw new Error("worker_threads unavailable");
+        });
+        assert.equal(typeof stop, "function", "construction failure must still return a live handle");
+        await wait(1_200);
+        assert.ok(recv.beats().length >= 1, `the in-thread fallback must attest immediately (got ${recv.beats().length} beats)`);
+    } finally {
+        stop?.();
+        recv.stop();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
