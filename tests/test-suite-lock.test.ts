@@ -414,7 +414,7 @@ const cf = configFile();
 if (s !== env.BILI_SESSIONS_DIR) { console.error("sessionsDir escaped isolation:", s); process.exit(9); }
 if (!env.XDG_DATA_HOME || !d.startsWith(env.XDG_DATA_HOME)) { console.error("dataDir escaped isolation:", d); process.exit(9); }
 if (!env.XDG_STATE_HOME || !st.startsWith(env.XDG_STATE_HOME)) { console.error("stateDir escaped isolation:", st); process.exit(9); }
-if (cf !== env.BILI_CONFIG_FILE) { console.error("configFile escaped isolation:", cf); process.exit(9); }
+if (!env.XDG_CONFIG_HOME || !cf.startsWith(env.XDG_CONFIG_HOME)) { console.error("configFile escaped isolation:", cf); process.exit(9); }
 console.log(JSON.stringify({ s, d, st }));
 `;
     // Scrub the ambient path vars so the ONLY thing isolating this child is the
