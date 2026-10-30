@@ -2485,3 +2485,23 @@ To stop the failures at the root, add the sessions dir to your antivirus exclusi
 2. **Do not sync this directory.** Make sure OneDrive (or Dropbox / Google Drive / similar) is not syncing `%USERPROFILE%\.local\share\billion-context\`. If it lives under a synced folder, relocate it with `BILI_SESSIONS_DIR` to a non-synced path.
 
 High-frequency persist writes otherwise re-trigger the real-time scan on every turn — which is what produces the `EPERM` write failures. Once the directory is excluded, the alerts stop.
+
+### Windows: node runtime labeled Low (NTFS mandatory integrity) (#5154)
+
+Everything above assumes the *files* are the problem. #5154 found the opposite shape: the **Node runtime itself** (`node.exe`) carried a **Low mandatory-integrity label**, so the process was Low-integrity and *every write to a Medium-labeled file* — the CA bundle rebuild, `index.db`, session envelopes — failed with `EPERM` while every ACL check passed. The label usually arrives by **inheritance**: a parent directory once labeled `Low (OI)(CI)` (for example by a stray `icacls <dir> /setintegritylevel "(OI)(CI)Low" /T`) stamps the Low label onto every file placed inside it, and it survives reboots. This is the mechanism behind whole "crash loop with no visible cause" startup classes (#5096).
+
+bili probes its own runtime's label once at startup (`icacls` on `process.execPath`) and logs a loud `[integrity]` warning when it finds Low/Untrusted — non-blocking, the proxy keeps running.
+
+To check and fix manually (run elevated; use the **absolute path** — `icacls` PATH resolution fails under some PowerShell/cmd profiles):
+
+```bat
+:: look for a "Mandatory Label\Low Mandatory Level" line (no Mandatory Label line = no label = fine)
+C:\Windows\System32\icacls.exe "C:\Program Files\nodejs\node.exe"
+
+:: restore the runtime to Medium (this is the fix; verify with the command above)
+C:\Windows\System32\icacls.exe "C:\Program Files\nodejs\node.exe" /setintegritylevel Medium
+```
+
+If the label shows an `(I)` (inherited) marker, a **parent directory** is the source: fix the directory **root only, non-recursive** — `icacls "<dir>" /setintegritylevel Medium` with **no `/T`**. New and re-created children then inherit "(no label)" and converge; `/T` would touch thousands of files for nothing. Back up current ACLs first with `icacls "<dir>" /save acl.txt` if unsure.
+
+Do **not** "fix" this by relabeling the billion-context data dir Low — that direction makes things worse (see #3823 vs #5154: files writable only by Low processes, integrity ceiling everywhere).

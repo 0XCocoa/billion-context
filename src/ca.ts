@@ -235,7 +235,7 @@ function writeCombinedBundle(): void {
         if (!reusable) throw err;
         loggerLog(
             "warn",
-            `[ca] cannot rebuild ${file} (${String(err).slice(0, 200)}) — continuing with the EXISTING bundle (it still carries the current root CA). This is an OS-level write refusal, not a code fault: on Windows exclude %USERPROFILE%\\.local\\share\\billion-context\\ from antivirus/Defender real-time scanning first (#3823); the rebuild retries on the next startup.`,
+            `[ca] cannot rebuild ${file} (${String(err).slice(0, 200)}) — continuing with the EXISTING bundle (it still carries the current root CA). This is an OS-level write refusal, not a code fault — on Windows check the Node runtime's integrity label FIRST (icacls \"<path-to-node.exe>\"; a Low label is refused for Medium-labeled files even with correct ACLs, #5154), then antivirus/Defender exclusions for %USERPROFILE%\\.local\\share\\billion-context\\ (#3823); the rebuild retries on the next startup.`,
         );
     }
 }

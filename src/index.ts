@@ -11,6 +11,7 @@
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { main } from "./cli.js";
+import { startupFailureHints, warnIfLowIntegrityRuntime } from "./integrity-label.ts";
 
 function invokedAsScript(): boolean {
     const argv1 = process.argv[1];
@@ -29,24 +30,10 @@ function invokedAsScript(): boolean {
     return self === invoked;
 }
 
-// #5103: "failed to start" with only the raw error dump left users digging
-// through %TEMP% logs for hours — an EPERM/EACCES here is an OS-level write
-// refusal (AV lock, integrity control, boot-time components), so say what
-// class it is and where the fix usually lives, before exiting.
-function startupFailureHints(err: unknown): string | undefined {
-    const code = err instanceof Error ? (err as NodeJS.ErrnoException).code : undefined;
-    if (code === "EPERM" || code === "EACCES") {
-        return [
-            "bili: startup failed because the OS refused a file operation (a permission/lock issue, not a code fault):",
-            "      - Windows: exclude %USERPROFILE%\\.local\\share\\billion-context\\ from antivirus/Defender real-time scanning (CONFIGURATION.md, AV exclusions); OneDrive placeholder files under the profile dir cause the same refusal.",
-            "      - Windows: low-integrity or sandboxed launcher processes hit this via integrity control even with correct ACLs (#3823).",
-            "      - Transient boot-time lockers clear on their own — retrying after a minute often succeeds.",
-        ].join("\n");
-    }
-    return undefined;
-}
-
 if (invokedAsScript()) {
+    // #5154: probe the runtime's NTFS integrity label once, before any
+    // startup write can die on it — fire-and-forget, never gates startup.
+    warnIfLowIntegrityRuntime();
     main().catch((err) => {
         console.error("bili: failed to start:", err);
         const hints = startupFailureHints(err);
