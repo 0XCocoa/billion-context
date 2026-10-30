@@ -112,6 +112,18 @@ import { currentContextObservation, CALIBRATION_CLAMP_MAX, CALIBRATION_CLAMP_MIN
  */
 
 const PERSIST_VERSION = 3;
+// #5188: wall-clock cooldown between sidecar reopen attempts (see
+// tryRecoverSidecar). A fixed constant — no config surface (#5140): the
+// first attempt already failed once, so 30 s of spacing bounds the retry
+// cost while still healing an fd-spike-class outage within one agent turn.
+const SHADOW_REOPEN_COOLDOWN_MS = 30_000;
+let shadowReopenCooldownMsOverride: number | null = null;
+
+/** Test seam: shrink/restore the #5188 sidecar-reopen cooldown (null = default).
+ *  Mirrors setSqliteEnginesUnavailableForTests — always reset by the tests. */
+export function setShadowReopenCooldownMsForTests(ms: number | null): void {
+    shadowReopenCooldownMsOverride = ms;
+}
 /** Dotfile (invisible to the kernel's .json walk): written after the first
  *  successful #286 migration pass so later boots skip the scan entirely. */
 const MIGRATION_MARKER = ".bili-migration-286.done";
@@ -307,6 +319,13 @@ export function fileNameMatchesId(base: string, id: string, protocol?: string, u
  *  public API predates the extraction and is kept stable for session.ts /
  *  server.ts / export.ts. */
 export class SessionStore {
+    /** #5188: args of the SYNCHRONOUS first-open path only. When that path ran
+     *  and failed, the save path retries maybeOpen on a cooldown; intentional
+     *  opt-outs (persistence off, encryption active) and the mysql async attach
+     *  never record args, so they keep their documented one-shot posture. */
+    private readonly syncSidecarOpen: { legacyLoad: (rec: unknown) => LegacySessionLike | null } | null = null;
+    private sidecarReopenNextAttemptAt = 0;
+
     readonly enabled: boolean;
     private readonly sessionsDir: string;
     private readonly store: StateStore<PersistedSession>;
@@ -495,9 +514,19 @@ export class SessionStore {
             });
             this.shadow = undefined;
         } else {
-            this.shadow = this.enabled && !unifiedBlockedByEncryption
-                ? (UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined)
-                : undefined;
+            if (this.enabled && !unifiedBlockedByEncryption) {
+                // #5188: remember the open args when this sync attempt actually
+                // runs, so a failure here can be retried from the save path.
+                this.syncSidecarOpen = { legacyLoad };
+                this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+                if (this.shadow === undefined) {
+                    // #5188: first failed attempt stamps the gate with the SAME
+                    // cooldown the retries will use (the test seam shrinks both).
+                    this.sidecarReopenNextAttemptAt = Date.now() + (shadowReopenCooldownMsOverride ?? SHADOW_REOPEN_COOLDOWN_MS);
+                }
+            } else {
+                this.shadow = undefined;
+            }
         }
         this.store = new StateStore<PersistedSession>({
             dir: this.sessionsDir,
@@ -2580,6 +2609,7 @@ export class SessionStore {
             return;
         }
         if (!this.enabled) return;
+        this.tryRecoverSidecar(); // #5188: dirty activity is the "still wanted" signal for a lost sidecar
         const id = session.id;
         this.saveBuilders.set(id, this.guardedBuild(session));
         const existing = this.saveTimers.get(id);
@@ -2689,6 +2719,29 @@ export class SessionStore {
         session.blockContents = lazy;
     }
 
+    /** #5188: recover a sidecar whose FIRST synchronous open died on a
+     *  transient OS error (fd exhaustion under test/CI load, momentary
+     *  disk-full, a spike of EBUSY). Before this, one failure at
+     *  construction time degraded the whole process for its lifetime and the
+     *  fork raw-tail rebuild failed closed at replicasAvailable() (#5140's
+     *  409s). The save path is the natural "this store is still wanted"
+     *  signal: one maybeOpen per cooldown window, boolean-gated per save.
+     *  maybeOpen itself never throws (it warns and returns null), so this
+     *  cannot break the never-throw save contract. */
+    private tryRecoverSidecar(): void {
+        const args = this.syncSidecarOpen;
+        if (!args || this.shadow !== undefined) return;
+        const now = Date.now();
+        if (now < this.sidecarReopenNextAttemptAt) return;
+        const cooldown = shadowReopenCooldownMsOverride ?? SHADOW_REOPEN_COOLDOWN_MS;
+        this.sidecarReopenNextAttemptAt = now + cooldown;
+        this.shadow = UnifiedShadow.maybeOpen(this.sessionsDir, process.env, args.legacyLoad, fileStorageUnified(), fileStorageWalJournalSizeLimit(), fileStorageBackend()) ?? undefined;
+        if (this.shadow !== undefined) {
+            this.log("info", "[storage] unified sidecar recovered after a transient open failure — unified surfaces resume without a restart (#5188)");
+            return;
+        }
+    }
+
     /** Synchronous flush for a single session. Used on memory eviction so a
      *  dirty evicted session is not lost. Sync because eviction runs in the
      *  sync getSession path; a single small write is acceptable.
@@ -2696,6 +2749,7 @@ export class SessionStore {
      *  failure for a never-persisted session or it is lost permanently). */
     flushSync(session: Session): boolean {
         if (!this.saveContentStore(session)) return false;
+        this.tryRecoverSidecar(); // #5188: eviction-time flushes are also a recovery opportunity
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
             // #3133: same subsume rule as writeNow.
             this.writerOffPending.delete(session.id);
