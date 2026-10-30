@@ -22,7 +22,7 @@
  */
 
 import { log as loggerLog } from "../logger.js";
-import { planIngest, planIngestDelta, loadLegacyView, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
+import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
@@ -36,6 +36,15 @@ import type { MessageRow, MessageRefContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 export const MAX_CONSECUTIVE_FAILURES = 3;
+
+/** Bound transient CAS strings during normal cold loads, not the retained history. */
+const VIEW_READ_BATCH_SIZE = 32;
+
+interface ResidentFields {
+    header: { requests: number; nextBlockId: number; activeBlockCount: number; mappedRefCount: number };
+    metadata?: Record<string, unknown>;
+    blockContents?: Map<string, { one: BlockView | null; full: BlockView }>;
+}
 
 /** #3133: read-back verification cadence — the verify leg (full read-back +
  *  double shadowDigest) is O(log) per save, while the drift it guards is a
@@ -555,26 +564,63 @@ export class UnifiedShadow {
     /** Loads the unified view of one session (full mode read path).
      *  Returns null on miss — the caller falls back to the legacy file. */
     viewFor(id: string): LegacySessionLike | null {
-        if (this.sync === null) return null;
+        const store = this.sync;
+        if (store === null) return null;
         if (this.stats.disabled) return null;
         try {
-            const sessionRow = this.sync.getSessionRow(id);
-            if (!sessionRow) return null;
-            const rows = {
-                session: sessionRow,
-                messages: this.sync.getMessages(id),
-                blocks: this.sync.getBlocks(id),
-                deadRefs: this.sync.getDeadRefs(id),
-                refs: this.sync.getRefs(id),
-            };
-            // The view's `state` object carries every MERGE_STATE_FIELDS key by
-            // construction; the declared Record<string, unknown> just needs a
-            // widening cast to reach LegacySessionLike.
-            const unified = loadLegacyView(rows) as LegacySessionLike;
+            const unified = store.readSnapshot(() => {
+                const sessionRow = store.getSessionRow(id);
+                if (!sessionRow) return null;
+                const builder = new LegacyViewBuilder(sessionRow, store.getRefs(id), store.getDeadRefs(id));
+                for (let offset = 0; ; offset += VIEW_READ_BATCH_SIZE) {
+                    const blocks = store.getBlocks(id, { limit: VIEW_READ_BATCH_SIZE, offset });
+                    builder.addBlocks(blocks);
+                    if (blocks.length < VIEW_READ_BATCH_SIZE) break;
+                }
+                for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
+                    builder.addMessages(store.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
+                }
+                // The builder preserves every MERGE_STATE_FIELDS key; its
+                // generic state declaration only needs widening here.
+                return builder.finish() as LegacySessionLike;
+            });
+            if (!unified) return null;
             warnTailGaps(id, unified as unknown as { tailGaps?: number });
             return unified;
         } catch (err) {
             loggerLog("warn", `[storage] unified load failed for ${id} (${String(err)}) — falling back to the legacy file`);
+            return null;
+        }
+    }
+
+    /** Lazy resident fields share the same source header without rebuilding a session. */
+    readResidentFieldsFor(id: string, fields: { metadata?: boolean; blockContents?: boolean }): ResidentFields | null {
+        const store = this.sync;
+        if (store === null || this.stats.disabled) return null;
+        try {
+            return store.readSnapshot(() => {
+                const header = store.getLoadHeader(id);
+                if (!header) return null;
+                const result: ResidentFields = { header };
+                if (fields.metadata) {
+                    const json = store.getMetadataJson(id);
+                    if (json === null) return null;
+                    result.metadata = JSON.parse(json) as Record<string, unknown>;
+                }
+                if (fields.blockContents) {
+                    const contents: NonNullable<ResidentFields["blockContents"]> = new Map();
+                    for (let offset = 0; ; offset += VIEW_READ_BATCH_SIZE) {
+                        const blocks = store.getBlockContents(id, { limit: VIEW_READ_BATCH_SIZE, offset });
+                        appendBlockContents(contents, blocks);
+                        if (blocks.length < VIEW_READ_BATCH_SIZE) break;
+                    }
+                    mergeOrphanBlockContents(contents, store.getOrphansJson(id));
+                    result.blockContents = contents;
+                }
+                return result;
+            });
+        } catch (err) {
+            loggerLog("warn", `[storage] resident field load failed for ${id} (${String(err)}) — falling back to the legacy file`);
             return null;
         }
     }
@@ -1041,15 +1087,21 @@ export class UnifiedShadow {
             if (this.stats.disabled) return null;
             try {
                 const backend = this.backend!;
-                const sessionRow = await backend.getSessionRow(id);
-                if (!sessionRow) return null;
-                const loaded = loadLegacyView({
-                    session: sessionRow,
-                    messages: await backend.getMessages(id),
-                    blocks: await backend.getBlocks(id),
-                    deadRefs: await backend.getDeadRefs(id),
-                    refs: await backend.getRefs(id),
-                }) as LegacySessionLike;
+                const loaded = await backend.readSnapshot(async (reader) => {
+                    const sessionRow = await reader.getSessionRow(id);
+                    if (!sessionRow) return null;
+                    const builder = new LegacyViewBuilder(sessionRow, await reader.getRefs(id), await reader.getDeadRefs(id));
+                    for (let offset = 0; ; offset += VIEW_READ_BATCH_SIZE) {
+                        const blocks = await reader.getBlocks(id, { limit: VIEW_READ_BATCH_SIZE, offset });
+                        builder.addBlocks(blocks);
+                        if (blocks.length < VIEW_READ_BATCH_SIZE) break;
+                    }
+                    for (let offset = 0; offset < builder.messageSeqs.length; offset += VIEW_READ_BATCH_SIZE) {
+                        builder.addMessages(await reader.getMessages(id, { seqs: builder.messageSeqs.slice(offset, offset + VIEW_READ_BATCH_SIZE) }));
+                    }
+                    return builder.finish() as LegacySessionLike;
+                });
+                if (!loaded) return null;
                 warnTailGaps(id, loaded as unknown as { tailGaps?: number });
                 return loaded;
             } catch (err) {

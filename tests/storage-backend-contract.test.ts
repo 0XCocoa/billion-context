@@ -296,6 +296,15 @@ test("mysql lane: contract surface against MySQL 8.0", { skip: MYSQL_DSN.length 
     const rows2 = await backend.getMessages(sid);
     assert.equal(rows2.length, 2, "no duplicate rows on identical re-ingest");
 
+    await backend.readSnapshot(async (reader) => {
+        assert.equal((await reader.getSessionRow(sid))!.sessionId, sid);
+        assert.deepEqual(await reader.getMessages(sid, { seqs: [] }), []);
+        const selected = await reader.getMessages(sid, { seqs: [rows2[1]!.seq] });
+        assert.equal(selected.length, 1);
+        assert.equal(selected[0]!.content, rows2[1]!.content);
+        assert.deepEqual(await reader.getBlocks(sid, { limit: 1 }), []);
+    });
+
     // fork clone (#4316 PR3/3, #4911): the same contract surface the shadow
     // async twins route into on the real fork lane — semantics must match
     // the sqlite lane's dedicated test line for line.
