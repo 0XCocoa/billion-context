@@ -2720,50 +2720,22 @@ export class SessionStore {
                 // can only ride along, never be missing, so the spill gate's
                 // equality check against the CURRENT epoch stays conservative.
                 const proofRevision = session.revisionEpoch;
-                let innerDrained = false;
                 let settledOk = false;
                 try {
                     this.guardedBuild(session)();
                     this.maybeCutForkBase(session);
-                    // #3135 ①/#3818: the 3-strike may have fired INSIDE that
-                    // build (shadow.record's catch disables the sidecar after
-                    // consecutive failures). writerOffActive() turns false for
-                    // the NEXT save — but this very session currently exists
-                    // on NEITHER copy (index got no rows, envelope was never
-                    // armed). Land one synchronous JSON write NOW via the
-                    // kernel store so the disabling tick always closes with
-                    // the data on the durable file copy.
-                    if (this.shadow && this.shadow.stats.disabled) {
-                        this.log("warn", `[persist] unified sidecar disabled mid-build for ${session.id} — landing an immediate JSON envelope write (#3135 ①)`);
-                        const innerProof = session.revisionEpoch;
-                        const build = this.guardedBuild(session);
-                        this.saveWritesInFlight.add(session.id);
-                        void this.store.writeNow(session.id, build)
-                            .then(() => {
-                                this.stampOwnWrite(session.id);
-                                this.noteDurable(session.id, innerProof);
-                                this.lastSaveLanded.set(session.id, true);
-                                this.runIdleSpillIfIdle(session.id);
-                                innerDrained = true;
-                                this.drainFlushWaiters(session.id, true);
-                            })
-                            .catch(() => {
-                                // Errors surface through the kernel write chain's own logging.
-                                this.lastSaveLanded.set(session.id, false);
-                                innerDrained = true;
-                                this.drainFlushWaiters(session.id, false);
-                            })
-                            .finally(() => { this.saveWritesInFlight.delete(session.id); });
-                    } else {
-                        // #4788 D2: the index-only build landed synchronously —
-                        // run the same settle protocol as a kernel-write land
-                        // (invariant #5: this routing path gets equivalent
-                        // drop behavior, gated identically).
-                        this.noteDurable(session.id, proofRevision);
-                        this.lastSaveLanded.set(session.id, true);
-                        this.runIdleSpillIfIdle(session.id);
-                        settledOk = true;
-                    }
+                    // #4788 D2: the index-only build landed synchronously —
+                    // run the same settle protocol as a kernel-write land
+                    // (invariant #5: this routing path gets equivalent
+                    // drop behavior, gated identically). The JSON-envelope
+                    // safety valve for a mid-build disable (#3135 ①) was
+                    // removed together with the 3-strike breaker itself
+                    // (2026-10-30 owner policy: index writes are never
+                    // abandoned, jsonWriter=off accepts index-only persistence).
+                    this.noteDurable(session.id, proofRevision);
+                    this.lastSaveLanded.set(session.id, true);
+                    this.runIdleSpillIfIdle(session.id);
+                    settledOk = true;
                     // #3818 writerOff safety valve REMOVED (#4216/#4242):
                     // the orphan/reap shape is now representable — its
                     // contents ride sessions.orphans_json in the same
@@ -2776,9 +2748,7 @@ export class SessionStore {
                     // without process-level handlers; the next markDirty retries.
                     this.log("error", `[persist] writerOff coalesced build failed for ${session.id}: ${String(err)}`);
                 } finally {
-                    if (!innerDrained) {
-                        this.drainFlushWaiters(session.id, settledOk);
-                    }
+                    this.drainFlushWaiters(session.id, settledOk);
                 }
             };
             this.writerOffPending.set(session.id, run);
@@ -3273,11 +3243,13 @@ export class SessionStore {
         return this.saveTimers.has(id) || this.writerOffPending.has(id);
     }
 
-    /** Phase 3 (#2960): the JSON envelope is skipped only while the sidecar
-     *  is both configured off AND actually alive — a mid-run sidecar death
-     *  (3-strike disable) automatically resumes file writes. */
+    /** Phase 3 (#2960): the JSON envelope is skipped while the operator asked
+     *  for index-only persistence AND the sidecar opened. Static decision:
+     *  the 3-strike breaker that used to re-arm envelope writes mid-run was
+     *  removed (2026-10-30 owner policy — index writes are never abandoned,
+     *  so there is nothing to fall back FROM anymore). */
     private writerOffActive(): boolean {
-        return this.jsonWriterOff && this.shadow !== undefined && !this.shadow.stats.disabled;
+        return this.jsonWriterOff && this.shadow !== undefined;
     }
 
     /** #4323: per-session envelope freeze (escalated structural drift, see

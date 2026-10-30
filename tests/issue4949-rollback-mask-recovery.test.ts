@@ -15,14 +15,13 @@
  *      SQLite auto-abort semantics.
  *
  *   B. PERMANENT BREAKER — src/storage/shadow.ts's 3-strike circuit breaker
- *      had no recovery path: once stats.disabled flipped, every facade
- *      missed until process restart, even after storage healed. Now each
- *      REENABLE_PROBE_COOLDOWN_MS window lets the next save run one
- *      writability probe (single-row committed write through the production
- *      path); success clears the breaker and the triggering record ingests
- *      normally. Consistency before unified reads resume relies on the
- *      load-side staleness guard (envelope savedAt > index row) + the next
- *      full ingest — asserted indirectly by the final viewFor check.
+ *      used to have no recovery path: once stats.disabled flipped, every
+ *      facade missed until process restart, even after storage healed. The
+ *      breaker itself is GONE now (owner policy 2026-10-30: index writes are
+ *      NEVER abandoned — "100 real-world failure shapes", not just 3): every
+ *      save attempts the index write regardless of prior failures, errors
+ *      still surface to the caller (the JSON envelope serves meanwhile), and
+ *      healing needs no probe or cooldown — the next save simply lands.
  */
 
 import { test } from "node:test";
@@ -32,7 +31,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { openSqliteDatabase, setDatabaseSyncFactoryForTests, setPreferredSqliteEngineForTests, type NodeSqliteDatabase } from "../src/storage/driver.ts";
-import { UnifiedShadow, REENABLE_PROBE_COOLDOWN_MS } from "../src/storage/shadow.ts";
+import { UnifiedShadow } from "../src/storage/shadow.ts";
 import type { LegacySessionLike } from "../src/storage/ingest.ts";
 import { setLogCapture } from "../src/logger.ts";
 import type { CoreMessage } from "acp-kernel";
@@ -272,7 +271,7 @@ test("#4949 A2: nested transactions roll back cleanly on a constraint failure", 
 //    triggering record lands in the unified store.
 // ---------------------------------------------------------------------------
 
-test("#4949 B: disabled sidecar recovers via cooldown-gated writability probe", () => {
+test("#4949 B: a failing sidecar never self-disables — every save retries, healing is instant", () => {
     const dir = tmpDir("breaker");
     const dbPath = path.join(dir, "index.db");
     try {
@@ -289,45 +288,43 @@ test("#4949 B: disabled sidecar recovers via cooldown-gated writability probe", 
             assert.equal(stats(shadow).disabled, false);
             assert.ok(stats(shadow).ingests >= 1, "warm ingest must land");
 
-            // Storage exhausts: three consecutive failures trip the breaker.
+            // Storage exhausts: three consecutive failures surface loudly —
+            // but NOTHING disables: index writes are never abandoned (the
+            // 3-strike breaker was removed per owner policy 2026-10-30).
             flaky.unhealthy = true;
             for (let i = 1; i <= 3; i++) {
                 shadow.record(mkLegacy("s1", Array.from({ length: i + 1 }, (_, j) => msg(j))));
             }
-            assert.equal(stats(shadow).disabled, true, "three consecutive failures disable the sidecar");
+            assert.equal(stats(shadow).disabled, false, "consecutive failures must NOT disable the sidecar any more");
             const lastErr = stats(shadow).lastError ?? "";
             assert.match(lastErr, /disk is full/, `status wire must carry the real cause: ${lastErr}`);
             assert.doesNotMatch(lastErr, /cannot rollback/, `masked error reached the status wire: ${lastErr}`);
-            const beginsAfterDisable = flaky.beginAttempts;
-            assert.ok(beginsAfterDisable >= 3, "each failed record attempted a real BEGIN");
 
-            // Cooldown gate: rapid saves must NOT hammer the broken store —
-            // exactly ONE probe until the window elapses.
+            // Rapid saves keep retrying — nothing is muted and nothing is
+            // gated: every save still reaches the broken store (each failed
+            // record costs >= 1 real BEGIN; the store may internally
+            // re-enter its guarded BEGIN/SAVEPOINT cycle before surfacing).
+            const beginsBeforeRapid = flaky.beginAttempts;
             shadow.record(mkLegacy("s1", [msg(0), msg(1)]));
-            assert.equal(flaky.beginAttempts, beginsAfterDisable + 1, "first save after disable runs one probe");
             shadow.record(mkLegacy("s1", [msg(0), msg(1)]));
-            shadow.record(mkLegacy("s1", [msg(0), msg(1)]));
-            assert.equal(flaky.beginAttempts, beginsAfterDisable + 1, "further saves stay quiet inside the cooldown window");
-            assert.equal(stats(shadow).disabled, true, "failed probe keeps the breaker armed");
+            const delta = flaky.beginAttempts - beginsBeforeRapid;
+            assert.ok(delta >= 2 && delta <= 8, `both rapid saves must attempt real index writes (saw ${delta} BEGINs)`);
+            // The facade keeps working through the whole outage (shadow mode
+            // serves JSON reads regardless; full mode's unified reads are
+            // unaffected by ingest failures by design of readsUnified).
+            assert.equal(stats(shadow).disabled, false, "still not disabled after rapid failing saves");
+            assert.equal(captured.filter((e) => e.msg.includes("RE-ENABLED")).length, 0, "no RE-ENABLED surface may exist any more");
 
-            // Operator frees space: the store heals. The next save after the
-            // window elapses probes once, succeeds, re-enables — and the
-            // triggering record ingests immediately.
-            (shadow as unknown as { nextReenableProbeAt: number }).nextReenableProbeAt = 0;
+            // Operator frees space: the store heals. NO probe, NO cooldown —
+            // the very next save lands in the index straight away.
             flaky.unhealthy = false;
             const ingestsBefore = stats(shadow).ingests;
             shadow.record(mkLegacy("s1", Array.from({ length: 7 }, (_, j) => msg(j))));
-            assert.equal(stats(shadow).disabled, false, "successful probe re-enables the sidecar");
-            assert.ok(stats(shadow).ingests > ingestsBefore, "the triggering record must land right away");
-            const view = shadow.viewFor("s1");
-            assert.ok(view, "unified reads must work again");
-            assert.ok(
-                view.lastMessages?.some((m) => (m as { text?: string }).text === "hello 6") ?? false,
-                "the recovered ingest carries the newest tail",
-            );
-
-            const reenabled = captured.filter((e) => e.level === "info" && e.msg.includes("RE-ENABLED"));
-            assert.equal(reenabled.length, 1, "exactly one re-enable log line");
+            assert.ok(stats(shadow).ingests > ingestsBefore, "the post-heal record lands immediately");
+            // The last observed failure stays visible for operators (there is
+            // no auto-cleanup of the error surface any more) — what is gone
+            // is the ABANDONMENT: the next write already landed above.
+            assert.match(stats(shadow).lastError ?? "", /disk is full/, "the error surface still names the cause");
         } finally {
             stop();
             shadow.close();
@@ -340,11 +337,13 @@ test("#4949 B: disabled sidecar recovers via cooldown-gated writability probe", 
 });
 
 // ---------------------------------------------------------------------------
-// C. The cooldown constant is the single knob behind the gate — pin its
-//    magnitude so a future "tweak" cannot silently turn the probe into a
-//    hammer (or a decade-long dead store).
+// C. The breaker itself must not come back: there is no self-disable, no
+//    cooldown constant, no probe state anywhere in the shadow module.
 // ---------------------------------------------------------------------------
 
-test("#4949 C: re-enable cooldown stays at the documented 5-minute cadence", () => {
-    assert.equal(REENABLE_PROBE_COOLDOWN_MS, 5 * 60 * 1000);
+test("#4949 C: the 3-strike breaker is gone for good (no re-disable surface left)", () => {
+    const src = fs.readFileSync(path.join(import.meta.dirname ?? ".", "..", "src", "storage", "shadow.ts"), "utf8");
+    assert.doesNotMatch(src, /REENABLE_PROBE_COOLDOWN_MS/, "no re-enable cooldown constant may exist");
+    assert.doesNotMatch(src, /nextReenableProbeAt/, "no probe-state field may exist");
+    assert.match(src, /NEVER gives up on index writes/, "the no-abandonment policy is documented at the top of the module");
 });

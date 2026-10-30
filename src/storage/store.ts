@@ -417,14 +417,6 @@ export class UnifiedStore {
      * verdict cache onto the post-checkpoint stats so the next boot skips
      * the rescan. Never true while a check is still in flight or failed. */
     private lastIntegrityOk = false;
-    /** #5108/#4816: a completed check said the file set is CORRUPT — a clean
-     * close refreshes the FAIL verdict onto post-checkpoint stats so the
-     * next boot's cached-fail path fails fast (loud degrade) instead of
-     * rescan-looping
-     * (a clean close moves the WAL, which would otherwise invalidate the
-     * cache key and send a large corrupt store back to unverified forever).
-     * Outranks lastIntegrityOk at close time. */
-    private lastIntegrityFailDetail: string | null = null;
 
     private constructor(db: SqliteDatabase, engine: SqliteEngineName, engineSource: SqliteEngineSource, lockPath: string | null, foreignLockHolder: { pid: number } | null, dbPath: string) {
         this.db = db;
@@ -457,11 +449,6 @@ export class UnifiedStore {
         // of it (no check, no cache IO).
         let integrityOk = false;
         const mode = integrityModeFor(path);
-        if (mode.kind === "cached-fail") {
-            recordIntegrityOutcome(path, false, 0, mode.detail);
-            db.close();
-            throw new StorageIntegrityError(path, mode.detail);
-        }
         if (mode.kind === "cached-ok") {
             recordIntegrityOutcome(path, true, 0, "verdict cache hit (file set unchanged since the last check)");
             integrityOk = true;
@@ -489,10 +476,9 @@ export class UnifiedStore {
                 db.close();
                 const detail = sqliteCorruptionDetail(err);
                 if (detail !== null) {
-                    // #4626-era owner decision: nothing is renamed away — cache
-                    // the FAIL verdict FIRST so every later open fails fast
-                    // without re-running the scan.
-                    writeIntegrityCache(path, false, detail.slice(0, 400));
+                    // 2026-10-30 owner policy: this FRESH in-boot finding REFUSES
+                    // this start, but nothing is persisted as a boot-blocker —
+                    // the next start re-scans and decides from fresh evidence.
                     throw new StorageIntegrityError(path, detail.slice(0, 400));
                 }
                 throw err;
@@ -500,8 +486,10 @@ export class UnifiedStore {
             const durationMs = Date.now() - started;
             recordIntegrityOutcome(path, verdict === "ok", durationMs, verdict === "ok" ? undefined : verdict.slice(0, 400));
             if (verdict !== "ok") {
+                // Same policy as the throwing-scan branch above: refuse THIS boot
+                // on fresh evidence, persist nothing — every future boot
+                // rechecks with its own live scan.
                 db.close();
-                writeIntegrityCache(path, false, verdict.slice(0, 400));
                 throw new StorageIntegrityError(path, verdict.slice(0, 400));
             }
             writeIntegrityCache(path, true);
@@ -594,10 +582,10 @@ export class UnifiedStore {
         if (integrityOk) store.noteIntegrityOk();
         // #4609: a large store's cache-miss check runs post-open on a second
         // read-only connection — open() returns immediately; the verdict
-        // lands in runtime-status and the cache (a cached failure makes the
-        // NEXT open fail fast and REFUSE TO START — no automatic file moves,
-        // #4175/#4626-era decision chain to 2026-10-30: no degradation).
-        if (mode.kind === "async") scheduleBackgroundIntegrityCheck(path, (ok, detail) => { if (ok) store.noteIntegrityOk(); else if (detail !== undefined) store.noteIntegrityFail(detail); });
+        // lands in runtime-status as an ALARM ONLY (2026-10-30 owner policy:
+        // a running store's background verdict never refuses future boots —
+        // each next boot re-scans fresh; no automatic file moves, #4175).
+        if (mode.kind === "async") scheduleBackgroundIntegrityCheck(path, (ok) => { if (ok) store.noteIntegrityOk(); });
         return store;
     }
 
@@ -626,12 +614,6 @@ export class UnifiedStore {
         }
     }
 
-    /** #5108/#4816: mirror of noteIntegrityOk for a completed FAIL verdict —
-     * see lastIntegrityFailDetail for why the close-time refresh needs it. */
-    noteIntegrityFail(detail: string): void {
-        this.lastIntegrityFailDetail = detail;
-    }
-
     close(): void {
         // #3250: converge the WAL before releasing the handle so a clean exit
         // leaves nothing for the next boot's recovery to replay. Same isolation
@@ -643,15 +625,13 @@ export class UnifiedStore {
             loggerLog("warn", `[storage] WAL checkpoint on close failed: ${String(err)}`);
         }
         this.db.close();
-        // #4609: a clean close of a verified store refreshes the verdict
-        // cache onto the post-checkpoint stats — the normal restart path then
-        // skips the rescan. #5108/#4816: the same refresh carries a FAIL
-        // verdict (fail outranks ok — never cache ok for a corrupt file).
-        // Deferred while a background check is still in flight (its own
-        // completion writes the cache). Best-effort.
+        // #4609: a clean close of a VERIFIED store refreshes the PASS memo onto
+        // post-checkpoint stats so the next boot skips the rescan. FAIL verdicts
+        // are alarm-only by owner policy (2026-10-30) and are never cached,
+        // so there is nothing else to carry here. Deferred while a background
+        // check is still in flight (its own completion writes the cache).
         if (!backgroundIntegrityInflightForTests(this.dbPath)) {
-            if (this.lastIntegrityFailDetail !== null) writeIntegrityCache(this.dbPath, false, this.lastIntegrityFailDetail);
-            else if (this.lastIntegrityOk) writeIntegrityCache(this.dbPath, true);
+            if (this.lastIntegrityOk) writeIntegrityCache(this.dbPath, true);
         }
         // #4175: release the ownership lockfile on a clean close so the next
         // open in another process is not told a dead pid holds it. When a

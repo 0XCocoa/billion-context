@@ -195,7 +195,7 @@ test("#4816 shadow: throwing corruption leaves every file UNTOUCHED and REFUSES 
     }
 });
 
-test("#4816 fail-fast: a second open after proven corruption does not rescan", { skip: SKIP_NO_ENGINE }, () => {
+test("#4816 repeat boots decide from FRESH evidence every time — no FAIL verdict is ever persisted", { skip: SKIP_NO_ENGINE }, () => {
     const dir = tmpDir();
     try {
         resetIntegrityCheckStateForTests();
@@ -208,14 +208,18 @@ test("#4816 fail-fast: a second open after proven corruption does not rescan", {
         );
         const scansAfterFirst = integrityCheckRunsForTests();
         const cache = readIntegrityCache(p);
-        assert.ok(cache !== null && cache.ok === false, `FAIL verdict cached on throw, got ${JSON.stringify(cache)}`);
-        // Second boot: served from the verdict cache — the typed error again,
-        // ZERO additional scans.
+        assert.ok(
+            cache === null || cache.ok !== false,
+            `a FAIL verdict must never reach the cache any more, got ${JSON.stringify(cache)}`,
+        );
+        // Second boot: no verdict short-circuit exists for failures — the
+        // same file set gets its own live scan and refuses again on the
+        // SAME fresh evidence (owner policy 2026-10-30).
         assert.throws(
             () => UnifiedStore.open(p),
             (err: unknown) => err instanceof StorageIntegrityError && /malformed/.test(err.detail),
         );
-        assert.equal(integrityCheckRunsForTests(), scansAfterFirst, "cached-fail must short-circuit before any quick_check");
+        assert.equal(integrityCheckRunsForTests(), scansAfterFirst + 1, "every boot runs its own fresh check — the second refusal came from evidence, not a cached verdict");
     } finally {
         resetIntegrityCheckStateForTests();
         rmSync(dir, { recursive: true, force: true });
@@ -244,7 +248,7 @@ test("#4816 operator resolution: moving the corrupt set aside unblocks a fresh r
     }
 });
 
-test("#4816 worker facet: a large store's throwing background check caches FAIL across a clean close", { skip: SKIP_NO_ENGINE }, async () => {
+test("#4816 worker facet: a large store's throwing background check is ALARM-ONLY — the next boot still refuses, from its own scan", { skip: SKIP_NO_ENGINE }, async () => {
     const dir = tmpDir();
     try {
         resetIntegrityCheckStateForTests();
@@ -255,13 +259,20 @@ test("#4816 worker facet: a large store's throwing background check caches FAIL 
         const s1 = UnifiedStore.open(p);
         try {
             await waitFor(() => !backgroundIntegrityInflightForTests(p), 15000);
+            // The finding is loud in runtime-status/logs but must NEVER be
+            // written as a boot-blocker (owner policy 2026-10-30).
             const cache = readIntegrityCache(p);
-            assert.ok(cache !== null && cache.ok === false, `FAIL verdict cached by the worker, got ${JSON.stringify(cache)}`);
-            assert.match(cache?.detail ?? "", /malformed/);
+            assert.ok(
+                cache === null || cache.ok !== false,
+                `the background FAIL must not reach the cache, got ${JSON.stringify(cache)}`,
+            );
         } finally {
-            s1.close(); // checkpoint moves the WAL — the refresh must carry the FAIL verdict
+            s1.close();
         }
-        // Next boot: cached-fail → typed error → the open refuses (no rescan).
+        // Next boot: no cached verdict to trust. Drop the async-threshold
+        // override first so this boot checks synchronously — its own fresh
+        // scan finds the corruption and refuses.
+        setIntegritySyncThresholdForTests(null);
         assert.throws(
             () => UnifiedStore.open(p),
             (err: unknown) => err instanceof StorageIntegrityError && /malformed/.test(err.detail),

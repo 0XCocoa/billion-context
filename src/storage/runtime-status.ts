@@ -29,7 +29,7 @@ import { fileStorageAutoDownload, fileStorageJsonWriter, fileStorageUnified, fil
 import { log as loggerLog } from "../logger.js";
 import { safePrefix, safeSuffix } from "../text-safe.js";
 import { resolvedSqliteEngineInfo } from "./driver.js";
-import { MAX_CONSECUTIVE_FAILURES, sqliteOpenFailureHint, type UnifiedShadow } from "./shadow.js";
+import { sqliteOpenFailureHint, type UnifiedShadow } from "./shadow.js";
 import type { StorageMode } from "./shadow.js";
 
 /** The driver's no-engine error text — one predicate, used wherever the
@@ -196,11 +196,6 @@ function shortenError(err: string): string {
 }
 
 function degradeReason(): string {
-    const sidecar = state.sidecar;
-    if (sidecar && sidecar.stats.disabled) {
-        const last = sidecar.stats.lastError ? shortenError(sidecar.stats.lastError) : "unknown";
-        return `unified store auto-disabled after ${MAX_CONSECUTIVE_FAILURES} consecutive failures (last: ${last})`;
-    }
     // No pinned artifact serves this runtime (below every Node floor, or a Node
     // ABI no prebuild targets), so the engine is refused BEFORE any load and the
     // sidecar open ALSO fails with the generic no-engine error — surface the real
@@ -298,12 +293,11 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
     // never surface as a degrade.
     const intentionalOptOut = state.encryptionBlocked || state.persistDisabled;
     const sidecar = state.sidecar;
-    const disabled = !!sidecar?.stats.disabled;
     // healthy sidecar ⇒ its mode === requested (maybeOpen opens only under
     // shadow/full); anything else means SQLite carries no data right now.
     const effective: "legacy" | "shadow" | "full" =
-        requested !== "legacy" && !intentionalOptOut && sidecar && !disabled ? requested : "legacy";
-    const degraded = requested !== "legacy" && !intentionalOptOut && (sidecar === null || disabled);
+        requested !== "legacy" && !intentionalOptOut && sidecar ? requested : "legacy";
+    const degraded = requested !== "legacy" && !intentionalOptOut && sidecar === null;
     const cd = cooldownState();
     // #3923/#3959: the second-process warning must never freeze — a foreign
     // pid that has since exited is cleared here, at the status read.
@@ -337,8 +331,12 @@ function getStorageRuntimeStatus(): StorageRuntimeStatus {
         bootstrap: state.bootstrap?.status ?? null,
         bootstrapFailure: cd.marker,
         cooldownRemainingMs: cd.remainingMs,
-        sidecarDisabled: disabled,
-        sidecarLastError: sidecar?.stats.disabled ? sidecar.stats.lastError : null,
+        // The breaker that used to self-disable the sidecar (3-strike) was
+        // removed by owner policy 2026-10-30 — index writes are never
+        // abandoned — so this field is permanently false (kept for the
+        // pre-existing API shape).
+        sidecarDisabled: false,
+        sidecarLastError: sidecar?.stats.lastError ?? null,
         indexDbOpenError: state.sidecarOpenError,
         // #3135 ④/#3818: the sampled digest-drift counter — once the index is
         // the default load path (full), drift must be OBSERVABLE, not just a

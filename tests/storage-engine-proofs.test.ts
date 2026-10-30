@@ -341,11 +341,12 @@ test("storage engine: rollback contract — explicit legacy mode serves the iden
 });
 
 // ---------------------------------------------------------------------------
-// SELF-DISABLE: 3 consecutive failures flip reads back to legacy-only.
+// NO SELF-DISABLE (2026-10-30 owner policy): a failing sidecar never
+// self-disables — every save keeps retrying the real index write.
 // ---------------------------------------------------------------------------
 
-test("storage engine: sidecar self-disables after 3 consecutive failures (reads flip legacy)", () => {
-    const dir = tmpdir("bili-engproof-disable-");
+test("storage engine: a failing sidecar NEVER self-disables — writes keep retrying, reads stay unified", () => {
+    const dir = tmpdir("bili-engproof-nodisable-");
     try {
         const shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => {
             throw new Error("synthetic legacy-load failure");
@@ -354,16 +355,21 @@ test("storage engine: sidecar self-disables after 3 consecutive failures (reads 
         assert.equal(shadow.readsUnified, true, "fresh full sidecar must read unified");
         shadow.record({ some: "record" });
         shadow.record({ some: "record" });
-        assert.equal(shadow.readsUnified, true, "2 failures must not disable yet");
         shadow.record({ some: "record" });
-        assert.equal(shadow.stats.disabled, true, "3 consecutive failures must disable the sidecar");
-        assert.equal(shadow.readsUnified, false, "disabled sidecar must not read unified");
-        assert.equal(shadow.viewFor("anything"), null, "disabled sidecar must miss reads");
+        assert.equal(shadow.stats.disabled, false, "no breaker any more — repeated failures must not disable the sidecar (2026-10-30 owner policy)");
+        assert.equal(shadow.readsUnified, true, "a failing sidecar keeps reading unified — it never falls back on its own");
+        assert.match(shadow.stats.lastError ?? "", /synthetic legacy-load failure/, "the failure stays VISIBLE (loud warn), just non-fatal");
+        assert.equal(shadow.viewFor("anything"), null, "reads of a never-ingested id still miss — visibility, not mode");
         shadow.close();
+
+        // The breaker machinery itself must be gone from the source.
+        const src = fs.readFileSync(path.join(import.meta.dirname ?? ".", "..", "src", "storage", "shadow.ts"), "utf8");
+        assert.doesNotMatch(src, /MAX_CONSECUTIVE_FAILURES/);
+        assert.doesNotMatch(src, /REENABLE_PROBE_COOLDOWN_MS/);
 
         // The legacy file is unaffected through a plain SessionStore.
         const legacy = loadFolded(path.join(dir, "seed"));
-        assert.ok(legacy, "legacy load broken while the sidecar is disabled");
+        assert.ok(legacy, "legacy load broken while the sidecar is failing");
     } finally {
         rmrf(dir);
     }

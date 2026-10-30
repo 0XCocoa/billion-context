@@ -20,6 +20,7 @@ import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, utimesSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { UnifiedStore, StorageIntegrityError } from "../src/storage/store.js";
+import { setLogCapture } from "../src/logger.ts";
 import {
     integrityCachePath,
     readIntegrityCache,
@@ -82,7 +83,7 @@ test("touching the db file invalidates the cache and forces a recheck", () => {
     }
 });
 
-test("a cached failure fails open with the typed error (the #4175 loud-degrade trigger) without rescanning", () => {
+test("a STALE cached FAIL (older-version leftover) no longer blocks boots — fresh rescan decides (#4609/#5123)", () => {
     resetIntegrityCheckStateForTests();
     setIntegritySyncThresholdForTests(null);
     const dir = tmpDir();
@@ -92,10 +93,23 @@ test("a cached failure fails open with the typed error (the #4175 loud-degrade t
         store.close(); // cache now holds ok for the closed file set
         const cache = readIntegrityCache(dbPath);
         assert.ok(cache !== null);
-        writeFileSync(integrityCachePath(dbPath), JSON.stringify({ ...cache, ok: false, detail: "simulated background failure" }));
+        writeFileSync(integrityCachePath(dbPath), JSON.stringify({ ...cache, ok: false, detail: "simulated older-version failure" }));
+        // Owner policy 2026-10-30: runtime/background findings are alarms, never
+        // boot-blockers. A FAIL verdict left by an OLDER build is treated as a
+        // plain cache miss: loud warn, then a FRESH scan decides.
         const before = integrityCheckRunsForTests();
-        assert.throws(() => UnifiedStore.open(dbPath), (err: unknown) => err instanceof StorageIntegrityError && /simulated background failure/.test(err.detail));
-        assert.equal(integrityCheckRunsForTests(), before, "cached fail threw without running a scan");
+        let warned = "";
+        setLogCapture((_level, m) => { if (m.includes("stale verdicts no longer block boots")) warned = m; });
+        try {
+            const again = UnifiedStore.open(dbPath);
+            again.close();
+        } finally {
+            setLogCapture(null);
+        }
+        assert.ok(warned.length > 0, "the stale FAIL must be called out loudly in the log");
+        assert.equal(integrityCheckRunsForTests(), before + 1, "a fresh scan ran instead of trusting the old verdict");
+        const after = readIntegrityCache(dbPath);
+        assert.equal(after?.ok, true, "the healthy file set re-cached a PASS verdict (fast path restored)");
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }

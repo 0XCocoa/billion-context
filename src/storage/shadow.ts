@@ -16,9 +16,12 @@
  *     env), but the unified index is the load path.
  *
  * Failure policy: sidecar problems must NEVER break the legacy write path.
- * All work is try/catch'd; after MAX_CONSECUTIVE_FAILURES consecutive
- * failures the sidecar disables itself for the process (warn once) — in
- * full mode that also flips reads back to legacy-only.
+ * All work is try/catch'd. The sidecar NEVER gives up on index writes
+ * (2026-10-30 owner policy): an ingest failure is recorded loudly — one warn
+ * per DISTINCT error message, so a stuck failure mode does not spam every
+ * turn's log line — and every subsequent save retries the index write as
+ * usual. No self-disable / circuit breaker exists anymore; the JSON envelope
+ * remains the recovery source either way.
  */
 
 import { log as loggerLog } from "../logger.js";
@@ -34,7 +37,6 @@ import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
 import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
-export const MAX_CONSECUTIVE_FAILURES = 3;
 const VERIFY_BATCH_SIZE = 32;
 
 /** Bound transient CAS strings during normal cold loads, not the retained history. */
@@ -46,14 +48,6 @@ interface ResidentFields {
     blockContents?: Map<string, { one: BlockView | null; full: BlockView }>;
 }
 
-/** #4949: re-enable cadence for the disabled sidecar. The 3-strike breaker used
- *  to be permanent until process restart even after the store healed. Now each
- *  cooldown window lets the NEXT save run one writability probe (a single-row
- *  committed write through the production path); success clears the breaker and
- *  the triggering record ingests normally. Missed saves converge via the
- *  load-side staleness guard (envelope savedAt > index row) + next full ingest,
- *  so no global pre-check is needed before unified reads resume. */
-export const REENABLE_PROBE_COOLDOWN_MS = 5 * 60 * 1000;
 
 /** #3133: read-back verification cadence — the verify leg (full read-back +
  *  double shadowDigest) is O(log) per save, while the drift it guards is a
@@ -115,6 +109,9 @@ interface ShadowStats {
     verifyOk: number;
     verifyDrift: number;
     imports: number;
+    /** Retained on the status wire for panel compatibility. Never set to true
+     *  anymore — the self-disable breaker was removed (2026-10-30 owner policy:
+     *  index writes are never abandoned). Always false. */
     disabled: boolean;
     lastError: string | null;
     /** #3818: records skipped from the mirror because they carry orphan
@@ -176,10 +173,10 @@ export class UnifiedShadow {
      *  Ingest-failure warnings must name it — "staying legacy-only" without a
      *  path left users hunting %TEMP% logs for which file said what. */
     private readonly dbPath: string | null;
+    /** Streak gauge for diagnostics/wire only — it never disables anything
+     *  (the breaker was removed, 2026-10-30 owner policy); resets on the next
+     *  successful ingest. */
     private consecutiveFailures = 0;
-    /** #4949: timestamp until which the disabled sidecar stays quiet; the first
-     *  save after it runs the writability probe (REENABLE_PROBE_COOLDOWN_MS). */
-    private nextReenableProbeAt = 0;
     /** #3133: per-session ingest counters (verify sampling). Per-process
      *  only — nothing persisted, no schema change. */
     private readonly ingestCounts = new Map<string, number>();
@@ -192,20 +189,18 @@ export class UnifiedShadow {
         this.dbPath = dbPath ?? null;
     }
 
-    /** #5103: one ingest failure recorded — the FIRST failure of a streak now
-     *  warns with the file named (before, strikes one and two were silent and
-     *  the user learned of the degradation from missing features, not logs);
-     *  at MAX_CONSECUTIVE_FAILURES the sidecar disables itself, same as before. */
+    /** #5103 / 2026-10-30 owner policy (never abandon index writes): record
+     *  every ingest failure with the file named — but a streak of the SAME
+     *  error message warns once (a permanently broken index must not add a log
+     *  line to every turn), while any NEW message warns immediately. Nothing is
+     *  ever disabled; the next save retries the write unconditionally. */
     private noteIngestFailure(err: unknown): void {
-        this.consecutiveFailures++;
+        const prev = this.stats.lastError ?? "";
         const errStr = String(err);
+        this.consecutiveFailures += 1;
         this.stats.lastError = errStr;
-        if (this.consecutiveFailures === 1) {
-            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${errStr})${sqliteOpenFailureHint(errStr)} — serving from JSON envelopes until it recovers or disables after ${MAX_CONSECUTIVE_FAILURES} consecutive failures`);
-        }
-        if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-            this.stats.disabled = true;
-            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} disabled after ${this.consecutiveFailures} consecutive failures (last: ${errStr})${sqliteOpenFailureHint(errStr)} — staying legacy-only`);
+        if (errStr !== prev) {
+            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${this.consecutiveFailures} in a row; ${errStr})${sqliteOpenFailureHint(errStr)} — the index write will be RETRIED on every subsequent save until it succeeds again (no self-disable; the JSON envelope keeps serving meanwhile)`);
         }
     }
 
@@ -395,9 +390,11 @@ export class UnifiedShadow {
         return new UnifiedShadow(mode, null, legacyLoad ?? (() => null), backend);
     }
 
-    /** True when reads should go unified-first (full mode, sidecar healthy). */
+    /** True when reads should go unified-first (full mode). A failing sidecar
+     *  still serves reads through the drift/lag guards (loadSync watermark +
+     *  #4323 richer-view pick), so ingest health is not part of this gate. */
     get readsUnified(): boolean {
-        return this.mode === "full" && !this.stats.disabled;
+        return this.mode === "full";
     }
 
     // engine/engineSource introspection lives in engineInfo (sqlite-only
@@ -413,25 +410,10 @@ export class UnifiedShadow {
      *  accounting stays honest. */
     record(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
         // #3931 step 3: network backend — the ingest runs on the serial
-        // queue (fire-and-forget; failures feed the same 3-strike disable).
+        // queue (fire-and-forget; failures are logged once per distinct message — never disabled).
         if (this.sync === null) {
             this.enqueueAsyncRecord(record, rawTail, liveCcr);
             return;
-        }
-        // #4949: a disabled sidecar is no longer dead for the process lifetime —
-        // one cooldown-gated writability probe per window; on success the
-        // breaker clears and THIS record falls through to the normal ingest.
-        if (this.stats.disabled) {
-            const now = Date.now();
-            if (now < this.nextReenableProbeAt) return;
-            this.nextReenableProbeAt = now + REENABLE_PROBE_COOLDOWN_MS;
-            try {
-                this.sync.probeWritable();
-            } catch (err) {
-                this.noteProbeFailure(err);
-                return;
-            }
-            this.clearBreaker();
         }
         try {
             const loaded = this.legacyLoad(record);
@@ -570,21 +552,6 @@ export class UnifiedShadow {
         }
     }
 
-    /** #4949: re-enable-probe failure tail — keeps the breaker armed while the
-     *  latest error stays visible on the status wire via stats.lastError. */
-    private noteProbeFailure(err: unknown): void {
-        this.stats.lastError = String(err);
-        loggerLog("debug", `[storage] unified store re-enable probe failed (${String(err)}) — staying disabled, next probe after ${REENABLE_PROBE_COOLDOWN_MS / 60_000}min (#4949)`);
-    }
-
-    /** #4949: clears the 3-strike breaker after a successful writability probe. */
-    private clearBreaker(): void {
-        this.stats.disabled = false;
-        this.stats.lastError = null;
-        this.consecutiveFailures = 0;
-        loggerLog("info", "[storage] unified store RE-ENABLED: writability probe succeeded after disable (#4949); sessions missed during the outage converge via the envelope staleness guard + next full ingest");
-    }
-
     /** #3133 delta ingest attempt for one record's legacy view — returns
      *  true when the O(new-messages) fast path committed. Every doubt
      *  routes to `false` (→ the caller's full ingest); failures here must
@@ -632,7 +599,6 @@ export class UnifiedShadow {
     viewFor(id: string): LegacySessionLike | null {
         const store = this.sync;
         if (store === null) return null;
-        if (this.stats.disabled) return null;
         try {
             const unified = store.readSnapshot(() => {
                 const sessionRow = store.getSessionRow(id);
@@ -662,7 +628,7 @@ export class UnifiedShadow {
     /** Lazy resident fields share the same source header without rebuilding a session. */
     readResidentFieldsFor(id: string, fields: { metadata?: boolean; blockContents?: boolean }): ResidentFields | null {
         const store = this.sync;
-        if (store === null || this.stats.disabled) return null;
+        if (store === null) return null;
         try {
             return store.readSnapshot(() => {
                 const header = store.getLoadHeader(id);
@@ -704,7 +670,6 @@ export class UnifiedShadow {
      *  the sqlite fast lane is unavailable; callers must not guess from null. */
     activeBlockCount(id: string): number | null {
         if (this.sync === null) return null;
-        if (this.stats.disabled) return null;
         try {
             return this.sync.getBlocks(id).filter((b) => b.active).length;
         } catch {
@@ -716,7 +681,6 @@ export class UnifiedShadow {
      *  seen so future loads serve from the unified store. Never throws. */
     importRecord(record: unknown): LegacySessionLike | null {
         if (this.sync === null) return null;
-        if (this.stats.disabled) return null;
         try {
             const legacy = this.legacyLoad(record);
             if (!legacy) return null;
@@ -741,7 +705,6 @@ export class UnifiedShadow {
         this.ingestCounts.delete(id);
         this.driftStreaks.delete(id);
         this.frozenEnvelopeIds.delete(id);
-        if (this.stats.disabled) return;
         try {
             this.sync.deleteSession(id);
         } catch (err) {
@@ -756,31 +719,26 @@ export class UnifiedShadow {
 
     createCheckpoint(cp: Parameters<UnifiedStore["insertCheckpoint"]>[0]): void {
         if (this.sync === null) throw new Error('[storage] sync checkpoint API unavailable on a network backend — use the async twin');
-        this.assertLive();
         this.sync.insertCheckpoint(cp);
     }
 
     listCheckpoints(sessionId?: string): CheckpointRow[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.listCheckpoints(sessionId);
     }
 
     getCheckpoint(cpId: string): CheckpointRow | undefined {
         if (this.sync === null) return undefined;
-        this.assertLive();
         return this.sync.getCheckpoint(cpId);
     }
 
     checkpointState(cpId: string): { stateJson: string; byteLen: number } {
         if (this.sync === null) throw new Error('[storage] sync checkpoint API unavailable on a network backend — use the async twin');
-        this.assertLive();
         return this.sync.checkpointState(cpId);
     }
 
     deleteCheckpoint(cpId: string): boolean {
         if (this.sync === null) return false;
-        this.assertLive();
         return this.sync.deleteCheckpoint(cpId);
     }
 
@@ -788,7 +746,6 @@ export class UnifiedShadow {
      *  ingested). See SessionStore.buildForLoadAll for the race this guards. */
     sessionUpdatedAt(sessionId: string): number | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.sessionUpdatedAt(sessionId);
     }
 
@@ -796,7 +753,6 @@ export class UnifiedShadow {
      *  Used as a checkpoint's seq_at. */
     sessionTipSeq(sessionId: string): number {
         if (this.sync === null) return 0;
-        this.assertLive();
         let tip = 0;
         for (const m of this.sync.getMessages(sessionId)) if (m.seq + 1 > tip) tip = m.seq + 1;
         return tip;
@@ -805,7 +761,6 @@ export class UnifiedShadow {
     /** #3301: message rows for specific ids (+ seq±1 neighbors) — stored
      *  decompositions for fold-anchor backfill after a wire-shape flip. */
     messagesForIds(sessionId: string, msgIds: readonly string[], includeNeighbors: boolean): { seq: number; msgId: string; content: string }[] {
-        this.assertLive();
         if (!this.sync) return []; // network backends cannot serve the sync decomposition lookup (#3931 architecture)
         return this.sync.messagesForIds(sessionId, msgIds, includeNeighbors);
     }
@@ -815,30 +770,26 @@ export class UnifiedShadow {
      *  enumerable. */
     listSessionIds(): string[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.listSessionIds();
     }
 
     /** Identity lookup passthrough (#2960 R2.1). */
     lookupConversation(namespace: string, conversationId: string): string | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.lookupConversation(namespace, conversationId);
     }
 
     /** #3049: O(1) counter probe backing the persist stale-guard fast path.
-     *  Safe on a disabled sidecar? NO — call sites must check stats first
-     *  (this throws like every other pass-through; the guard treats any
-     *  failure as "no fast path" and falls back to the full envelope read). */
+     *  Throws like every other pass-through when the store rejects it; the
+     *  guard treats any failure as "no fast path" and falls back to the full
+     *  envelope read. */
     sessionCounters(sessionId: string): { requests: number; nextBlockId: number } | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.sessionCounters(sessionId);
     }
 
     listConversationBindings(namespace?: string): { namespace: string; conversationId: string; sessionId: string; claimedAt: number }[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.listConversationBindings(namespace);
     }
 
@@ -897,7 +848,6 @@ export class UnifiedShadow {
 
     rawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string }[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.getMessages(sessionId, fromSeqExclusive !== undefined ? { fromSeqExclusive } : undefined).map((m) => ({ seq: m.seq, content: m.content }));
     }
 
@@ -905,7 +855,6 @@ export class UnifiedShadow {
      *  (tail_json.tailSeqs). Null when absent/malformed. */
     tailSeqs(sessionId: string): number[] | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.tailSeqs(sessionId);
     }
 
@@ -918,20 +867,17 @@ export class UnifiedShadow {
     /** #D5-5: identity-only rows (no content bytes) for the render lane. */
     messageIdRows(sessionId: string): { seq: number; msgId: string }[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.messageIdRows(sessionId);
     }
 
     /** #D5-5: content rows outside the covered intervals only. */
     uncoveredRows(sessionId: string, intervals: readonly [number, number][]): (MessageRow & { contentHash: string })[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.uncoveredRows(sessionId, intervals);
     }
 
     tailViewRows(sessionId: string): MessageRow[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.getMessages(sessionId);
     }
 
@@ -940,20 +886,17 @@ export class UnifiedShadow {
      *  compaction pruned the resident window. */
     messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
         if (this.sync === null || refNums.length === 0) return [];
-        this.assertLive();
         return this.sync.messageContentByRefNums(sessionId, refNums);
     }
 
     sessionSummaries(): SessionSummaryRow[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.sessionSummaries();
     }
 
     /** #2960 ③: whole-store CCR read from the sessions row's ccr mirror. */
     getCcr(sessionId: string): MessageContentStore | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.getCcr(sessionId);
     }
 
@@ -963,7 +906,6 @@ export class UnifiedShadow {
      *  falls back to the envelope, exactly like today's sync loadSync). */
     getSessionMetadata(sessionId: string): Record<string, unknown> | null {
         if (this.sync === null) return null;
-        if (this.stats.disabled) return null;
         try {
             return this.sync.getSessionMetadata(sessionId);
         } catch {
@@ -976,7 +918,6 @@ export class UnifiedShadow {
      *  getSessionMetadata. */
     getBlockContents(sessionId: string): import("./store.ts").BlockContentsMap | null {
         if (this.sync === null) return null;
-        if (this.stats.disabled) return null;
         try {
             return this.sync.getBlockContents(sessionId) as import("./store.ts").BlockContentsMap | null;
         } catch {
@@ -990,13 +931,11 @@ export class UnifiedShadow {
      *  or nothing — a stale map would re-bind citations wrongly. */
     seqByRaw(sessionId: string): Map<string, number> | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.seqByRaw(sessionId);
     }
 
     /** #4316 PR3/3: live (non-retired) message row count. */
     liveRowCount(sessionId: string): number {
-        this.assertLive();
         if (this.sync !== null) return this.sync.liveRowCount(sessionId);
         return -1;
     }
@@ -1006,7 +945,6 @@ export class UnifiedShadow {
      *  store is unavailable or the session has no live rows. */
     lastLiveSeq(sessionId: string): number | null {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.lastLiveSeq(sessionId);
     }
 
@@ -1018,7 +956,6 @@ export class UnifiedShadow {
      *  (sync === null) cannot serve this sync facade — the fork lane awaits
      *  cloneSessionRowsAsync instead (#4911). */
     cloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
-        this.assertLive();
         if (this.sync !== null) return this.sync.cloneSessionRows(parentId, childId, throughSeq);
         return false;
     }
@@ -1026,7 +963,6 @@ export class UnifiedShadow {
     /** #2960 R2.2: web list rows (stats/metadata JSON + block aggregates). */
     webSummaryRows(): WebSummaryRow[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.webSummaryRows();
     }
 
@@ -1038,49 +974,41 @@ export class UnifiedShadow {
 
     setSessionExt(sessionId: string, key: string, value: unknown): void {
         if (this.sync === null) return;
-        this.assertLive();
         this.sync.setSessionExt(sessionId, key, value);
     }
 
     getSessionExt(sessionId: string, key: string): unknown {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.getSessionExt(sessionId, key);
     }
 
     listSessionExt(sessionId: string): { key: string; value: unknown; updatedAt: number }[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.listSessionExt(sessionId);
     }
 
     deleteSessionExt(sessionId: string, key?: string): number {
         if (this.sync === null) return 0;
-        this.assertLive();
         return this.sync.deleteSessionExt(sessionId, key);
     }
 
     setKv(namespace: string, key: string, value: unknown): void {
         if (this.sync === null) return;
-        this.assertLive();
         this.sync.setKv(namespace, key, value);
     }
 
     getKv(namespace: string, key: string): unknown {
         if (this.sync === null) return null;
-        this.assertLive();
         return this.sync.getKv(namespace, key);
     }
 
     listKv(namespace?: string, keyPrefix?: string): { namespace: string; key: string; value: unknown; updatedAt: number }[] {
         if (this.sync === null) return [];
-        this.assertLive();
         return this.sync.listKv(namespace, keyPrefix);
     }
 
     deleteKv(namespace: string, key?: string): number {
         if (this.sync === null) return 0;
-        this.assertLive();
         return this.sync.deleteKv(namespace, key);
     }
 
@@ -1101,24 +1029,9 @@ export class UnifiedShadow {
     /** record()'s async port — MUST stay in lockstep with the sync body
      *  above (orphan guard + #3841 reap journal, #3133 watermark delta,
      *  full ingest, #3133 sampled verify + drift latch). Serialized by the
-     *  shadow queue; failures feed the same 3-strike disable. */
+     *  shadow queue; failures feed the same per-message warn — nothing disables (#2432-era breaker removed 2026-10-30). */
     private enqueueAsyncRecord(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
         void this.enqueue(async () => {
-            // #4949: async twin of the sync re-enable probe in record() — MUST
-            // stay in lockstep with it; setKv is the backend's single-row
-            // committed write probe.
-            if (this.stats.disabled) {
-                const now = Date.now();
-                if (now < this.nextReenableProbeAt) return;
-                this.nextReenableProbeAt = now + REENABLE_PROBE_COOLDOWN_MS;
-                try {
-                    await this.backend!.setKv("__bili", "writability-probe", { probedAt: now });
-                } catch (err) {
-                    this.noteProbeFailure(err);
-                    return;
-                }
-                this.clearBreaker();
-            }
             try {
                 const backend = this.backend!;
                 const loaded0 = this.legacyLoad(record);
@@ -1193,7 +1106,6 @@ export class UnifiedShadow {
 
     viewForAsync(id: string): Promise<LegacySessionLike | null> {
         return this.viaAsync(null, () => this.viewFor(id), async () => {
-            if (this.stats.disabled) return null;
             try {
                 const backend = this.backend!;
                 const loaded = await backend.readSnapshot(async (reader) => {
@@ -1222,7 +1134,6 @@ export class UnifiedShadow {
 
     importRecordAsync(record: unknown): Promise<LegacySessionLike | null> {
         return this.viaAsync(null, () => this.importRecord(record), async () => {
-            if (this.stats.disabled) return null;
             try {
                 const legacy = this.legacyLoad(record);
                 if (!legacy) return null;
@@ -1323,7 +1234,6 @@ export class UnifiedShadow {
      *  facade; sqlite delegates to the identical sync body via viaAsync. */
     lastLiveSeqAsync(sessionId: string): Promise<number | null> {
         return this.viaAsync(null, () => this.lastLiveSeq(sessionId), async () => {
-            if (this.stats.disabled) return null;
             try {
                 return await this.backend!.lastLiveSeq(sessionId);
             } catch (err) {
@@ -1337,11 +1247,10 @@ export class UnifiedShadow {
      *  adoption row clone through the backend on network backends; sqlite
      *  delegates to the identical sync body. Serialized on the shadow queue
      *  like every other write twin so it can never race a pending parent
-     *  ingest. A failed or disabled sidecar degrades to the kernel-only
+     *  ingest. A failing sidecar degrades to the kernel-only
      *  fork (false) — the fork itself must never fail for a storage nicety. */
     cloneSessionRowsAsync(parentId: string, childId: string, throughSeq: number): Promise<boolean> {
         return this.viaAsync(false, () => this.cloneSessionRows(parentId, childId, throughSeq), async () => {
-            if (this.stats.disabled) return false;
             try {
                 return await this.enqueue(() => this.backend!.cloneSessionRows(parentId, childId, throughSeq));
             } catch (err) {
@@ -1354,14 +1263,12 @@ export class UnifiedShadow {
     /** Fork publication is strict: clone and initial state land together, or
      * nothing lands. Unlike shadow mirrors, an error cannot mean success. */
     createForkAsync(parentId: string, child: LegacySessionLike): Promise<boolean> {
-        if (this.stats.disabled) throw new Error("fork storage unavailable");
         const initial = planIngest(child);
         if (this.sync !== null) {
             const throughSeq = this.sync.lastLiveSeq(parentId);
             return Promise.resolve(this.sync.cloneSessionRows(parentId, child.id, throughSeq ?? -1, initial));
         }
         return this.enqueue(async () => {
-            if (this.stats.disabled) throw new Error("fork storage unavailable");
             const throughSeq = await this.backend!.lastLiveSeq(parentId);
             return this.backend!.cloneSessionRows(parentId, child.id, throughSeq ?? -1, initial);
         });
@@ -1415,10 +1322,6 @@ export class UnifiedShadow {
             // queue work reports its own failures
         }
         await this.backend?.close();
-    }
-
-    private assertLive(): void {
-        if (this.stats.disabled) throw new Error("[storage] unified sidecar is disabled (repeated failures) — replica operations are unavailable");
     }
 
     close(): void {
