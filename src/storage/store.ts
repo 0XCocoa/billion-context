@@ -337,6 +337,20 @@ export class StorageIntegrityError extends Error {
     }
 }
 
+/** #4612: human-readable byte sizing for vacuum start/finish logs.
+ *  */
+function formatDbSize(bytes: number): string {
+    if (bytes < 0) return "?";
+    const units = ["B", "KiB", "MiB", "GiB"];
+    let v = bytes;
+    let i = 0;
+    while (v >= 1024 && i < units.length - 1) {
+        v /= 1024;
+        i++;
+    }
+    return i === 0 ? `${v} B` : `${v.toFixed(1)} ${units[i]}`;
+}
+
 /** #4175: true when a pid belongs to a live process (EPERM = alive, foreign user). */
 function processAlive(pid: number): boolean {
     try {
@@ -534,6 +548,40 @@ export class UnifiedStore {
     /** #4175: the live foreign pid seen holding <db>.lock at open, or null. */
     lockHolder(): { pid: number } | null {
         return this.foreignLockHolder;
+    }
+
+    /** #4612: a live pid besides ours currently writing this db — the union of
+     *  two evidence sources: (1) the foreign holder captured at open, re-validated
+     *  for liveness (it may have exited since); (2) a fresh read of <db>.lock
+     *  pointing at another live pid — every opener overwrites the lockfile with
+     *  its own pid on open, so this catches an instance that started AFTER us.
+     *  Null when no live foreign writer is provably present; an unreadable
+     *  lockfile means "no evidence" (fail-open) — callers need proof of
+     *  liveness to refuse, not certainty of absence. */
+    activeForeignWriter(): number | null {
+        if (this.foreignLockHolder !== null && processAlive(this.foreignLockHolder.pid)) {
+            return this.foreignLockHolder.pid;
+        }
+        if (this.lockPath !== null) {
+            try {
+                if (existsSync(this.lockPath)) {
+                    const parsed = JSON.parse(readFileSync(this.lockPath, "utf8")) as { pid?: unknown };
+                    const pid = typeof parsed.pid === "number" ? parsed.pid : null;
+                    if (pid !== null && pid !== process.pid && processAlive(pid)) return pid;
+                }
+            } catch {
+                /* unreadable lockfile: no evidence of a writer */
+            }
+        }
+        return null;
+    }
+
+    private dbFileSize(): number {
+        try {
+            return statSync(this.dbPath).size;
+        } catch {
+            return -1;
+        }
     }
 
     /**
@@ -1861,6 +1909,19 @@ export class UnifiedStore {
      *  pages incrementally; a one-time VACUUM reclaims the initial bloat of
      *  databases created before that pragma). */
     gc(opts: { archiveAfterDays: number; archiveDir: string; now?: number; vacuum?: "full" | "incremental" }): { archived: number; contentRowsDeleted: number } {
+        // #4612: full VACUUM is an O(db-size) atomic rewrite under the exclusive
+        // write lock with no intermediate progress. Running it against a db that
+        // another live process is writing starves that process until its storage
+        // layer degrades (field report: shadow 3-strike during a 14-min run on a
+        // 14 GB db). Refuse up front with an actionable error instead of silently
+        // contending. Incremental / no-vacuum sweeps are short transactions — the
+        // existing busy_timeout handling covers them.
+        if (opts.vacuum === "full") {
+            const writer = this.activeForeignWriter();
+            if (writer !== null) {
+                throw new Error(`[#4612] gc full VACUUM refused: another process (pid ${writer}) is actively writing this database — the rewrite holds the exclusive write lock across the whole pass and would starve the peer's writes until its storage layer degrades; stop the other process (or wait for it to exit) and retry, or use vacuum:"incremental"`);
+            }
+        }
         const now = opts.now ?? Date.now();
         let archived = 0;
         let contentRowsDeleted = 0;
@@ -1879,10 +1940,19 @@ export class UnifiedStore {
             contentRowsDeleted += this.collectZeroRefContent(GC_ZERO_REF_BATCH_SIZE);
         }
         if (opts.vacuum === "full") {
-            loggerLog("info", "[#3901] gc: running full VACUUM (this can take a while on large databases)");
+            const sizeBefore = this.dbFileSize();
+            let walPart = "";
+            try {
+                walPart = `, ${formatDbSize(statSync(`${this.dbPath}-wal`).size)} WAL`;
+            } catch {
+                /* no WAL file present */
+            }
+            loggerLog("info", `[#4612] gc: full VACUUM starting — ${formatDbSize(sizeBefore)} main file${walPart}; atomic rewrite holding the exclusive write lock until done (no intermediate progress)`);
+            const startedAt = Date.now();
             // #4390: delegate to vacuum() — a bare VACUUM leaves the compacted
             // image in the WAL; only the TRUNCATE checkpoint shrinks the files.
             this.vacuum("full");
+            loggerLog("info", `[#4612] gc: full VACUUM finished in ${((Date.now() - startedAt) / 1000).toFixed(1)} s — ${formatDbSize(sizeBefore)} -> ${formatDbSize(this.dbFileSize())}`);
         } else if (opts.vacuum === "incremental") {
             this.vacuum("incremental");
         }

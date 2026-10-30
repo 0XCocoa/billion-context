@@ -1826,6 +1826,18 @@ export class SessionStore {
         }
     }
 
+    /** #4612: live foreign writer on the unified db (#4175 lock discipline) —
+     *  the gc full-vacuum preflight signal for the CLI/HTTP surfaces. Null when
+     *  the unified store is unavailable or nobody else is provably writing. */
+    unifiedActiveWriter(): number | null {
+        if (!this.shadow || this.shadow.stats.disabled) return null;
+        try {
+            return this.shadow.activeForeignWriter();
+        } catch {
+            return null; // sidecar degraded mid-call: no evidence of a writer
+        }
+    }
+
     /** #3901/#3463: restore an archived session from its export file. */
     unifiedRestoreArchived(sessionId: string, archiveDir?: string): { ok: boolean; reason?: string } | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
