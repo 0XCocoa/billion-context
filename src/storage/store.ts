@@ -2523,6 +2523,8 @@ export class UnifiedStore {
      *    lazy-field restore (#4739) — block-row summary/one CAS bytes plus the
      *    orphans_json journal precedence, WITHOUT resurrecting state.blocks
      *    (issue4739-bounded-session-load pins this). */
+    getBlockContents(sessionId: string, opts: { limit: number; offset?: number }): Pick<BlockRow, "blockId" | "summary" | "one">[];
+    getBlockContents(sessionId: string): BlockContentsMap | null;
     getBlockContents(sessionId: string, opts?: { limit: number; offset?: number }): Pick<BlockRow, "blockId" | "summary" | "one">[] | BlockContentsMap | null {
         if (opts !== undefined) {
             const rows = this.db.prepare(`SELECT block_id, summary_hash, one_hash FROM blocks

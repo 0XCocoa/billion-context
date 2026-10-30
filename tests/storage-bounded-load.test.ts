@@ -186,7 +186,11 @@ test("resident field reads avoid unrelated JSON, messages, refs, and block paylo
     const contents = store.getBlockContents.bind(store);
     const orphans = store.getOrphansJson.bind(store);
     store.getMetadataJson = (id) => { metadataReads++; return metadata(id); };
-    store.getBlockContents = (id, opts) => { contentReads++; assert.equal(opts?.limit, 32); return contents(id, opts); };
+    store.getBlockContents = ((id: string, opts?: { limit: number; offset?: number }) => {
+        contentReads++;
+        assert.equal(opts?.limit, 32);
+        return contents(id, opts);
+    }) as typeof store.getBlockContents;
     store.getOrphansJson = (id) => { orphanReads++; return orphans(id); };
     const meta = shadow.readResidentFieldsFor("bounded", { metadata: true });
     assert.deepEqual(meta, { header: { requests: 7, nextBlockId: 71, activeBlockCount: 35, mappedRefCount: 2 }, metadata: expected.metadata });
