@@ -16,6 +16,8 @@ import type {
     RefRow,
     CcrEntryRow,
     SessionSummaryRow,
+    SessionViewRows,
+    StorageReadView,
 } from "../src/storage/backend.ts";
 import { sha256 } from "../src/storage/canonical.ts";
 
@@ -98,6 +100,31 @@ class StubMysqlBackend implements StorageBackend {
     getSessionRow(sessionId: string): Promise<StubRows["session"] | null> {
         this.viewCalls.count++;
         return Promise.resolve(this.rows.get(sessionId)?.session ?? null);
+    }
+    // #5198-era interface members (#4739 narrow reads + snapshot facade),
+    // satisfied from the same rows ingestSession captured.
+    sessionViewRows(sessionId: string): Promise<SessionViewRows> {
+        const row = this.rows.get(sessionId);
+        if (!row) return Promise.resolve(null);
+        const view = {
+            session: row.session,
+            messages: row.messages.map((r) => ({ ...r, contentHash: r.contentHash ?? sha256(r.content) })),
+            blocks: row.blocks.map((b) => ({ ...b, summaryHash: sha256(b.summary), oneHash: b.one === null ? null : sha256(b.one) })),
+            deadRefs: row.deadRefs,
+            refs: row.refs,
+        };
+        return Promise.resolve(view as unknown as SessionViewRows);
+    }
+    readSnapshot<T>(read: (reader: StorageReadView) => Promise<T>): Promise<T> {
+        const row = (id: string) => this.rows.get(id);
+        const view: StorageReadView = {
+            getSessionRow: async (id) => row(id)?.session ?? null,
+            getMessages: async (id, _opts) => (row(id)?.messages ?? []).map((r) => ({ ...r, contentHash: r.contentHash ?? sha256(r.content), retiredAt: null })),
+            getBlocks: async (id, _opts) => (row(id)?.blocks ?? []).map((b) => ({ ...b, summaryHash: sha256(b.summary), oneHash: b.one === null ? null : sha256(b.one) })),
+            getDeadRefs: async (id) => row(id)?.deadRefs ?? [],
+            getRefs: async (id) => row(id)?.refs ?? [],
+        };
+        return read(view);
     }
     liveRowCount(sessionId: string): Promise<number> {
         return Promise.resolve(this.rows.get(sessionId)?.messages.length ?? 0);
