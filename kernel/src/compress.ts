@@ -1664,7 +1664,7 @@ function applySingleRange(input: SingleRangeInput): SingleRangeOutcome {
     };
   }
 
-  validateCompressionRange(input, filteredIds, consumedBlockIds.length);
+  validateCompressionRange(input);
 
   if (filteredIds.length === 0 && consumedBlockIds.length === 0) {
     // #4521: everything in the range was dropped by content filters
@@ -1789,20 +1789,14 @@ function resolveCoverageInterval(
   return merged;
 }
 
-function validateCompressionRange(
-  input: SingleRangeInput,
-  directMessageIds: string[],
-  consumedBlockCount: number,
-): void {
+function validateCompressionRange(input: SingleRangeInput): void {
   const cfg = input.config.compress;
   validateSummaryLength(input.spec, cfg);
 
-  // #4521: the empty-range case (directMessageIds 0, consumed 0) moved to the
-  // caller as an idempotent NO-OP outcome — see applySingleRange. Throwing
-  // here rejected whole batches for ranges that were legal but had nothing
-  // left to fold.
-  void directMessageIds;
-  void consumedBlockCount;
+  // #4521: the empty-range case (no direct messages, no consumed blocks)
+  // moved to the caller as an idempotent NO-OP outcome — see applySingleRange.
+  // Throwing here rejected whole batches for ranges that were legal but had
+  // nothing left to fold.
 }
 
 function validateSummaryLength(
