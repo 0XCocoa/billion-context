@@ -1470,7 +1470,10 @@ test("HTTP a cold-restored non-retained parent serves its intact raw tail immedi
         assert.equal(restored.pluginSnapshot, undefined, "a non-forked session restores without its raw snapshot");
         // #5140: the intact raw tail is reconstructable from the unified index, so the cold
         // parent is servable immediately — no model call needed to recover stored source.
-        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
+        // The 409 body names the exact forkSnapshot refusal branch — a bare status assert
+        // swallowed it and left the CI flake undiagnosable (#4599 sentinel 2026-10-30).
+        const coldSnap = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(coldSnap.status, 200, JSON.stringify(coldSnap.body));
         await sendModel(h, "parent", h.messages);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
         assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);

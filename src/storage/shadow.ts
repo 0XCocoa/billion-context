@@ -464,7 +464,7 @@ export class UnifiedShadow {
                         } catch {
                             // counts must never break the heal path
                         }
-                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}. Both legs are built in THIS process, so a persistent gap is a digest-shape mismatch first (field only one leg builds, ordering) and only then a second writer: a second bili instance sharing one sessions dir (#394 anti-pattern; second-instance detection: #4177) is one cause among others (#4392). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
+                        loggerLog("warn", `[storage] DIGEST DRIFT ESCALATED for ${legacy.id}: ${streak} consecutive sampled drifts — the views have stopped converging${sides}. Both legs are built in THIS process, so a persistent gap is a digest-shape mismatch first (field only one leg builds, ordering — #4392) and only then a writer: known producers are a second bili instance sharing one sessions dir (#394 anti-pattern; second-instance detection: #4177), or ONE host re-writing history slots below the ingest watermark on every save (the delta fast path skips them by design, so the sampled backstop cannot converge against a repeating trigger — #4614). Freezing THIS process's JSON envelope writes for the session until a clean sample re-admits it — the unified store keeps receiving every save (#4323)`);
                     }
                     // Panels consume {disabled, lastError} — make the sampled
                     // degradation visible there, not just in the counter/log.
@@ -772,6 +772,14 @@ export class UnifiedShadow {
     gcPlan(archiveAfterDays: number, now?: number): import("./store.ts").GcPlan | null {
         if (this.sync === null) return null;
         return this.sync.gcPlan(archiveAfterDays, now);
+    }
+
+    /** #4612: live foreign writer on the unified db (#4175 lock discipline) —
+     *  the gc full-vacuum preflight signal. Null when unavailable or nobody
+     *  else is provably writing. */
+    activeForeignWriter(): number | null {
+        if (this.sync === null) return null;
+        return this.sync.activeForeignWriter();
     }
 
     rawMessages(sessionId: string): { seq: number; content: string }[] {
