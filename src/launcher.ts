@@ -303,6 +303,16 @@ export interface LauncherDeps {
      *  made "why did we spawn instead of attach" undiagnosable. Default tees
      *  to bili.log + stderr. */
     attachDiag?: (msg: string) => void;
+    /** #5167: drain-aware liveness probe for the #3544 stale rotation wait.
+     *  Keep-alive POOLED probes cannot see a drain — the resident closes its
+     *  LISTENER within milliseconds of accepting the shutdown (that is the
+     *  port-release signal) but keeps answering pooled sockets while it
+     *  drains (worst case (1+10)×10s post-#3890). Polling with Connection:
+     *  close opens a FRESH connection each round, so "answers" once again
+     *  means "the listener still accepts" — exactly the condition the spawned
+     *  child needs before its bind can succeed.
+     *  Default hits the real endpoint; tests stub it. */
+    fetchHealthInfoNoReuse?: (origin: string) => Promise<HealthInfo | undefined>;
     /** #3544: ask a stale resident to drain+exit (POST /__bili/shutdown).
      *  Default hits the real endpoint; tests stub it. */
     requestInstanceShutdown?: (origin: string) => Promise<boolean>;
@@ -3954,9 +3964,16 @@ interface HealthInfo {
     watchdog?: { armed: boolean; watchers?: number[] };
 }
 
-async function fetchHealthInfoDefault(origin: string): Promise<HealthInfo | undefined> {
+async function fetchHealthInfoDefault(origin: string, opts?: { noKeepAlive?: boolean }): Promise<HealthInfo | undefined> {
     try {
-        const res = await fetch(healthUrl(origin), { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+        // #5167: noKeepAlive sends Connection: close so the probe rides a FRESH
+        // connection — used by the rotation wait, where a pooled socket would
+        // keep being answered by a resident that already closed its listener
+        // and is merely draining its keep-alive connections (false "alive").
+        const res = await fetch(healthUrl(origin), {
+            signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+            ...(opts?.noKeepAlive ? { headers: { connection: "close" } } : {}),
+        });
         if (!res.ok) return undefined;
         const data = (await res.json()) as { ok?: boolean; instanceId?: string; version?: unknown; pid?: unknown; auxProxy?: unknown; auxProxySource?: unknown; watchdog?: unknown };
         const info: HealthInfo = { ok: Boolean(data.ok), instanceId: typeof data.instanceId === "string" ? data.instanceId : undefined };
@@ -4653,7 +4670,14 @@ export function rotatePortLogIfNeeded(logPath: string): void {
 // "永远更新不了". Before spawning we ask such a resident to drain+exit and wait
 // for the port; on ANY doubt (unverifiable version, no endpoint, refusal,
 // timeout) we fall back to the historical spawn behavior untouched.
-const STALE_ROTATION_WAIT_MS = 12_000; // > the responder's 10s force-exit backstop
+// #5167: the budget only needs to cover the shutdown REQUEST being processed
+// (a wedged loop never closes the listener) — NOT the responder's drain: the
+// port-release signal is the LISTENER closing, which happens milliseconds
+// after the POST is accepted, and the wait below polls with Connection: close
+// so a resident that only answers pooled keep-alive sockets while draining
+// still reads as released. The process itself may take up to (1+10)×10s to
+// fully exit post-#3890; that is fine — the child binds the freed port.
+const STALE_ROTATION_WAIT_MS = 12_000;
 const SHUTDOWN_REQUEST_TIMEOUT_MS = 3_000;
 const OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
 const OWNER_HEARTBEAT_POST_TIMEOUT_MS = 2_000;
@@ -4662,7 +4686,10 @@ export async function requestInstanceShutdown(origin: string): Promise<boolean> 
     try {
         const res = await fetch(`${origin}/__bili/shutdown`, {
             method: "POST",
-            headers: { "content-type": "application/json" },
+            // #5167: one-shot connection — the target closes its listener on
+            // accepting this request; leaving a pooled keep-alive socket behind
+            // would only extend the drain it is about to run.
+            headers: { "content-type": "application/json", connection: "close" },
             body: "{}",
             signal: AbortSignal.timeout(SHUTDOWN_REQUEST_TIMEOUT_MS),
         });
@@ -4689,7 +4716,7 @@ async function rotateStalePredecessor(
     opts: LaunchOptions,
     attachUrl: string | undefined,
     foreignLanes: readonly string[],
-    fetchHealthInfo: (origin: string) => Promise<HealthInfo | undefined>,
+    fetchHealthInfoNoReuse: (origin: string) => Promise<HealthInfo | undefined>,
     now: () => number,
     sleep: (ms: number) => Promise<void>,
     requestShutdown: (origin: string) => Promise<boolean>,
@@ -4724,10 +4751,16 @@ async function rotateStalePredecessor(
     }
     const deadline = now() + STALE_ROTATION_WAIT_MS;
     for (;;) {
-        const h = await fetchHealthInfo(candidate.inst.origin);
+        // #5167: poll on a FRESH connection (Connection: close). The resident
+        // closes its LISTENER within milliseconds of accepting the shutdown
+        // above but keeps answering POOLED keep-alive sockets while it drains
+        // (by design, ≤110s post-#3890) — a pooled probe here would read a
+        // draining resident as alive and falsely time out, sending the caller
+        // into the spawn ladder / attach-anyway while the port is actually free.
+        const h = await fetchHealthInfoNoReuse(candidate.inst.origin);
         if (!h?.ok) break;
         if (now() >= deadline) {
-            console.error(`bili: stale rotation timed out after ${STALE_ROTATION_WAIT_MS}ms — ${candidate.inst.origin} still answers healthy; falling back to the normal spawn ladder`);
+            console.error(`bili: stale rotation timed out after ${STALE_ROTATION_WAIT_MS}ms — ${candidate.inst.origin} still accepts fresh connections (listener open); falling back to the normal spawn ladder`);
             return;
         }
         await sleep(HEALTH_POLL_INTERVAL_MS);
@@ -5026,7 +5059,7 @@ export async function ensureProxyRunning(
             opts,
             attachUrl,
             foreignLanes,
-            fetchHealthInfo,
+            deps?.fetchHealthInfoNoReuse ?? ((origin: string) => fetchHealthInfoDefault(origin, { noKeepAlive: true })),
             now,
             sleepImpl,
             deps?.requestInstanceShutdown ?? requestInstanceShutdown,
