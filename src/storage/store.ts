@@ -346,12 +346,14 @@ function likeEscape(prefix: string): string {
 
 /**
  * #4175: raised when PRAGMA quick_check fails at open. Migrations must never
- * run against a corrupt file, so this fires BEFORE migrateSchema; the shadow
- * layer records it and RE-THROWS — bili REFUSES TO START with the files
- * left exactly in place (no automatic rename/repair, no legacy fallback:
- * full data recovery cannot be guaranteed without operator involvement). The FAIL
- * verdict is cached so later opens fail fast; the operator moves the files
- * aside by hand (backed up first) to force a fresh rebuild.
+ * run against a corrupt file, so this fires BEFORE migrateSchema (and from the
+ * migration catch for large stores, where the scan was size-skipped); the
+ * shadow layer catches it and STARTS WITHOUT THE INDEX — loud alarm, files
+ * left EXACTLY in place (no automatic rename/repair/copy/rebuild; auto-
+ * recovery from JSON withdrawn because full data recovery cannot be
+ * guaranteed without operator involvement). A FAIL verdict is never cached —
+ * every boot re-scans fresh; the operator's manual fix (back up, then move
+ * index.db{-wal,-shm} aside by hand, start again) is named in the alarm.
  */
 export class StorageIntegrityError extends Error {
     constructor(public readonly dbPath: string, public readonly detail: string) {
@@ -440,12 +442,13 @@ export class UnifiedStore {
         // corrupt file must never be migrated against — #4175's premise,
         // preserved wherever it is cheap); a large store checks in the
         // background post-open (#4609: a 14 GB quick_check costs ~260 s and
-        // the 60 s native spawn budget killed the child mid-scan). A cached
-        // failure throws here so the open REFUSES to start INSTEAD of
-        // rescan-looping (#4626-era owner decision chain: no automatic
-        // quarantine, no legacy fallback — see maybeOpen) — including for
-        // failures found by the background
-        // check of a previous run. BILI_STORAGE_QUICK_CHECK=0 opts out of all
+        // the 60 s native spawn budget killed the child mid-scan). A proven
+        // failure throws StorageIntegrityError as an INTERNAL signal — the
+        // shadow layer alarms loudly and starts WITHOUT the index (files left
+        // exactly in place; owner chain 2026-10-30 final form). Only PASS
+        // verdicts are cached (rescan skip); FAILs are never persisted, so a
+        // stale FAIL left behind by an older version is treated as a miss and
+        // re-scanned fresh. BILI_STORAGE_QUICK_CHECK=0 opts out of all
         // of it (no check, no cache IO).
         let integrityOk = false;
         const mode = integrityModeFor(path);
@@ -476,9 +479,11 @@ export class UnifiedStore {
                 db.close();
                 const detail = sqliteCorruptionDetail(err);
                 if (detail !== null) {
-                    // 2026-10-30 owner policy: this FRESH in-boot finding REFUSES
-                    // this start, but nothing is persisted as a boot-blocker —
-                    // the next start re-scans and decides from fresh evidence.
+                    // 2026-10-30 owner policy (final form): this FRESH in-boot
+                    // finding throws to the shadow layer, which alarms and
+                    // starts WITHOUT the index — files untouched, nothing
+                    // cached as a boot-blocker; the next start re-scans and
+                    // decides from fresh evidence.
                     throw new StorageIntegrityError(path, detail.slice(0, 400));
                 }
                 throw err;
@@ -486,9 +491,10 @@ export class UnifiedStore {
             const durationMs = Date.now() - started;
             recordIntegrityOutcome(path, verdict === "ok", durationMs, verdict === "ok" ? undefined : verdict.slice(0, 400));
             if (verdict !== "ok") {
-                // Same policy as the throwing-scan branch above: refuse THIS boot
-                // on fresh evidence, persist nothing — every future boot
-                // rechecks with its own live scan.
+                // Same policy as the throwing-scan branch above: throw the typed
+                // signal (shadow layer alarms + starts without the index),
+                // persist nothing — every future boot rechecks with its own
+                // live scan.
                 db.close();
                 throw new StorageIntegrityError(path, verdict.slice(0, 400));
             }
@@ -556,11 +562,11 @@ export class UnifiedStore {
             // to be corrupt: the #2771 fallback tells operators to MOVE the
             // file aside by hand (backed up first) to reset the index — and
             // Windows refuses to move a file a live process still holds open.
-            // Close, then rethrow for the shadow's legacy-only degradation.
+            // Close, then rethrow — the shadow layer alarms and starts WITHOUT
+            // the index (files left exactly in place; no cache writes at all).
             // #5108/#4816: large stores (> sync threshold) skip the pre-migration
             // scan, so a corruption can surface HERE first — classify it the same
-            // way so the loud degrade + fail-fast cache applies instead of an
-            // unexplained raw driver error.
+            // way instead of letting an unexplained raw driver error out.
             db.close();
             const detail = sqliteCorruptionDetail(err);
             if (detail !== null) throw new StorageIntegrityError(path, detail.slice(0, 400));

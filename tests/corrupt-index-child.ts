@@ -44,7 +44,6 @@ import type { ProxyOptions } from "../src/config.ts";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { storageStatusWire } from "../src/storage/runtime-status.ts";
-import { StorageIntegrityError } from "../src/storage/store.ts";
 import { setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
 import { loadLegacyView, toLegacyLike } from "../src/storage/ingest.ts";
 import { canonicalize, sha256, sortObjectKeys } from "./golden-canonical.ts";
@@ -196,18 +195,20 @@ export function makeOpts(upstreamPort: number): ProxyOptions {
 // sides reference these constants, so the coverage list cannot drift.
 // ---------------------------------------------------------------------------
 
-// #4816/#4626 policy chain (owner decisions through 2026-10-30): throwing
-// corruption is classified → NO automatic quarantine rename (a move can't
-// prove full recovery) AND no legacy fallback (the JSON envelope would fork
-// from the dead index forever). Construction therefore REFUSES — typed
-// StorageIntegrityError, files byte-identical in place, no leaked handle
-// into the dir (so an operator can move the set aside immediately).
-// These checks pin that policy plus the original #2781/#4357 leak guards.
+// #4816/#4626 policy chain (FINAL form, 2026-10-30): throwing corruption is
+// classified → NO automatic rename/move/copy AND no automatic rebuild
+// (auto-recovery can't guarantee full data recovery) AND no legacy fallback
+// (forks from the dead index forever) — and construction SUCCEEDS too: bili
+// boots WITHOUT the index, envelope-served, under a loud wire alarm naming
+// the manual fix. Files byte-identical in place; no leaked handle into the
+// dir (so an operator can still move the set aside immediately). These checks
+// pin that policy plus the original #2781/#4357 leak guards.
 const ENGPROOF_CHECK_NAMES = {
-    noAutoRename: "corrupt index.db left UNTOUCHED — byte-identical, no .corrupt-* copy (#4626 decision)",
-    refusesToStart: "construction THROWS StorageIntegrityError — no silent legacy fallback",
-    midFlowGuard: "no live handle into the sessions dir after the refused construction (#2781/#4357 guard)",
-    fdGuard: "no open fd into the corrupt index dir after the refusal (/proc/self/fd, Linux)",
+    noAutoRename: "corrupt index.db left UNTOUCHED — byte-identical, no .corrupt-* copy or rebuild (#4626/#4816 decision)",
+    bootProceeds: "construction SUCCEEDS — boots WITHOUT the index, loud wire alarm names the fix (no move/copy/rebuild/refusal)",
+    envelopeServed: "session loads from the JSON envelopes while the corrupt index sits untouched",
+    midFlowGuard: "no live handle into the sessions dir after the alarm-boot (#2781/#4357 guard)",
+    fdGuard: "no open fd into the corrupt index dir after close (/proc/self/fd, Linux)",
 } as const;
 export const ENGPROOF_CHECKS: readonly string[] = Object.values(ENGPROOF_CHECK_NAMES);
 
@@ -344,29 +345,31 @@ async function engproofScenario(argv: string[], run: CheckRun): Promise<void> {
     fs.writeSync(fd, Buffer.alloc(512, 0x5a), 0, 512, 0);
     fs.closeSync(fd);
 
-    // THE policy chain pinned here: construction must REFUSE a provably-
-    // corrupt index with the typed error — files untouched, no rename, and
-    // no legacy fallback (a legacy-only store would fork from the dead
-    // index forever). Supersedes #2771's "construction must survive" for
-    // PROVABLY CORRUPT indices; transient open failures still survive.
+    // THE policy chain pinned here (FINAL form, 2026-10-30): a provably-
+    // corrupt index must NOT block startup either — construction succeeds,
+    // the file set stays byte-identical in place (no move, no copy, no
+    // automatic rebuild: auto-recovery cannot guarantee full data recovery),
+    // and this process serves from the JSON envelopes under a loud alarm
+    // naming the manual fix. Supersedes the interim refuse-to-start pin.
     const beforeHash = createHash("sha256").update(fs.readFileSync(path.join(dir, "index.db"))).digest("hex");
-    let caught: unknown = null;
-    try {
-        new SessionStore({ dir, debounceMs: 1, enabled: true });
-    } catch (err) {
-        caught = err;
-    }
+    let store: SessionStore | null = null;
+    await run.run(ENGPROOF_CHECK_NAMES.bootProceeds, () => {
+        store = new SessionStore({ dir, debounceMs: 1, enabled: true });
+        const reason = storageStatusWire().reason ?? "";
+        assert.match(reason, /integrity check and was left UNTOUCHED/);
+        assert.doesNotMatch(reason, /REFUSES TO START/i);
+    });
     await run.run(ENGPROOF_CHECK_NAMES.noAutoRename, () => {
         const names = fs.readdirSync(dir);
         assert.ok(!names.some((n) => n.startsWith("index.db.corrupt-")), `an automatic .corrupt-* copy must never exist, got ${names.join(", ")}`);
         const afterHash = createHash("sha256").update(fs.readFileSync(path.join(dir, "index.db"))).digest("hex");
         assert.equal(afterHash, beforeHash, "the corrupt primary must stay byte-identical");
     });
-    await run.run(ENGPROOF_CHECK_NAMES.refusesToStart, () =>
-        assert.ok(
-            caught instanceof StorageIntegrityError,
-            `a provably-corrupt index must make construction throw StorageIntegrityError, got ${caught === null ? "NO THROW (the store constructed!)" : String(caught)}`,
-        ));
+    await run.run(ENGPROOF_CHECK_NAMES.envelopeServed, () => {
+        const viaEnvelope = store!.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
+        assert.ok(viaEnvelope, "with the index out of service the session must still load from its JSON envelope");
+        store!.closeQuietly();
+    });
 
     // Leak guard (#2781/#4357): a REJECTED store must hold NO persistent
     // handle into the dir — whole-dir rename round-trip straight after the

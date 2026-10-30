@@ -136,10 +136,11 @@ test("review 2: destroyed-substrate blocks are deleted and cannot resurrect on a
     });
 });
 
-test("review 3: corrupt index.db REFUSES TO START instead of bricking the proxy", async () => {
+test("review 3: corrupt index.db alarms loudly — boots envelope-served, files untouched", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-review-corrupt-"));
     try {
         const session = loadCorpusCase(dir, "folded", "corpus-folded", "anthropic");
+        void session;
         fs.writeFileSync(path.join(dir, "index.db"), Buffer.concat([
             Buffer.from("SQLite format 3\0"),
             crypto.randomBytes(4096),
@@ -147,15 +148,14 @@ test("review 3: corrupt index.db REFUSES TO START instead of bricking the proxy"
 
         process.env.BILI_STORAGE_UNIFIED = "shadow";
         try {
-            // #5124/#4816/#4626 behavior chain: this corruption shape makes
-            // quick_check THROW, it IS classified → NO rename AND NO legacy
-            // fallback (a fallback forks the two replicas forever) — the
-            // store's open must throw the typed error.
-            assert.throws(
-                () => new SessionStore({ dir, debounceMs: 1, enabled: true }),
-                /integrity/i,
-                "a provably-corrupt index must make construction REFUSE, not degrade",
-            );
+            // #5124/#4816/#4626 behavior chain (FINAL, 2026-10-30): this
+            // corruption shape makes quick_check THROW; classified corruption
+            // no longer blocks startup either — NOTHING is renamed, copied or
+            // rebuilt automatically (auto-recovery cannot guarantee full data
+            // recovery), construction SUCCEEDS serving from the envelopes,
+            // and the loud alarm carries the manual fix.
+            const s1 = new SessionStore({ dir, debounceMs: 1, enabled: true });
+            s1.closeQuietly();
             // Files byte-in-place: nothing renamed, nothing rebuilt.
             const names = fs.readdirSync(dir);
             assert.ok(!names.some((n) => n.startsWith("index.db.corrupt-")), `no automatic .corrupt-* copy may exist, got ${names.join(", ")}`);
@@ -164,15 +164,14 @@ test("review 3: corrupt index.db REFUSES TO START instead of bricking the proxy"
             delete process.env.BILI_STORAGE_UNIFIED;
         }
 
-        // And a later process fails the same way — fast, from the cached FAIL
-        // verdict (no rescan), never "recovers" on its own.
+        // And a later process behaves identically — a fresh scan of the SAME
+        // untouched file set (no FAIL verdict is ever persisted), same loud
+        // alarm, same boot-without-index outcome, never silent recovery.
         process.env.BILI_STORAGE_UNIFIED = "shadow";
         try {
-            assert.throws(
-                () => new SessionStore({ dir, debounceMs: 1, enabled: true }),
-                /integrity/i,
-                "second process must also refuse (cached-fail fast path)",
-            );
+            const s2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
+            s2.closeQuietly();
+            assert.ok(fs.existsSync(path.join(dir, "index.db")), "second boot must also leave the corrupt index exactly in place");
         } finally {
             delete process.env.BILI_STORAGE_UNIFIED;
         }

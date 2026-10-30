@@ -155,7 +155,7 @@ test("#4816 store: a throwing quick_check becomes StorageIntegrityError", { skip
     }
 });
 
-test("#4816 shadow: throwing corruption leaves every file UNTOUCHED and REFUSES TO OPEN", { skip: SKIP_NO_ENGINE }, () => {
+test("#4816 shadow: throwing corruption leaves every file UNTOUCHED and boots WITHOUT the index", { skip: SKIP_NO_ENGINE }, () => {
     const dir = tmpDir();
     // The wire reason below resolves `requested` from the REAL process env
     // (runtime-status records it only via SessionStore), and the CI baseline
@@ -169,14 +169,12 @@ test("#4816 shadow: throwing corruption leaves every file UNTOUCHED and REFUSES 
         truncateHalf(join(dir, "index.db"));
         const before = createHash("sha256").update(readFileSync(join(dir, "index.db"))).digest("hex");
         _resetStorageRuntimeStatusForTest();
-        // #4626-era owner decision chain: NO rename AND NO legacy fallback —
-        // a provably-corrupt index must make the open throw the typed error
-        // (proxy boot then hard-fails loudly).
-        assert.throws(
-            () => UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null),
-            (err: unknown) => err instanceof StorageIntegrityError,
-            "a provably-corrupt index must refuse to open — nothing may auto-rename or fall back legacy-only",
-        );
+        // #4626-era owner decision chain (FINAL, 2026-10-30): NO rename AND
+        // NO legacy fallback AND no refusal — a provably-corrupt index alarms
+        // loudly and the open comes back as "no sidecar"; this process then
+        // serves from the envelopes until an operator fixes things by hand.
+        const sh = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
+        assert.equal(sh, null, "a provably-corrupt index must yield 'no sidecar' (loud alarm) — nothing auto-renames, falls back legacy-only or blocks the boot");
         // Byte-identical file set: NO automatic rename/repair (#4626-era owner
         // decision — checkpoint rows live only inside the index, and with
         // jsonWriterOff it is the sole durable copy).
@@ -186,7 +184,7 @@ test("#4816 shadow: throwing corruption leaves every file UNTOUCHED and REFUSES 
         // Loud + actionable on the status wire.
         const wire = storageStatusWire();
         assert.match(wire.reason ?? "", /integrity check and was left UNTOUCHED/);
-        assert.match(wire.reason ?? "", /REFUSES TO START/i);
+        assert.match(wire.reason ?? "", /starting WITHOUT the index/i);
     } finally {
         if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prevUnified;
@@ -248,7 +246,7 @@ test("#4816 operator resolution: moving the corrupt set aside unblocks a fresh r
     }
 });
 
-test("#4816 worker facet: a large store's throwing background check is ALARM-ONLY — the next boot still refuses, from its own scan", { skip: SKIP_NO_ENGINE }, async () => {
+test("#4816 worker facet: a large store's throwing background check is ALARM-ONLY — the next boot still throws, from its own scan", { skip: SKIP_NO_ENGINE }, async () => {
     const dir = tmpDir();
     try {
         resetIntegrityCheckStateForTests();

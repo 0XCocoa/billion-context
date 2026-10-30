@@ -253,36 +253,27 @@ export class UnifiedShadow {
                 // proved the file set corrupt — handled below WITHOUT moving any file
                 // (#4626-era owner decision, 2026-10-30).
                 if (!(err instanceof StorageIntegrityError)) throw err;
-                // #4626-era owner decision (2026-10-30): NO automatic quarantine
-                // rename. quick_check proved the file set corrupt, but automatic
-                // removal of a storage PRIMARY was withdrawn because full data
-                // recovery cannot be guaranteed without touching the main flow:
-                //   - checkpoint rows live only inside index.db — the JSON
-                //     envelopes are NOT a complete round-trip for them;
-                //   - with BILI_STORAGE_JSON_WRITER=off (jsonWriterOff, see
-                //     persist.ts) the envelopes are skipped entirely and the
-                //     index is the SOLE durable copy — an automatic rename
-                //     destroys unrecoverable data;
-                //   - a corrupt-on-open index can still often be salvaged by an
-                //     operator; renaming it away severs that last option forever.
-                // The file set therefore stays EXACTLY in place, untouched,
-                // and the store REFUSES TO START (#4626-era owner decision
-                // chain, 2026-10-30): renaming risks destroying the sole copy
-                // WITHOUT proving recovery, and falling back to legacy-only
-                // was rejected too — once the two replicas stop advancing
-                // together the split can never be reconciled, so continuing
-                // would bake the divergence in. The loud failure below names
-                // the manual fix. The FAIL verdict has already been written
-                // to index.db.chk by UnifiedStore.open, so every later open
-                // fails fast from the cache — no rescans. Manual resolution:
-                // back up, then move index.db{-wal,-shm} aside yourself;
-                // the next start rebuilds the index fresh and re-imports the
-                // JSON envelopes that hold session content.
+                // #4626-era owner decision chain — FINAL form (2026-10-30):
+                // quick_check PROVED this file set corrupt. Nothing moves,
+                // nothing is copied, nothing is rebuilt automatically
+                // (auto-recovery from the JSON envelopes was withdrawn too:
+                // with BILI_STORAGE_JSON_WRITER=off the index is the sole
+                // durable copy), and bili STARTS ANYWAY, serving from the
+                // envelopes — with a loud alarm naming the manual fix.
+                // writerOffActive() sees no sidecar, so even a jsonWriter=off
+                // operator keeps persisting every turn to the envelopes; no
+                // turn ever lands somewhere unsafe. The corrupt set stays
+                // EXACTLY in place: an operator repairs it or moves it aside
+                // by hand (back up first) and the next start picks up a fresh
+                // index that re-imports the envelopes. Transient open
+                // failures below are a different category ("environment
+                // broken", not "data proven bad") and still refuse.
                 loggerLog(
                     "error",
-                    `[storage] index.db FAILED its integrity quick_check (${err.detail}) — REFUSING TO START with a corrupt index (no automatic rename, no legacy fallback): back up ${path.join(dir, "index.db")}{,-wal,-shm}, move those files aside, then start again — the JSON envelopes are the recovery source and a fresh index is rebuilt automatically (#4175/#4626)`,
+                    `[storage] index.db FAILED its integrity quick_check (${err.detail}) — starting WITHOUT the index (no file moved, no copy, no automatic rebuild; 2026-10-30 owner policy): back up ${path.join(dir, "index.db")}{,-wal,-shm}, then MOVE those files aside by hand and start again — the fresh index re-imports the JSON envelopes (#4175/#4626/#4816)`,
                 );
-                throw err;
+                recordSidecarOpenFailure(`integrity quick_check failed: ${err.detail}`);
+                return null;
             }
             // #3285: watermark trust does not cross process boundaries — a
             // restart-handoff overlap leaves the previous writer's rows AND
@@ -305,20 +296,15 @@ export class UnifiedShadow {
             // either (#3823 lock; #4614 readonly — where it would DESTROY the only copy of recent
             // session state in unified-full mode). The Node.js upgrade lever is surfaced via
             // /__bili/status + the bootstrap warn.
-            // #4626-era owner decision chain (2026-10-30): ANY sidecar-open
-            // failure now REFUSES TO START instead of degrading — proven
-            // corruption (renaming risks destroying the sole durable copy
-            // without proving recovery; a legacy-only fallback diverges from
-            // the dead index forever) and every transient shape alike
-            // (no-engine/CANTOPEN/readonly/second-writer: availability at the
+            // Corruption-shaped failures never reach here — the inner catch
+            // above handles them (loud alarm + boot WITHOUT the index).
+            // #4626-era owner decision chain (2026-10-30): every OTHER
+            // sidecar-open failure REFUSES TO START instead of degrading —
+            // no-engine/CANTOPEN/readonly/second-writer: availability at the
             // price of a silently different storage path was withdrawn by
-            // owner instruction "在任何情况下不降级"). Intentional opt-outs
+            // owner instruction "在任何情况下不降级". Intentional opt-outs
             // (legacy mode / encryption opt-out / persistence off) resolve to
             // mode===legacy above and never reach here.
-            if (err instanceof StorageIntegrityError) {
-                recordSidecarOpenFailure(errStr);
-                throw err;
-            }
             const hint = sqliteOpenFailureHint(errStr);
             const tail = /no SQLite engine available/i.test(errStr)
                 ? ""

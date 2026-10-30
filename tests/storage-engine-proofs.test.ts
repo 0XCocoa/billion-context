@@ -24,19 +24,23 @@
  *                      state on load.
  *   ROLLBACK         — explicitly select legacy after persisting the full
  *                      load's migration → the file loads the exact digest.
- *   SELF-DISABLE     — 3 consecutive sidecar failures disable it; reads flip
- *                      back to legacy; the legacy file stays readable.
- *   CORRUPT INDEX    — a provably-corrupt index.db makes construction
- *                      REFUSE loudly: typed StorageIntegrityError, file set
- *                      left in place byte-identical, no automatic rename and
- *                      no legacy fallback (#4626-era owner decision chain,
- *                      supersedes #2771's survive-degraded for corruption).
+ *   NO SELF-DISABLE  — a failing sidecar NEVER self-disables: every save
+ *                      keeps retrying the real index write (reads stay
+ *                      unified) — the old 3-strike breaker is gone.
+ *   CORRUPT INDEX    — a provably-corrupt index.db does NOT block startup:
+ *                      construction proceeds WITHOUT the index (envelope-
+ *                      served), loud wire alarm, file set left in place
+ *                      byte-identical, no automatic rename/copy/rebuild and
+ *                      no legacy fallback (#4626 → final owner chain
+ *                      2026-10-30; supersedes both #2771's survive-degraded
+ *                      and the interim refuse-to-start pin for corruption).
  *   CAS REFCOUNT     — shared content blobs survive deleteSession of one
  *                      session and are collected only at refcount 0.
  *
  * The corrupt-index test was the regression for #2771 (construction
- * survival) — re-pinned for the #4626→refuse-to-start policy chain: nothing
- * renamed, no fallback, typed throw, files byte-identical; the rest are
+ * survival) — re-pinned for the FINAL #4626-era policy chain: nothing moved/
+ * copied/rebuilt, boot proceeds envelope-served under a loud alarm; the rest
+ * are
  * contract pins
  * (proof-only, no product change).
  */
@@ -376,11 +380,12 @@ test("storage engine: a failing sidecar NEVER self-disables — writes keep retr
 });
 
 // ---------------------------------------------------------------------------
-// CORRUPT INDEX (#2771 → #4626 → refuse-to-start): construction must REFUSE a
-// provably-corrupt index loudly — files untouched, no rename, no fallback.
+// CORRUPT INDEX (#2771 → #4626 → final form): a provably-corrupt index does
+// NOT block startup — the boot proceeds envelope-served; files untouched, no
+// move/copy/rebuild, the loud alarm names the manual fix.
 // ---------------------------------------------------------------------------
 
-test("storage engine: corrupt index.db makes construction REFUSE loudly — files untouched, no fallback (#4626/#4816)", { timeout: 180_000 }, async () => {
+test("storage engine: corrupt index.db makes the boot PROCEED envelope-served — loud alarm, files untouched (#4626/#4816)", { timeout: 180_000 }, async () => {
     const dir = tmpdir("bili-engproof-corrupt-");
     const prev = process.env.BILI_STORAGE_UNIFIED;
     try {
@@ -397,8 +402,8 @@ test("storage engine: corrupt index.db makes construction REFUSE loudly — file
         await clean.writeNow(viaFull);
         clean.closeQuietly();
 
-        // #4338: everything past this point (corrupt the header → refused
-        // construction → leak guards) runs in a spawned child. On Windows any
+        // #4338: everything past this point (corrupt the header → alarm-boot
+        // → leak guards) runs in a spawned child. On Windows any
         // sqlite file the scenario touches can leave an OS handle with no JS
         // reference to release, and the resulting persistent EBUSY at rmrf
         // would outlive the whole tmp-rm retry ladder; the child exiting
