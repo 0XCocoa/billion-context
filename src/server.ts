@@ -99,8 +99,8 @@ import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWri
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
-import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
-import { recordSplitBrainContest } from "./storage/runtime-status.js";
+import { createServedMarkerWriter, peerStillContests, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
+import { recordSplitBrainContest, registerSplitBrainEvidenceCheck } from "./storage/runtime-status.js";
 import { holderProbeOrigin, mayClobberPointer, probeHolderForHint, probeOwnerInfo, resolvePortClaim, verifyEntryOwnsPort } from "./port-owner.js";
 import { armEventLoopWatchdog } from "./event-loop-watchdog.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
@@ -1280,6 +1280,13 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                 },
             );
             reapStaleWriterMarkers(markerDir, Date.now());
+            // #4626: a surfaced verdict re-evaluates against CURRENT marker
+            // evidence at every status read — the accused peer's own marker,
+            // judged by the same "still contests" definition as detection, so
+            // the restart-handover notice clears itself once the peer
+            // PROVABLY stops; an unreadable marker fails closed (keeps it).
+            registerSplitBrainEvidenceCheck((contest) =>
+                peerStillContests(markerDir, instanceId, contest.peer.instanceId, contest.sessionId, Date.now()));
             setGlobalSessionCommitListener((id) => servedWriter?.noteServed(id));
         }
         const nOverrides = Object.keys(opts.routes).length;
