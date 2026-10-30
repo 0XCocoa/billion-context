@@ -5,14 +5,21 @@
  * machine load (many test processes sharing one disk) that one unlucky open at
  * construction time is exactly what stripped the unified layer, and the fork
  * raw-tail rebuild (#5140's HTTP 409 SNAPSHOT_UNAVAILABLE) fails closed on
- * replicasAvailable(). The save path is now the "this store is still wanted"
- * signal: one maybeOpen per 30 s cooldown window, boolean-gated per save, until
- * the resource returns — then unified surfaces resume WITHOUT a restart.
+ * replicasAvailable().
+ *
+ * Recovery is demand-driven on BOTH consumer classes, each with its own pace:
+ * - save path (scheduleSave/flushSync): one maybeOpen per 30 s cooldown window;
+ * - read path (replicasAvailable): one maybeOpen per 100 ms interval — a read
+ *   asking "are replicas available?" gets a fresh answer instead of waiting for
+ *   the next write. #5140's flake was precisely that gap: ctor open dies under
+ *   shard load, the resource clears milliseconds later, and the cold-restore
+ *   snapshot request arrives before any save could trigger a retry — and the
+ *   old constructor-time cooldown stamp gated even the first retry for 30 s.
  *
  * Both directions pinned (#3617): recovery works without a restart once the
- * resource returns, AND while gated/failed the store keeps serving (JSON
- * durability intact, exactly one failed-open warn from construction, no retry
- * spam inside the cooldown).
+ * resource returns (no save required on the read timeline), AND while
+ * gated/failed the store keeps serving (JSON durability intact, bounded
+ * attempt counts per pace, no retry spam inside either window).
  *
  * The strike-side half of #5188 (transient vs structural ingest-error
  * classification) has its own suite: tests/issue5140-contention-not-disabling.test.ts
@@ -23,7 +30,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { SessionStore, setShadowReopenCooldownMsForTests } from "../src/persist.ts";
+import { SessionStore, setShadowReopenCooldownMsForTests, setShadowReopenReadCheckMsForTests } from "../src/persist.ts";
 import { setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
 import { _resetStorageRuntimeStatusForTest, storageStatusWire } from "../src/storage/runtime-status.ts";
 import { setLogCapture } from "../src/logger.ts";
@@ -44,15 +51,13 @@ test("sidecar recovers without a restart once the resource returns (#5188)", () 
     let store: SessionStore | undefined;
     try {
         _resetStorageRuntimeStatusForTest();
-        // Cooldown seam BEFORE construction: the ctor stamps the first retry
-        // gate with the cooldown active at that moment (now + cooldown).
         setShadowReopenCooldownMsForTests(0);
         setSqliteEnginesUnavailableForTests(true);
         store = new SessionStore({ dir, enabled: true });
         assert.equal(store.replicasAvailable(), false, "unlucky first open degrades to legacy-only");
         assert.equal(storageStatusWire().degraded, true, "degraded state observable on the status wire");
-        // resource returns mid-process; the 0 ms cooldown armed at ctor lets
-        // the very next save retry immediately
+        // resource returns mid-process; the very next save retries immediately
+        // (the constructor's failed open does not consume the retry budget)
         setSqliteEnginesUnavailableForTests(false);
         store.scheduleSave(mkSess());
         assert.equal(store.replicasAvailable(), true, "recovered by the save path without a restart");
@@ -65,7 +70,7 @@ test("sidecar recovers without a restart once the resource returns (#5188)", () 
     }
 });
 
-test("cooldown gates retries and JSON durability holds while degraded (#5188)", async () => {
+test("each pace gates its own retries and JSON durability holds while degraded (#5188)", async () => {
     const dir = fs.mkdtempSync(path.join(HERMETIC, "gate-"));
     let store: SessionStore | undefined;
     const warns: string[] = [];
@@ -73,30 +78,62 @@ test("cooldown gates retries and JSON durability holds while degraded (#5188)", 
         _resetStorageRuntimeStatusForTest();
         setLogCapture((level, msg) => { if (level === "warn") warns.push(msg); });
         setSqliteEnginesUnavailableForTests(true);
-        // Small cooldown FROM CONSTRUCTION so the ctor's next-attempt stamp
-        // (now + cooldown) sits inside the test window…
         setShadowReopenCooldownMsForTests(300);
+        setShadowReopenReadCheckMsForTests(300);
         store = new SessionStore({ dir, enabled: true });
-        const ctorWarns = warns.filter((w) => /failed to open/.test(w));
-        assert.equal(ctorWarns.length, 1, "exactly one failed-open warn from construction");
-        // activity well inside the cooldown window must NOT fire retries…
+        const failedOpens = () => warns.filter((w) => /failed to open/.test(w)).length;
+        assert.equal(failedOpens(), 1, "exactly one failed-open warn from construction");
+        // the ctor failure does NOT consume either pace: the first save fires
+        // one immediate attempt…
         store.scheduleSave(mkSess("g1"));
-        store.scheduleSave(mkSess("g2"));
-        // (flushSync on a bare fixture can report its kernel-store commit as
-        // partial — envelope durability itself is pinned by the #4175/
-        // persistence suites; here the call exists to exercise the recovery
-        // hook on the eviction path.)
-        store.flushSync(mkSess("g3"));
-        assert.equal(warns.filter((w) => /failed to open/.test(w)).length, 1, "no retry spam inside the cooldown");
+        assert.equal(failedOpens(), 2, "first save retries immediately (no constructor-time stamp)");
+        // …and its failure arms the save cooldown: further saves stay quiet…
+        store.flushSync(mkSess("g2"));
+        assert.equal(failedOpens(), 2, "the second save is gated by the cooldown the first attempt armed");
+        // …while the read path takes its own single immediate attempt…
         assert.equal(store.replicasAvailable(), false, "still legacy-only while the resource is gone");
-        // …and the next attempt happens AFTER the cooldown, then recovers.
+        assert.equal(failedOpens(), 3, "the first read check fires its own immediate attempt");
+        // …and everything inside both windows stays quiet…
+        store.scheduleSave(mkSess("g3"));
+        store.flushSync(mkSess("g4"));
+        store.replicasAvailable();
+        assert.equal(failedOpens(), 3, "no retry spam inside either window");
+        // …until the windows elapse, then the next attempt recovers.
         setSqliteEnginesUnavailableForTests(false);
         await new Promise((r) => setTimeout(r, 400));
-        store.scheduleSave(mkSess("g4"));
+        store.scheduleSave(mkSess("g5"));
         assert.equal(store.replicasAvailable(), true, "post-cooldown attempt succeeds once the resource returns");
     } finally {
         setLogCapture(null);
         setShadowReopenCooldownMsForTests(null);
+        setShadowReopenReadCheckMsForTests(null);
+        setSqliteEnginesUnavailableForTests(false);
+        _resetStorageRuntimeStatusForTest();
+        store?.closeQuietly();
+    }
+});
+
+test("an unlucky first open recovers on the next read check — no save, no 30 s wait (#5140 timeline)", async () => {
+    const dir = fs.mkdtempSync(path.join(HERMETIC, "tl-"));
+    let store: SessionStore | undefined;
+    try {
+        _resetStorageRuntimeStatusForTest();
+        // NO seams: production pacing applies. This is #5140's exact CI
+        // timeline — the ctor open dies under shard load, the resource clears
+        // milliseconds later, and the cold-restore snapshot request (a pure
+        // READ) arrives before any save could trigger a retry. Before the fix
+        // this returned false forever: the constructor stamped a 30 s cooldown
+        // and only the save path ever retried.
+        setSqliteEnginesUnavailableForTests(true);
+        store = new SessionStore({ dir, enabled: true });
+        assert.equal(store.replicasAvailable(), false, "unlucky first open degrades to legacy-only");
+        setSqliteEnginesUnavailableForTests(false);
+        // production read-check interval is 100 ms; wait past one slot so the
+        // next availability check is definitely eligible
+        await new Promise((r) => setTimeout(r, 150));
+        assert.equal(store.replicasAvailable(), true, "a plain read recovers the sidecar — no save anywhere in this timeline");
+        assert.equal(storageStatusWire().degraded, false, "status wire clears with the recovery");
+    } finally {
         setSqliteEnginesUnavailableForTests(false);
         _resetStorageRuntimeStatusForTest();
         store?.closeQuietly();

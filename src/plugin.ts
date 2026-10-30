@@ -1208,7 +1208,7 @@ function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
     const expected = session.state.lastPassIds;
     if (!expected || expected.length === 0) return reconMiss(session, "empty-lastPassIds");
     const store = getStore();
-    if (!store.replicasAvailable()) return reconMiss(session, "replicasUnavailable");
+    if (!store.replicasAvailable()) return reconMiss(session, "replicasUnavailable", store.sidecarDownReason());
     const seqs = store.unifiedTailSeqs(session.id);
     if (!seqs || seqs.length === 0) return reconMiss(session, "empty-tailSeqs", `expected=${expected.length}`);
     const rows = store.unifiedTailViewRows(session.id);
