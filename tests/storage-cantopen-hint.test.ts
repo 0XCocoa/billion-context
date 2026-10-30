@@ -27,6 +27,8 @@ import { rmrf } from "./tmp-rm.ts";
  */
 
 const CANT_OPEN = "Error: [storage:node:sqlite] Error: unable to open database file";
+// #4614/#5103 field shape: the db OPENS fine but writes are refused — same
+// OS-level refusal class, different SQLite errno.
 const READONLY = "Error: [storage:node:sqlite] Error: attempt to write a readonly database";
 
 function stubPlatform(platform: string): () => void {
@@ -43,6 +45,27 @@ test("hint: win32 + CANTOPEN carries the OS-level suspects", () => {
         assert.ok(hint.includes("antivirus"), "points at AV exclusions");
         assert.ok(hint.includes("%USERPROFILE%\\.local\\share\\billion-context\\"), "names the exclusion target");
         assert.ok(hint.includes("deleting the file will not clear a lock"), "corrects the delete-file advice");
+    } finally {
+        restore();
+    }
+});
+
+test("hint: win32 + readonly-write points at integrity control with the CORRECT fix direction (#5103/#5154)", () => {
+    const restore = stubPlatform("win32");
+    try {
+        const hint = sqliteOpenFailureHint(READONLY);
+        assert.ok(hint.includes("win32"), "names the platform");
+        assert.ok(hint.includes("integrity"), "names Windows integrity control");
+        assert.ok(hint.includes("icacls"), "gives the label-check command");
+        assert.ok(
+            hint.includes("icacls <path-to-node.exe> /setintegritylevel Medium"),
+            "the fix restores the PROCESS (node.exe) to Medium — #5154 root cause",
+        );
+        assert.ok(
+            !hint.includes('"(OI)(CI)Low"') && !hint.includes("(OI)(CI)Low /T"),
+            "must NOT advise relabeling the sessions dir Low — that direction was the #5154 trap",
+        );
+        assert.ok(hint.includes("do NOT delete"), "forbids deleting the live index");
     } finally {
         restore();
     }
@@ -66,6 +89,7 @@ test("hint: non-win32 platforms stay silent even on CANTOPEN", () => {
         const restore = stubPlatform(p);
         try {
             assert.equal(sqliteOpenFailureHint(CANT_OPEN), "", `expected no hint on ${p}`);
+            assert.equal(sqliteOpenFailureHint(READONLY), "", `expected no hint on ${p}`);
         } finally {
             restore();
         }
