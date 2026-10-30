@@ -76,7 +76,9 @@ test("sessionTipSeq is max live seq + 1 and materializes zero message rows", asy
 
         assert.equal(await sh.sessionTipSeqAsync("tip-1"), expectedTip, "async twin agrees");
     } finally {
-        store.cancelAll();
+        // release the unified index.db handle before rmrf — Windows cannot
+        // unlink an open SQLite file (the #4599 tmp-rm EBUSY family)
+        store.closeQuietly();
         rmrf(dir);
     }
 });
