@@ -15,7 +15,7 @@
 import { randomBytes } from "node:crypto";
 
 export const LANE_TOKEN_MARKER = "bili-lane-token:";
-export const LANE_TOKEN_HEX_LEN = 12;
+const LANE_TOKEN_HEX_LEN = 12;
 
 const LANE_TOKEN_RE = new RegExp(`(?<![0-9a-f])${LANE_TOKEN_MARKER}([0-9a-f]{${LANE_TOKEN_HEX_LEN}})(?![0-9a-f])`);
 

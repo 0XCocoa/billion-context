@@ -743,7 +743,7 @@ export function isOursSessionStartEntry(entry: unknown): boolean {
 
 /** #5095 (D1-C): a SubagentStart entry we wrote: any hook command naming
  *  our lane-token hook script. */
-export function isOursSubagentStartEntry(entry: unknown): boolean {
+function isOursSubagentStartEntry(entry: unknown): boolean {
     const hooks = (entry !== null && typeof entry === "object" && !Array.isArray(entry) ? (entry as { hooks?: unknown }).hooks : undefined);
     if (!Array.isArray(hooks)) return false;
     return hooks.some((h) => h !== null && typeof h === "object" && isOurSubagentHookCommand((h as { command?: unknown }).command));
