@@ -5,10 +5,10 @@
  * rows (page-level damage), or it can THROW out of the statement itself
  * (truncated file, garbage header, broken overflow chain — probe-verified on
  * node:sqlite v22: ERR_SQLITE_ERROR with the raw sqlite3_errmsg text). The
- * #4175 loud-degrade decision (fail fast + legacy-only, no automatic file
- * moves) only saw the verdict-row shape, so every
- * throwing corruption escaped as a raw driver error and degraded the store
- * to legacy-only forever with no auto-heal.
+ * #4175 decision (fail fast + REFUSE TO START — no automatic file moves and
+ * no legacy fallback, per the 2026-10-30 owner follow-up) only saw the
+ * verdict-row shape, so every throwing corruption escaped as a raw driver
+ * error and degraded the store to legacy-only forever with no auto-heal.
  *
  * This classifier maps the throwing shapes onto the same decision. It
  * matches ONLY SQLITE_CORRUPT / SQLITE_NOTADB:

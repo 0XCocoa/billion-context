@@ -43,6 +43,7 @@ import { defaultConfig } from "acp-kernel";
 import type { ProxyOptions } from "../src/config.ts";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { StorageIntegrityError } from "../src/storage/store.ts";
 import { setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
 import { loadLegacyView, toLegacyLike } from "../src/storage/ingest.ts";
 import { canonicalize, sha256, sortObjectKeys } from "./golden-canonical.ts";
@@ -194,21 +195,18 @@ export function makeOpts(upstreamPort: number): ProxyOptions {
 // sides reference these constants, so the coverage list cannot drift.
 // ---------------------------------------------------------------------------
 
-// #4816/#4626: throwing-shape corruption (header garbage / truncation) is
-// classified and degrades LOUDLY — but #4626-era owner decision withdrew the
-// automatic quarantine rename (no full-recovery guarantee), so the corrupt
-// files stay byte-identical in place and the store serves legacy-only until
-// an operator moves them aside. These checks pin that policy plus the
-// original #2781/#4357 leak guards.
+// #4816/#4626 policy chain (owner decisions through 2026-10-30): throwing
+// corruption is classified → NO automatic quarantine rename (a move can't
+// prove full recovery) AND no legacy fallback (the JSON envelope would fork
+// from the dead index forever). Construction therefore REFUSES — typed
+// StorageIntegrityError, files byte-identical in place, no leaked handle
+// into the dir (so an operator can move the set aside immediately).
+// These checks pin that policy plus the original #2781/#4357 leak guards.
 const ENGPROOF_CHECK_NAMES = {
     noAutoRename: "corrupt index.db left UNTOUCHED — byte-identical, no .corrupt-* copy (#4626 decision)",
-    degraded: "store serves legacy-only; nothing auto-recovers full mode",
-    lazyImport: "session loaded from the legacy envelope while degraded",
-    midFlowGuard: "no live handle into the sessions dir while serving degraded (#2781/#4357 guard)",
-    stateDigest: "legacy load's state digest matches the clean full-mode read",
-    writeNow: "writeNow keeps working over the legacy path",
-    postCloseGuard: "no live handle after the final close (post-close rename guard)",
-    fdGuard: "no open fd into the corrupt index dir after close (/proc/self/fd, Linux)",
+    refusesToStart: "construction THROWS StorageIntegrityError — no silent legacy fallback",
+    midFlowGuard: "no live handle into the sessions dir after the refused construction (#2781/#4357 guard)",
+    fdGuard: "no open fd into the corrupt index dir after the refusal (/proc/self/fd, Linux)",
 } as const;
 export const ENGPROOF_CHECKS: readonly string[] = Object.values(ENGPROOF_CHECK_NAMES);
 
@@ -337,65 +335,46 @@ async function runFdGuard(run: CheckRun, name: string, dir: string): Promise<voi
  *  expectedStateDigest] — the parent seeded dir (corpus + full-mode write +
  *  clean full-mode read) and hands in the clean read's state digest. */
 async function engproofScenario(argv: string[], run: CheckRun): Promise<void> {
-    const [dir, expectedStateDigest] = argv;
-    if (!dir || !expectedStateDigest) throw new Error("engproof mode needs <dir> <expectedStateDigest>");
+    const [dir] = argv;
+    if (!dir) throw new Error("engproof mode needs <dir>");
 
     // Corrupt the index header (crashed checkpoint / stray write).
     const fd = fs.openSync(path.join(dir, "index.db"), "r+");
     fs.writeSync(fd, Buffer.alloc(512, 0x5a), 0, 512, 0);
     fs.closeSync(fd);
 
-    // THE #2771 regression: construction must survive. #4626-era owner
-    // decision: NO automatic quarantine/recovery — the corrupt files stay
-    // where they are and the store serves from the JSON envelopes (full
-    // recovery can't be guaranteed without operator involvement); the
-    // envelope read below must still be exact.
+    // THE policy chain pinned here: construction must REFUSE a provably-
+    // corrupt index with the typed error — files untouched, no rename, and
+    // no legacy fallback (a legacy-only store would fork from the dead
+    // index forever). Supersedes #2771's "construction must survive" for
+    // PROVABLY CORRUPT indices; transient open failures still survive.
     const beforeHash = createHash("sha256").update(fs.readFileSync(path.join(dir, "index.db"))).digest("hex");
-    const store2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
+    let caught: unknown = null;
+    try {
+        new SessionStore({ dir, debounceMs: 1, enabled: true });
+    } catch (err) {
+        caught = err;
+    }
     await run.run(ENGPROOF_CHECK_NAMES.noAutoRename, () => {
         const names = fs.readdirSync(dir);
         assert.ok(!names.some((n) => n.startsWith("index.db.corrupt-")), `an automatic .corrupt-* copy must never exist, got ${names.join(", ")}`);
         const afterHash = createHash("sha256").update(fs.readFileSync(path.join(dir, "index.db"))).digest("hex");
         assert.equal(afterHash, beforeHash, "the corrupt primary must stay byte-identical");
     });
-    await run.run(ENGPROOF_CHECK_NAMES.degraded, () =>
-        assert.equal(store2.replicasAvailable(), false, "must serve legacy-only — nothing may auto-recover full mode"));
-    const reloaded = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-    store2.cancelAll();
-    try {
-        await run.run(ENGPROOF_CHECK_NAMES.lazyImport, () =>
-            assert.ok(reloaded, "degraded store returned null for a session whose legacy envelope exists"));
-        if (!reloaded) return;
+    await run.run(ENGPROOF_CHECK_NAMES.refusesToStart, () =>
+        assert.ok(
+            caught instanceof StorageIntegrityError,
+            `a provably-corrupt index must make construction throw StorageIntegrityError, got ${caught === null ? "NO THROW (the store constructed!)" : String(caught)}`,
+        ));
 
-        // Leak guard (#2781/#4357): a degraded store must hold NO persistent
-        // handle into the dir at all — whole-dir rename round-trip.
-        await runGuard(run, ENGPROOF_CHECK_NAMES.midFlowGuard, dir, "-midflow");
+    // Leak guard (#2781/#4357): a REJECTED store must hold NO persistent
+    // handle into the dir — whole-dir rename round-trip straight after the
+    // refused construction (what lets an operator move the corrupt set
+    // aside without hitting EBUSY).
+    await runGuard(run, ENGPROOF_CHECK_NAMES.midFlowGuard, dir, "-midflow");
 
-        // #4316 PR3/3: the clean full-mode read carried the one-time ledger
-        // alignment; the recovered load applies it again. The parent passes
-        // its digest already modulo that alignment (single definition), so
-        // strip it here too before comparing.
-        await run.run(ENGPROOF_CHECK_NAMES.stateDigest, () =>
-            assert.equal(viewStateDigest(stripOneTimeAlignment(toLegacyLike(reloaded))), expectedStateDigest,
-                "recovered-index state digest drift vs clean full-mode read"));
-
-        // Writes must keep working (full path into the fresh index) — no
-        // throw, files refreshed.
-        await run.run(ENGPROOF_CHECK_NAMES.writeNow, () => store2.writeNow(reloaded));
-    } finally {
-        store2.closeQuietly();
-    }
-
-    // #4338 direction 4: the #2781 guard above only covers the window between
-    // loadSync and writeNow — the leak behind #4338 was (re)acquired during
-    // the write phase, past that guard, and only surfaced at rmrf after the
-    // whole retry ladder burned. Guard AFTER the final close too, so future
-    // handle-leak drift trips here — named, deterministic, at the right
-    // place — instead of as a 10-second EBUSY in teardown.
-    await runGuard(run, ENGPROOF_CHECK_NAMES.postCloseGuard, dir, "-postclose");
-
-    // #4357: POSIX rename cannot see open files — scan our own fd table so the
-    // quick_check throw-path leak trips by name on Linux as well.
+    // #4357: POSIX rename cannot see open files — scan our own fd table so
+    // the quick_check throw-path leak trips by name on Linux as well.
     await runFdGuard(run, ENGPROOF_CHECK_NAMES.fdGuard, dir);
 }
 

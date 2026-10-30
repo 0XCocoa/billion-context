@@ -12,8 +12,9 @@
  *   1. the classifier itself (corruption shapes match, transient shapes do NOT);
  *   2. UnifiedStore.open turns a throwing scan into StorageIntegrityError;
  *   3. the shadow leaves the file set EXACTLY where it is (no automatic
- *      rename — #4626-era owner decision) and degrades loudly with an
- *      actionable operator instruction + cached FAIL verdict;
+ *      rename — #4626-era owner decision) and REFUSES TO OPEN — no legacy
+ *      fallback either (the two replicas would fork forever), throwing the
+ *      typed error with the actionable operator instruction + cached FAIL;
  *   4. the FAIL verdict makes the next open fail fast WITHOUT rescan;
  *   5. the documented manual resolution (back up, move aside, restart)
  *      actually unblocks: a fresh store rebuilds cleanly;
@@ -154,14 +155,13 @@ test("#4816 store: a throwing quick_check becomes StorageIntegrityError", { skip
     }
 });
 
-test("#4816 shadow: throwing corruption leaves every file UNTOUCHED and degrades loudly", { skip: SKIP_NO_ENGINE }, () => {
+test("#4816 shadow: throwing corruption leaves every file UNTOUCHED and REFUSES TO OPEN", { skip: SKIP_NO_ENGINE }, () => {
     const dir = tmpDir();
-    let shadow: UnifiedShadow | null = null;
     // The wire reason below resolves `requested` from the REAL process env
     // (runtime-status records it only via SessionStore), and the CI baseline
     // preload pins BILI_STORAGE_UNIFIED=legacy for the non-storage corpus
-    // (#2815) — under legacy there is nothing to report degraded. Pin full to
-    // match the mode maybeOpen is asked for; restore afterwards.
+    // (#2815) — pin full to match the mode maybeOpen is asked for; restore
+    // afterwards.
     const prevUnified = process.env.BILI_STORAGE_UNIFIED;
     process.env.BILI_STORAGE_UNIFIED = "full";
     try {
@@ -169,8 +169,14 @@ test("#4816 shadow: throwing corruption leaves every file UNTOUCHED and degrades
         truncateHalf(join(dir, "index.db"));
         const before = createHash("sha256").update(readFileSync(join(dir, "index.db"))).digest("hex");
         _resetStorageRuntimeStatusForTest();
-        shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
-        assert.equal(shadow, null, "a provably-corrupt index must degrade legacy-only — nothing may auto-rename or auto-reopen");
+        // #4626-era owner decision chain: NO rename AND NO legacy fallback —
+        // a provably-corrupt index must make the open throw the typed error
+        // (proxy boot then hard-fails loudly).
+        assert.throws(
+            () => UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null),
+            (err: unknown) => err instanceof StorageIntegrityError,
+            "a provably-corrupt index must refuse to open — nothing may auto-rename or fall back legacy-only",
+        );
         // Byte-identical file set: NO automatic rename/repair (#4626-era owner
         // decision — checkpoint rows live only inside the index, and with
         // jsonWriterOff it is the sole durable copy).
@@ -180,9 +186,8 @@ test("#4816 shadow: throwing corruption leaves every file UNTOUCHED and degrades
         // Loud + actionable on the status wire.
         const wire = storageStatusWire();
         assert.match(wire.reason ?? "", /integrity check and was left UNTOUCHED/);
-        assert.match(wire.reason ?? "", /aside/i);
+        assert.match(wire.reason ?? "", /REFUSES TO START/i);
     } finally {
-        shadow?.close();
         if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prevUnified;
         _resetStorageRuntimeStatusForTest();
@@ -256,7 +261,7 @@ test("#4816 worker facet: a large store's throwing background check caches FAIL 
         } finally {
             s1.close(); // checkpoint moves the WAL — the refresh must carry the FAIL verdict
         }
-        // Next boot: cached-fail → typed error → the shadow degrades loudly (no rescan).
+        // Next boot: cached-fail → typed error → the open refuses (no rescan).
         assert.throws(
             () => UnifiedStore.open(p),
             (err: unknown) => err instanceof StorageIntegrityError && /malformed/.test(err.detail),

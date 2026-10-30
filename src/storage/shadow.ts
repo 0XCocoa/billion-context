@@ -270,18 +270,22 @@ export class UnifiedShadow {
                 //     destroys unrecoverable data;
                 //   - a corrupt-on-open index can still often be salvaged by an
                 //     operator; renaming it away severs that last option forever.
-                // The file set therefore stays EXACTLY in place, untouched;
-                // we degrade loudly instead (outer catch → legacy-only + the
-                // status wire). The FAIL verdict has already been written to
-                // index.db.chk by UnifiedStore.open, so every later open in
-                // this deployment fails fast from the cache — no rescans, no
-                // repeated work in the main flow. Manual resolution (unchanged
-                // #2771 fallback): back up, then move index.db{-wal,-shm}
-                // aside yourself; the next start rebuilds the index fresh and
-                // re-imports the JSON envelopes that hold session content.
+                // The file set therefore stays EXACTLY in place, untouched,
+                // and the store REFUSES TO START (#4626-era owner decision
+                // chain, 2026-10-30): renaming risks destroying the sole copy
+                // WITHOUT proving recovery, and falling back to legacy-only
+                // was rejected too — once the two replicas stop advancing
+                // together the split can never be reconciled, so continuing
+                // would bake the divergence in. The loud failure below names
+                // the manual fix. The FAIL verdict has already been written
+                // to index.db.chk by UnifiedStore.open, so every later open
+                // fails fast from the cache — no rescans. Manual resolution:
+                // back up, then move index.db{-wal,-shm} aside yourself;
+                // the next start rebuilds the index fresh and re-imports the
+                // JSON envelopes that hold session content.
                 loggerLog(
                     "error",
-                    `[storage] index.db failed its integrity quick_check (${err.detail}) — leaving the file UNTOUCHED and running legacy-only (no automatic rename); back up ${path.join(dir, "index.db")}{,-wal,-shm}, then move those files aside to force a fresh rebuild (JSON envelopes remain the recovery source for session content) (#4175/#4626)`,
+                    `[storage] index.db FAILED its integrity quick_check (${err.detail}) — REFUSING TO START with a corrupt index (no automatic rename, no legacy fallback): back up ${path.join(dir, "index.db")}{,-wal,-shm}, move those files aside, then start again — the JSON envelopes are the recovery source and a fresh index is rebuilt automatically (#4175/#4626)`,
                 );
                 throw err;
             }
@@ -300,28 +304,29 @@ export class UnifiedShadow {
                 recordSidecarOpenFailure(`second-writer: another bili process (pid ${err.pid}) owns index.db — isolate via BILI_SESSIONS_DIR(+BILI_CONFIG_FILE); unified features off until then (#5046)`);
                 return null;
             }
-            // #2771: a corrupt/unreadable index.db must degrade to legacy-only
-            // (same shape as the encryption opt-out), never brick SessionStore
-            // construction. No auto-delete: the index may hold pinned checkpoint
-            // blobs (#2671 Phase 2) — destructive recovery is operator policy.
             const errStr = String(err);
             // Deleting the index cannot fix a no-engine failure (this Node.js has neither builtin
             // node:sqlite nor a loadable better-sqlite3), and it cannot clear an OS-level refusal
             // either (#3823 lock; #4614 readonly — where it would DESTROY the only copy of recent
-            // session state in unified-full mode). The delete advice fits only a genuine corrupt
-            // file; the Node.js upgrade lever is surfaced via /__bili/status + the bootstrap warn.
+            // session state in unified-full mode). The Node.js upgrade lever is surfaced via
+            // /__bili/status + the bootstrap warn.
+            // #4626-era owner decision chain (2026-10-30): quick_check PROVED
+            // the file set corrupt — refusing to start is the ONLY safe
+            // outcome: renaming risks destroying the sole durable copy without
+            // proving recovery, and a legacy-only fallback diverges from the
+            // dead index forever (never reconcilable). Transient shapes
+            // (CANTOPEN/no-engine/second-writer/readonly) NEVER reach here —
+            // they classify out before any StorageIntegrityError exists, and
+            // keep degrading as before. Integrity errors never reach the
+            // "delete to reset" advice below either.
+            if (err instanceof StorageIntegrityError) {
+                recordSidecarOpenFailure(errStr);
+                throw err;
+            }
             const hint = sqliteOpenFailureHint(errStr);
-            // #4626-era owner decision: a provably-corrupt index is LEFT IN PLACE —
-            // "delete to reset" advice would nudge toward destroying data that
-            // may not be fully envelope-covered (checkpoints; jsonWriterOff).
-            const corruptIntegrity = err instanceof StorageIntegrityError;
             const tail = /no SQLite engine available/i.test(errStr)
                 ? ""
-                : corruptIntegrity
-                    ? ""
-                    : hint !== ""
-                        ? hint
-                        : "; delete the file to reset the index";
+                : hint !== "" ? hint : "; delete the file to reset the index";
             loggerLog(
                 "warn",
                 `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${tail}`,

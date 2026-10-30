@@ -449,9 +449,10 @@ export class UnifiedStore {
         // preserved wherever it is cheap); a large store checks in the
         // background post-open (#4609: a 14 GB quick_check costs ~260 s and
         // the 60 s native spawn budget killed the child mid-scan). A cached
-        // failure throws here so the shadow degrades loudly INSTEAD of
-        // rescan-looping (#4626-era owner decision: no automatic quarantine —
-        // see maybeOpen) — including for failures found by the background
+        // failure throws here so the open REFUSES to start INSTEAD of
+        // rescan-looping (#4626-era owner decision chain: no automatic
+        // quarantine, no legacy fallback — see maybeOpen) — including for
+        // failures found by the background
         // check of a previous run. BILI_STORAGE_QUICK_CHECK=0 opts out of all
         // of it (no check, no cache IO).
         let integrityOk = false;
