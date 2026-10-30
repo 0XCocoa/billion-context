@@ -136,7 +136,7 @@ test("review 2: destroyed-substrate blocks are deleted and cannot resurrect on a
     });
 });
 
-test("review 3: corrupt index.db degrades loudly instead of bricking the proxy", async () => {
+test("review 3: corrupt index.db REFUSES TO START instead of bricking the proxy", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-review-corrupt-"));
     try {
         const session = loadCorpusCase(dir, "folded", "corpus-folded", "anthropic");
@@ -146,32 +146,33 @@ test("review 3: corrupt index.db degrades loudly instead of bricking the proxy",
         ]));
 
         process.env.BILI_STORAGE_UNIFIED = "shadow";
-        let store: SessionStore;
         try {
-            store = new SessionStore({ dir, debounceMs: 1, enabled: true }); // must NOT throw
-            await store.writeNow(session);
-            const reloaded = store.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-            assert.ok(reloaded, "session load must succeed");
-            // #5124/#4816/#4626 behavior change: this corruption shape makes
-            // quick_check THROW, and it is classified — but NO file is ever
-            // renamed or a fresh index opened automatically; the store serves
-            // legacy-only until an operator moves the corrupt set aside.
-            assert.equal(store.replicasAvailable(), false, "throwing corruption must degrade legacy-only under the #4626 policy");
+            // #5124/#4816/#4626 behavior chain: this corruption shape makes
+            // quick_check THROW, it IS classified → NO rename AND NO legacy
+            // fallback (a fallback forks the two replicas forever) — the
+            // store's open must throw the typed error.
+            assert.throws(
+                () => new SessionStore({ dir, debounceMs: 1, enabled: true }),
+                /integrity/i,
+                "a provably-corrupt index must make construction REFUSE, not degrade",
+            );
+            // Files byte-in-place: nothing renamed, nothing rebuilt.
             const names = fs.readdirSync(dir);
             assert.ok(!names.some((n) => n.startsWith("index.db.corrupt-")), `no automatic .corrupt-* copy may exist, got ${names.join(", ")}`);
             assert.ok(fs.existsSync(path.join(dir, "index.db")), "the corrupt index.db must stay exactly where it is");
-            await store.flushAll(); // flush the JSON record to disk (closeQuietly only cancels)
         } finally {
-            store!.closeQuietly();
             delete process.env.BILI_STORAGE_UNIFIED;
         }
 
-        // And a later process (fresh handle) still works the same way.
+        // And a later process fails the same way — fast, from the cached FAIL
+        // verdict (no rescan), never "recovers" on its own.
         process.env.BILI_STORAGE_UNIFIED = "shadow";
         try {
-            const again = new SessionStore({ dir, debounceMs: 1, enabled: true });
-            assert.ok(again.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" }), "second process must load the session");
-            again.closeQuietly();
+            assert.throws(
+                () => new SessionStore({ dir, debounceMs: 1, enabled: true }),
+                /integrity/i,
+                "second process must also refuse (cached-fail fast path)",
+            );
         } finally {
             delete process.env.BILI_STORAGE_UNIFIED;
         }

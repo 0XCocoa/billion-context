@@ -220,10 +220,12 @@ function degradeReason(): string {
         if (isNoEngineError(e)) {
             return `no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)${nodeSqliteUpgradeHint()}`;
         }
-        // #4626-era owner decision: a provably-corrupt index is LEFT IN PLACE
-        // (no automatic rename), so the reason must carry the manual fix.
+        // #4626-era owner decision chain: a provably-corrupt index is LEFT IN
+        // PLACE (no automatic rename) AND the store refuses to start rather
+        // than fall back legacy-only (the two replicas would diverge forever
+        // and never reconcile) — the reason carries the manual fix.
         if (/StorageIntegrityError|integrity quick_check failed/i.test(state.sidecarOpenError)) {
-            return `index database failed its integrity check and was left UNTOUCHED (${e}) — back up index.db{,-wal,-shm}, then move those files aside by hand to rebuild; the proxy runs legacy-only meanwhile`;
+            return `index database failed its integrity check and was left UNTOUCHED (${e}) — the store REFUSES TO START; back up index.db{,-wal,-shm}, move those files aside by hand, then start again (a fresh index rebuilds from the JSON envelopes)`;
         }
         return `index database failed to open (${e})${sqliteOpenFailureHint(state.sidecarOpenError)}`;
     }

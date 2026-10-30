@@ -130,7 +130,7 @@ test("lockfile: a live foreign pid is reported, a dead pid is taken over, close 
     }
 });
 
-test("shadow open degrades loudly on a corrupt index.db set — nothing renamed (#4626)", async () => {
+test("shadow open REFUSES on a corrupt index.db set — nothing renamed, no fallback (#4626)", async () => {
     const { UnifiedShadow } = await import("../src/storage/shadow.ts");
     const { readdirSync } = await import("node:fs");
     const dir = freshDir();
@@ -148,13 +148,19 @@ test("shadow open degrades loudly on a corrupt index.db set — nothing renamed 
         writeFileSync(path, raw);
         const beforeHash = createHash("sha256").update(raw).digest("hex");
 
-        // The shadow's maybeOpen (full mode) must degrade legacy-only and
-        // leave EVERY file exactly where it was: no rename, no auto-reopen,
-        // no forensics copy (#4626-era owner decision — full recovery cannot
-        // be guaranteed without operator involvement).
+        // The shadow's maybeOpen (full mode) must refuse — throw the typed
+        // error AND leave EVERY file exactly where it was: no rename, no
+        // auto-reopen, no forensics copy, and NO legacy fallback (#4626-era
+        // owner decision chain — automatic moves can't prove full recovery,
+        // and a fallback forks the two replicas forever).
         const env = { ...process.env, BILI_STORAGE_UNIFIED: "full" };
-        const shadow = UnifiedShadow.maybeOpen(dir, env);
-        assert.equal(shadow, null, "a provably-corrupt index must degrade loudly, not auto-recover");
+        let caught: unknown = null;
+        try {
+            UnifiedShadow.maybeOpen(dir, env);
+        } catch (err) {
+            caught = err;
+        }
+        assert.ok(caught, "a provably-corrupt index must make the open THROW — not degrade");
         const names = readdirSync(dir);
         assert.ok(!names.some((n) => n.includes(".corrupt-")), `no automatic copies allowed, got ${names.join(", ")}`);
         const afterHash = createHash("sha256").update(readFileSync(path)).digest("hex");

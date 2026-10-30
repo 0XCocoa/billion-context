@@ -21,9 +21,8 @@
  *     readers, and the main handle has already run recovery, so the
  *     read-only open cannot hit WAL-recovery). Boot returns in
  *     milliseconds; a failure is recorded loudly and cached so the NEXT
- *     open throws StorageIntegrityError and reuses the #4175
- *     loud-degrade machinery (no automatic file moves, #4626-era owner
- *     decision). Small stores keep the
+ *     open throws StorageIntegrityError and the open REFUSES (no automatic
+ *     file moves AND no legacy fallback, #4626-era owner decision chain). Small stores keep the
  *     synchronous pre-migration check — the #4175 premise (a corrupt file
  *     must never be migrated against) stays intact wherever it is cheap.
  *     The one concession: on a big store's first boot after upgrade,
@@ -176,7 +175,7 @@ const inflight = new Set<string>();
 
 /** Fire-and-forget background quick_check on a second read-only connection
  * (#4609). Records the outcome, caches it (ok or fail — a cached fail makes
- * the NEXT open throw and degrade loudly via the #4175 path), and tells the
+ * the NEXT open throw and REFUSE via the #4175 path), and tells the
  * caller's store instance so a clean close can refresh the cache key. */
 export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok: boolean, detail?: string) => void): void {
     const size = statPart(dbPath)?.s ?? 0;
@@ -210,7 +209,7 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
                 } else {
                     // A real integrity failure found post-open: record loudly
                     // and cache the fail so the NEXT open throws StorageIntegrityError
-                    // and degrades loudly INSTEAD of rescan-looping (#4175 path,
+                    // and REFUSES to start INSTEAD of rescan-looping (#4175 path,
                     // no automatic rename — files stay where they are); keep
                     // serving now (writes into a provably-corrupt store surface
                     // as ingest errors and the #3133 breaker disables the
@@ -218,7 +217,7 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
                     // are the recovery source either way).
                     recordIntegrityOutcome(dbPath, false, 0, verdict.slice(0, 400));
                     writeIntegrityCache(dbPath, false, verdict.slice(0, 400));
-                    loggerLog("error", `[storage] background quick_check FAILED for ${dbPath}: ${verdict.slice(0, 400)} — verdict cached; the next open fails fast and runs legacy-only (files left UNTOUCHED — move them aside by hand after backing up to force a rebuild; JSON envelopes remain the recovery source, #4175/#4609)`);
+                    loggerLog("error", `[storage] background quick_check FAILED for ${dbPath}: ${verdict.slice(0, 400)} — verdict cached; the next open FAILS FAST AND REFUSES TO START (files left UNTOUCHED — move them aside by hand after backing up to force a rebuild; JSON envelopes remain the recovery source, #4175/#4609)`);
                     // Detail rides with the verdict so a clean close can
                     // refresh the FAIL cache onto post-checkpoint stats
                     // (#5108/#4816) — without it the verdict would go stale
@@ -229,14 +228,14 @@ export function scheduleBackgroundIntegrityCheck(dbPath: string, onVerdict?: (ok
                 // #5108/#4816: the scan itself threw a corruption-shaped error
                 // (the throwing shapes of CORRUPT/NOTADB). Same consequences as
                 // a bad verdict row: record loudly and cache the fail so the
-                // NEXT open fails fast and degrades loudly (#4175 path).
+                // NEXT open fails fast and refuses to start (#4175 path).
                 // Without this branch the throw fell into "could not run"
                 // below and the fail verdict was never recorded — a large
                 // corrupt store stayed unverified boot after boot.
                 const detail = String(msg.error ?? "").slice(0, 400);
                 recordIntegrityOutcome(dbPath, false, 0, detail);
                 writeIntegrityCache(dbPath, false, detail);
-                loggerLog("error", `[storage] background quick_check threw a corruption-shaped error for ${dbPath}: ${detail} — FAIL verdict cached; the next open fails fast and runs legacy-only (files left UNTOUCHED — move them aside by hand after backing up to force a rebuild; JSON envelopes remain the recovery source, #5108/#4175)`);
+                loggerLog("error", `[storage] background quick_check threw a corruption-shaped error for ${dbPath}: ${detail} — FAIL verdict cached; the next open FAILS FAST AND REFUSES TO START (files left UNTOUCHED — move them aside by hand after backing up to force a rebuild; JSON envelopes remain the recovery source, #5108/#4175)`);
                 onVerdict?.(false, detail);
             } else {
                 loggerLog("warn", `[storage] background quick_check could not run for ${dbPath}: ${String(msg.error)} — the store serves unverified; the next boot rechecks`);
