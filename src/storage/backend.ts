@@ -33,6 +33,7 @@ export type {
     SessionSummaryRow,
     WebSummaryRow,
     IngestSessionInput,
+    SessionViewRows,
 } from "./store.js";
 import type {
     SessionRow,
@@ -44,6 +45,7 @@ import type {
     SessionSummaryRow,
     WebSummaryRow,
     IngestSessionInput,
+    SessionViewRows,
 } from "./store.js";
 
 /** Everything a storage backend must provide. Mirrors the operation surface
@@ -77,6 +79,9 @@ export interface StorageBackend {
     cloneSessionRows(parentId: string, childId: string, throughSeq: number, initial?: IngestSessionInput): Promise<boolean>;
     getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string })[]>;
     getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]>;
+    /** #4739: the viewFor bundle from ONE consistent read snapshot (messages
+     *  fetched only at the tail/pluginSnapshot pointer seqs). */
+    sessionViewRows(sessionId: string): Promise<SessionViewRows>;
     getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]>;
     getRefs(sessionId: string): Promise<RefRow[]>;
     /** All reads, including CAS hydration, use one short read-only snapshot. */
@@ -199,6 +204,9 @@ export class SqliteBackend implements StorageBackend {
     }
     getBlocks(sessionId: string, opts?: { limit: number; offset?: number }): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
         return Promise.resolve(this.store.getBlocks(sessionId, opts));
+    }
+    sessionViewRows(sessionId: string): Promise<SessionViewRows> {
+        return Promise.resolve(this.store.sessionViewRows(sessionId));
     }
     getDeadRefs(sessionId: string): Promise<{ ord: number; ref: string; refNum: number; recordedAt: number }[]> {
         return Promise.resolve(this.store.getDeadRefs(sessionId));
