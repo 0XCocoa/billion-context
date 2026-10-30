@@ -116,9 +116,11 @@ class StubMysqlBackend implements StorageBackend {
     cloneSessionRows(): Promise<boolean> {
         return Promise.resolve(true);
     }
-    getMessages(sessionId: string): Promise<(MessageRow & { contentHash: string })[]> {
+    getMessages(sessionId: string, _opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]> {
         const rows = this.rows.get(sessionId)?.messages ?? [];
-        return Promise.resolve(rows.map((r) => ({ ...r, contentHash: r.contentHash ?? sha256(r.content) })));
+        // Stub rows come from ingest inputs only (live rows, never retired),
+        // so retiredAt is always null here — shape kept for interface parity.
+        return Promise.resolve(rows.map((r) => ({ ...r, contentHash: r.contentHash ?? sha256(r.content), retiredAt: null })));
     }
     getBlocks(sessionId: string): Promise<(BlockRow & { summaryHash: string; oneHash: string | null })[]> {
         const rows = this.rows.get(sessionId)?.blocks ?? [];
