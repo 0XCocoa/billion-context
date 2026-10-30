@@ -11,14 +11,19 @@
  * manual rename). Facets covered here:
  *   1. the classifier itself (corruption shapes match, transient shapes do NOT);
  *   2. UnifiedStore.open turns a throwing scan into StorageIntegrityError;
- *   3. the shadow quarantines + reopens fresh instead of degrading;
- *   4. a failed quarantine rename degrades loudly with the errno (no doomed reopen);
+ *   3. the shadow leaves the file set EXACTLY where it is (no automatic
+ *      rename — #4626-era owner decision) and degrades loudly with an
+ *      actionable operator instruction + cached FAIL verdict;
+ *   4. the FAIL verdict makes the next open fail fast WITHOUT rescan;
+ *   5. the documented manual resolution (back up, move aside, restart)
+ *      actually unblocks: a fresh store rebuilds cleanly;
  *   5. the background (large-store) check caches its FAIL verdict across a clean close;
  *   6. /__bili/status reports the resolved engine when the failure happened AFTER resolution.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, closeSync, existsSync, mkdtempSync, openSync, readdirSync, rmSync, statSync, truncateSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, existsSync, mkdtempSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, truncateSync, writeFileSync, writeSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { UnifiedStore, StorageIntegrityError } from "../src/storage/store.js";
@@ -30,6 +35,7 @@ import {
     resetIntegrityCheckStateForTests,
     setIntegritySyncThresholdForTests,
     backgroundIntegrityInflightForTests,
+    integrityCheckRunsForTests,
 } from "../src/storage/integrity-check.js";
 import {
     _resetStorageRuntimeStatusForTest,
@@ -40,7 +46,6 @@ import {
 
 const HAS_ENGINE = probeBuiltinSqlite() || probeHostBetterSqlite3();
 const SKIP_NO_ENGINE = HAS_ENGINE ? undefined : "no SQLite engine available on this host";
-const SKIP_RENAME_FAIL = SKIP_NO_ENGINE ?? (process.platform === "win32" ? "chmod has no permission effect on Windows" : undefined);
 
 function tmpDir(): string {
     return mkdtempSync(join(tmpdir(), "bili-issue4816-"));
@@ -149,26 +154,9 @@ test("#4816 store: a throwing quick_check becomes StorageIntegrityError", { skip
     }
 });
 
-test("#4816 shadow: throwing corruption is quarantined and the store recovers to full mode", { skip: SKIP_NO_ENGINE }, () => {
+test("#4816 shadow: throwing corruption leaves every file UNTOUCHED and degrades loudly", { skip: SKIP_NO_ENGINE }, () => {
     const dir = tmpDir();
     let shadow: UnifiedShadow | null = null;
-    try {
-        seedValidDb(join(dir, "index.db"));
-        truncateHalf(join(dir, "index.db"));
-        shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
-        assert.ok(shadow !== null, "corrupt index must be quarantined + reopened fresh, not degrade legacy-only");
-        assert.equal(shadow.readsUnified, true);
-        const names = readdirSync(dir);
-        assert.ok(names.some((n) => n.startsWith("index.db.corrupt-")), `quarantined copy kept for forensics, got ${names.join(", ")}`);
-        assert.ok(existsSync(join(dir, "index.db")), "fresh index.db exists after quarantine");
-    } finally {
-        shadow?.close();
-        rmSync(dir, { recursive: true, force: true });
-    }
-});
-
-test("#4816 shadow: a failed quarantine rename degrades loudly with the errno, no doomed reopen", { skip: SKIP_RENAME_FAIL }, () => {
-    const dir = tmpDir();
     // The wire reason below resolves `requested` from the REAL process env
     // (runtime-status records it only via SessionStore), and the CI baseline
     // preload pins BILI_STORAGE_UNIFIED=legacy for the non-storage corpus
@@ -179,23 +167,74 @@ test("#4816 shadow: a failed quarantine rename degrades loudly with the errno, n
     try {
         seedValidDb(join(dir, "index.db"));
         truncateHalf(join(dir, "index.db"));
-        chmodSync(dir, 0o555);
-        try {
-            _resetStorageRuntimeStatusForTest();
-            const shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
-            assert.equal(shadow, null, "must degrade when the primary cannot be moved aside");
-            assert.ok(existsSync(join(dir, "index.db")), "corrupt primary stays in place when the rename fails");
-            assert.ok(!readdirSync(dir).some((n) => n.startsWith("index.db.corrupt-")), "no partial quarantine");
-            const wire = storageStatusWire();
-            assert.match(wire.reason ?? "", /index database failed to open/);
-            assert.match(wire.reason ?? "", /quarantine rename failed/);
-        } finally {
-            chmodSync(dir, 0o755);
-            _resetStorageRuntimeStatusForTest();
-        }
+        const before = createHash("sha256").update(readFileSync(join(dir, "index.db"))).digest("hex");
+        _resetStorageRuntimeStatusForTest();
+        shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
+        assert.equal(shadow, null, "a provably-corrupt index must degrade legacy-only — nothing may auto-rename or auto-reopen");
+        // Byte-identical file set: NO automatic rename/repair (#4626-era owner
+        // decision — checkpoint rows live only inside the index, and with
+        // jsonWriterOff it is the sole durable copy).
+        const after = createHash("sha256").update(readFileSync(join(dir, "index.db"))).digest("hex");
+        assert.equal(after, before, "the corrupt primary must stay byte-identical");
+        assert.ok(!readdirSync(dir).some((n) => n.startsWith("index.db.corrupt-")), "no quarantine copies may exist anymore");
+        // Loud + actionable on the status wire.
+        const wire = storageStatusWire();
+        assert.match(wire.reason ?? "", /integrity check and was left UNTOUCHED/);
+        assert.match(wire.reason ?? "", /aside/i);
     } finally {
+        shadow?.close();
         if (prevUnified === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = prevUnified;
+        _resetStorageRuntimeStatusForTest();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("#4816 fail-fast: a second open after proven corruption does not rescan", { skip: SKIP_NO_ENGINE }, () => {
+    const dir = tmpDir();
+    try {
+        resetIntegrityCheckStateForTests();
+        const p = join(dir, "index.db");
+        seedValidDb(p);
+        truncateHalf(p); // proven to make PRAGMA quick_check throw CORRUPT
+        assert.throws(
+            () => UnifiedStore.open(p),
+            (err: unknown) => err instanceof StorageIntegrityError && /malformed/.test(err.detail),
+        );
+        const scansAfterFirst = integrityCheckRunsForTests();
+        const cache = readIntegrityCache(p);
+        assert.ok(cache !== null && cache.ok === false, `FAIL verdict cached on throw, got ${JSON.stringify(cache)}`);
+        // Second boot: served from the verdict cache — the typed error again,
+        // ZERO additional scans.
+        assert.throws(
+            () => UnifiedStore.open(p),
+            (err: unknown) => err instanceof StorageIntegrityError && /malformed/.test(err.detail),
+        );
+        assert.equal(integrityCheckRunsForTests(), scansAfterFirst, "cached-fail must short-circuit before any quick_check");
+    } finally {
+        resetIntegrityCheckStateForTests();
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("#4816 operator resolution: moving the corrupt set aside unblocks a fresh rebuild", { skip: SKIP_NO_ENGINE }, () => {
+    const dir = tmpDir();
+    let fresh: UnifiedStore | null = null;
+    try {
+        seedValidDb(join(dir, "index.db"));
+        truncateHalf(join(dir, "index.db"));
+        assert.throws(() => UnifiedStore.open(join(dir, "index.db")), (err: unknown) => err instanceof StorageIntegrityError);
+        // The documented manual step: back up, move the file set aside…
+        for (const suffix of ["", "-wal", "-shm"] as const) {
+            const from = join(dir, `index.db${suffix}`);
+            if (!existsSync(from)) continue;
+            renameSync(from, `${from}.moved-by-operator`);
+        }
+        // …and the next start rebuilds cleanly against the empty directory.
+        fresh = UnifiedStore.open(join(dir, "index.db"));
+        assert.deepEqual(fresh.listSessionIds(), [] as string[], "rebuilt index opens cleanly against the empty directory");
+    } finally {
+        fresh?.close();
         rmSync(dir, { recursive: true, force: true });
     }
 });
@@ -217,7 +256,7 @@ test("#4816 worker facet: a large store's throwing background check caches FAIL 
         } finally {
             s1.close(); // checkpoint moves the WAL — the refresh must carry the FAIL verdict
         }
-        // Next boot: cached-fail → typed error → the shadow would quarantine.
+        // Next boot: cached-fail → typed error → the shadow degrades loudly (no rescan).
         assert.throws(
             () => UnifiedStore.open(p),
             (err: unknown) => err instanceof StorageIntegrityError && /malformed/.test(err.detail),

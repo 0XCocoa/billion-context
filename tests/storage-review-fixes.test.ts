@@ -136,7 +136,7 @@ test("review 2: destroyed-substrate blocks are deleted and cannot resurrect on a
     });
 });
 
-test("review 3: corrupt index.db auto-quarantines and recovers instead of bricking the proxy", async () => {
+test("review 3: corrupt index.db degrades loudly instead of bricking the proxy", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-review-corrupt-"));
     try {
         const session = loadCorpusCase(dir, "folded", "corpus-folded", "anthropic");
@@ -152,13 +152,14 @@ test("review 3: corrupt index.db auto-quarantines and recovers instead of bricki
             await store.writeNow(session);
             const reloaded = store.loadSync(session.id, { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
             assert.ok(reloaded, "session load must succeed");
-            // #5124/#4816 behavior change (a): this corruption shape makes
-            // quick_check THROW, so the store quarantines the corrupt file set
-            // and recovers a fresh index — it no longer degrades legacy-only.
-            assert.equal(store.replicasAvailable(), true, "throwing corruption must be quarantined + recovered, not stay legacy-only");
+            // #5124/#4816/#4626 behavior change: this corruption shape makes
+            // quick_check THROW, and it is classified — but NO file is ever
+            // renamed or a fresh index opened automatically; the store serves
+            // legacy-only until an operator moves the corrupt set aside.
+            assert.equal(store.replicasAvailable(), false, "throwing corruption must degrade legacy-only under the #4626 policy");
             const names = fs.readdirSync(dir);
-            assert.ok(names.some((n) => n.startsWith("index.db.corrupt-")), `quarantined copy kept for forensics, got ${names.join(", ")}`);
-            assert.ok(fs.existsSync(path.join(dir, "index.db")), "fresh index.db exists after quarantine");
+            assert.ok(!names.some((n) => n.startsWith("index.db.corrupt-")), `no automatic .corrupt-* copy may exist, got ${names.join(", ")}`);
+            assert.ok(fs.existsSync(path.join(dir, "index.db")), "the corrupt index.db must stay exactly where it is");
             await store.flushAll(); // flush the JSON record to disk (closeQuietly only cancels)
         } finally {
             store!.closeQuietly();

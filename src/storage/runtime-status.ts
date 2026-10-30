@@ -188,7 +188,7 @@ function shortenError(err: string): string {
     const oneLine = err.replace(/\s+/g, " ").trim();
     if (oneLine.length <= 160) return oneLine;
     // #5108/#4816: both ends carry signal — the error class up front, the
-    // errno/detail at the end (e.g. "quarantine rename failed: EPERM") — so
+    // errno/detail at the end (e.g. "corruption detail: …") — so
     // cut the MIDDLE (usually a long path) instead of the tail. Head-only
     // truncation made the actionable detail invisible on exactly the
     // long-path machines (Windows user profiles) this fix targets.
@@ -219,6 +219,11 @@ function degradeReason(): string {
         // say what it actually is instead of "index database failed to open".
         if (isNoEngineError(e)) {
             return `no SQLite engine available (node:sqlite missing, better-sqlite3 not installed)${nodeSqliteUpgradeHint()}`;
+        }
+        // #4626-era owner decision: a provably-corrupt index is LEFT IN PLACE
+        // (no automatic rename), so the reason must carry the manual fix.
+        if (/StorageIntegrityError|integrity quick_check failed/i.test(state.sidecarOpenError)) {
+            return `index database failed its integrity check and was left UNTOUCHED (${e}) — back up index.db{,-wal,-shm}, then move those files aside by hand to rebuild; the proxy runs legacy-only meanwhile`;
         }
         return `index database failed to open (${e})${sqliteOpenFailureHint(state.sidecarOpenError)}`;
     }

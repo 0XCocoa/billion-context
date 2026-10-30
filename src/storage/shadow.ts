@@ -26,7 +26,6 @@ import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendB
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, StorageSecondWriterError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
-import { existsSync, renameSync } from "node:fs";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
@@ -253,73 +252,38 @@ export class UnifiedShadow {
             try {
                 store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit, secondWriterPolicy: "degrade" });
             } catch (err) {
-                // #5046/B: a live foreign writer owns this db — never quarantine (the file is NOT corrupt) and never take over its lock; the outer catch degrades.
+                // #5046/B: a live foreign writer owns this db — never touch it (the file is NOT corrupt) and never take over its lock; the outer catch degrades.
                 if (err instanceof StorageSecondWriterError) throw err;
-                // #4175: quick_check failed — the file set is provably corrupt.
-                // Quarantine it (db/-wal/-shm → .corrupt-<ts>, same suffix
-                // discipline as the session envelopes) and retry ONCE with a
-                // fresh file: the JSON envelopes remain the recovery source
-                // (full mode re-imports organically on load). No auto-delete —
-                // the corrupt original is kept for forensics.
+                // #4175: anything else throwing StorageIntegrityError means quick_check
+                // proved the file set corrupt — handled below WITHOUT moving any file
+                // (#4626-era owner decision, 2026-10-30).
                 if (!(err instanceof StorageIntegrityError)) throw err;
-                const stamp = Date.now();
-                const quarantined: string[] = [];
-                let primaryRenameFailure: string | null = null;
-                const sidecarLeft: string[] = [];
-                for (const suffix of ["", "-wal", "-shm"]) {
-                    const from = `${dir}/index.db${suffix}`;
-                    if (!existsSync(from)) continue; // absent sidecar files are fine
-                    const to = `${dir}/index.db${suffix}.corrupt-${stamp}`;
-                    try {
-                        renameSync(from, to);
-                        quarantined.push(path.basename(to));
-                    } catch (rerr) {
-                        // #5108/#4347: the old empty catch swallowed EVERY failure
-                        // — including a primary that could not be moved — and the
-                        // code below then claimed success. Capture the errno and
-                        // decide per file what a failed move actually means.
-                        const why = String((rerr as NodeJS.ErrnoException).code ?? rerr);
-                        if (suffix === "") primaryRenameFailure = why;
-                        else sidecarLeft.push(`${path.basename(from)} (${why})`);
-                    }
-                }
-                // #4609: the verdict cache belongs to the quarantined file set —
-                // move it along so the fresh store starts with a clean cache
-                // (its stats differ anyway; this keeps the directory honest).
-                try {
-                    const cacheFrom = `${dir}/index.db.chk`;
-                    renameSync(cacheFrom, `${cacheFrom}.corrupt-${stamp}`);
-                    quarantined.push(path.basename(`${cacheFrom}.corrupt-${stamp}`));
-                } catch (rerr) {
-                    if (existsSync(`${dir}/index.db.chk`)) {
-                        // Present but unmovable — harmless (the fresh store's stats
-                        // key misses and rescans), but say so instead of staying silent.
-                        loggerLog("warn", `[storage] quarantined index.db but its .chk verdict cache could not be moved (${String((rerr as NodeJS.ErrnoException).code ?? rerr)}) — it will be overwritten by the next check`);
-                    }
-                }
-                if (primaryRenameFailure !== null) {
-                    // The corrupt PRIMARY is still in place: a fresh reopen would
-                    // just re-hit the same corrupt file, so do NOT attempt it —
-                    // degrade loudly with the real errno instead of claiming the
-                    // quarantine succeeded. The operator moves the file aside by
-                    // hand (the same manual workaround that always worked).
-                    loggerLog(
-                        "error",
-                        `[storage] index.db failed its integrity quick_check (${err.detail}) but the corrupt file could NOT be quarantined (rename ${primaryRenameFailure}${sidecarLeft.length > 0 ? `; also left behind: ${sidecarLeft.join(", ")}` : ""}) — staying legacy-only; move ${path.join(dir, "index.db")} aside by hand to rebuild the index (#5108/#4347)`,
-                    );
-                    throw new StorageIntegrityError(`${dir}/index.db`, `${err.detail}; quarantine rename failed: ${primaryRenameFailure}`);
-                }
-                if (sidecarLeft.length > 0) {
-                    // Probe-verified (node:sqlite v22): SQLite RESETS a stale -wal
-                    // whose parent db was replaced rather than replaying it onto
-                    // the fresh file, so leftover sidecars are safe to leave.
-                    loggerLog("warn", `[storage] quarantined index.db but ${sidecarLeft.join(", ")} could not be renamed — left in place (a stale -wal is reset, not replayed, on the next open)`);
-                }
+                // #4626-era owner decision (2026-10-30): NO automatic quarantine
+                // rename. quick_check proved the file set corrupt, but automatic
+                // removal of a storage PRIMARY was withdrawn because full data
+                // recovery cannot be guaranteed without touching the main flow:
+                //   - checkpoint rows live only inside index.db — the JSON
+                //     envelopes are NOT a complete round-trip for them;
+                //   - with BILI_STORAGE_JSON_WRITER=off (jsonWriterOff, see
+                //     persist.ts) the envelopes are skipped entirely and the
+                //     index is the SOLE durable copy — an automatic rename
+                //     destroys unrecoverable data;
+                //   - a corrupt-on-open index can still often be salvaged by an
+                //     operator; renaming it away severs that last option forever.
+                // The file set therefore stays EXACTLY in place, untouched;
+                // we degrade loudly instead (outer catch → legacy-only + the
+                // status wire). The FAIL verdict has already been written to
+                // index.db.chk by UnifiedStore.open, so every later open in
+                // this deployment fails fast from the cache — no rescans, no
+                // repeated work in the main flow. Manual resolution (unchanged
+                // #2771 fallback): back up, then move index.db{-wal,-shm}
+                // aside yourself; the next start rebuilds the index fresh and
+                // re-imports the JSON envelopes that hold session content.
                 loggerLog(
                     "error",
-                    `[storage] index.db failed its integrity quick_check (${err.detail}) — quarantined ${quarantined.join(", ")} and reopened fresh; JSON envelopes remain the recovery source (#4175)`,
+                    `[storage] index.db failed its integrity quick_check (${err.detail}) — leaving the file UNTOUCHED and running legacy-only (no automatic rename); back up ${path.join(dir, "index.db")}{,-wal,-shm}, then move those files aside to force a fresh rebuild (JSON envelopes remain the recovery source for session content) (#4175/#4626)`,
                 );
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit, secondWriterPolicy: "degrade" });
+                throw err;
             }
             // #3285: watermark trust does not cross process boundaries — a
             // restart-handoff overlap leaves the previous writer's rows AND
@@ -347,11 +311,17 @@ export class UnifiedShadow {
             // session state in unified-full mode). The delete advice fits only a genuine corrupt
             // file; the Node.js upgrade lever is surfaced via /__bili/status + the bootstrap warn.
             const hint = sqliteOpenFailureHint(errStr);
+            // #4626-era owner decision: a provably-corrupt index is LEFT IN PLACE —
+            // "delete to reset" advice would nudge toward destroying data that
+            // may not be fully envelope-covered (checkpoints; jsonWriterOff).
+            const corruptIntegrity = err instanceof StorageIntegrityError;
             const tail = /no SQLite engine available/i.test(errStr)
                 ? ""
-                : hint !== ""
-                    ? hint
-                    : "; delete the file to reset the index";
+                : corruptIntegrity
+                    ? ""
+                    : hint !== ""
+                        ? hint
+                        : "; delete the file to reset the index";
             loggerLog(
                 "warn",
                 `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${tail}`,

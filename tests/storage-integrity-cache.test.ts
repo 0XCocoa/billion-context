@@ -6,7 +6,8 @@
  *      open must NOT recheck (counter stays put).
  *   2. any stat change (mtime bump) invalidates the cache → recheck.
  *   3. cached failure → open throws StorageIntegrityError (the #4175
- *      quarantine-and-reopen-fresh path) without rescanning.
+ *      loud-degrade trigger: files stay where they are, next open fails fast)
+ *      without rescanning.
  *   4. large store (threshold overridden to 1 byte): open returns without
  *      blocking; a worker-thread check completes in the background, writes
  *      the cache, and the counter reaches 1.
@@ -81,7 +82,7 @@ test("touching the db file invalidates the cache and forces a recheck", () => {
     }
 });
 
-test("a cached failure fails open with the typed error (the #4175 quarantine trigger) without rescanning", () => {
+test("a cached failure fails open with the typed error (the #4175 loud-degrade trigger) without rescanning", () => {
     resetIntegrityCheckStateForTests();
     setIntegritySyncThresholdForTests(null);
     const dir = tmpDir();

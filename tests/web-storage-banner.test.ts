@@ -1,8 +1,8 @@
 // #3040 web surface: SQLite unified storage degrades to legacy-only through
 // several fail-open paths (#2825 contract): engine ladder exhausted,
 // self-download blocked in cooldown, non-corruption index-open failures,
-// 3-strike sidecar disable (a corrupt index.db since #4816 quarantines and
-// recovers instead of degrading). The proxy keeps running on JSON — correct — but until now
+// 3-strike sidecar disable (a corrupt index.db since #4626-era policy degrades
+// loudly with the files left in place — nothing is auto-renamed). The proxy keeps running on JSON — correct — but until now
 // the condition was only visible as one-time log lines, so environments that
 // cannot run SQLite were never learned about before the upcoming full-mode
 // default flip. These tests pin the wire contract the web banner reads:
@@ -271,10 +271,10 @@ test("#3040 engine-ladder-exhausted degrade: banner wire shape with the open-fai
         // construct the store → serve /__bili/overview → assert the degraded
         // wire shape → close) runs in a spawned child so any OS handle the
         // store opens is released by process exit before this parent's
-        // rmrf(base) can hit a Windows EBUSY. (#4816 moved the trigger off
-        // the corrupt-index cause: that one now quarantines and recovers, so
-        // the banner surface is pinned through the deterministic no-engine
-        // path instead.) The child prints a JSON verdict of named checks;
+        // rmrf(base) can hit a Windows EBUSY. (#4816/#4626: the corrupt-index
+        // cause no longer degrades through this surface — it now fails loudly
+        // with the files untouched, so the banner contract is pinned through
+        // the deterministic no-engine path instead.) The child prints a JSON verdict of named checks;
         // every one is re-asserted here, so assertion coverage stays 1:1
         // with the in-process era. The spawn env below is the child's only
         // isolation — this process's own env and seams stay untouched.

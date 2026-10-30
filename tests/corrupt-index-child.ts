@@ -34,6 +34,7 @@ import { spawnSync } from "node:child_process";
 import http from "node:http";
 import { once } from "node:events";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdirSync, realpathSync, writeSync } from "node:fs";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -193,24 +194,28 @@ export function makeOpts(upstreamPort: number): ProxyOptions {
 // sides reference these constants, so the coverage list cannot drift.
 // ---------------------------------------------------------------------------
 
-// #4816: throwing-shape corruption (header garbage / truncation) is now
-// quarantined and the store RECOVERS to full mode on a fresh index.db —
-// these checks pin that recovery plus the original #2781/#4357 leak guards.
+// #4816/#4626: throwing-shape corruption (header garbage / truncation) is
+// classified and degrades LOUDLY — but #4626-era owner decision withdrew the
+// automatic quarantine rename (no full-recovery guarantee), so the corrupt
+// files stay byte-identical in place and the store serves legacy-only until
+// an operator moves them aside. These checks pin that policy plus the
+// original #2781/#4357 leak guards.
 const ENGPROOF_CHECK_NAMES = {
-    quarantine: "corrupt index.db was renamed aside (index.db.corrupt-* kept for forensics)",
-    freshIndex: "a fresh index.db replaced the quarantined one",
-    lazyImport: "session reloaded from the legacy envelope into the recovered index",
-    midFlowGuard: "no live handle on the QUARANTINED file (#2781/#4357 rename guard)",
-    stateDigest: "recovered-index state digest matches the clean full-mode read",
-    writeNow: "writeNow keeps working over the recovered full mode",
+    noAutoRename: "corrupt index.db left UNTOUCHED — byte-identical, no .corrupt-* copy (#4626 decision)",
+    degraded: "store serves legacy-only; nothing auto-recovers full mode",
+    lazyImport: "session loaded from the legacy envelope while degraded",
+    midFlowGuard: "no live handle into the sessions dir while serving degraded (#2781/#4357 guard)",
+    stateDigest: "legacy load's state digest matches the clean full-mode read",
+    writeNow: "writeNow keeps working over the legacy path",
     postCloseGuard: "no live handle after the final close (post-close rename guard)",
     fdGuard: "no open fd into the corrupt index dir after close (/proc/self/fd, Linux)",
 } as const;
 export const ENGPROOF_CHECKS: readonly string[] = Object.values(ENGPROOF_CHECK_NAMES);
 
-// #4816: a corrupt index.db no longer degrades — it quarantines and recovers
-// (see engproof). The banner wire shape is pinned here through the remaining
-// deterministic cross-platform degrade cause: the engine ladder exhausted.
+// #4626-era owner decision: a corrupt index.db degrades loudly and NOTHING
+// is renamed or rebuilt automatically (see engproof). The banner wire shape
+// is pinned here through the remaining deterministic cross-platform degrade
+// cause: the engine ladder exhausted.
 const BANNER_CHECK_NAMES = {
     overviewAnswers: "/__bili/overview answers 200 with JSON",
     requestedFull: "storage.requested is full",
@@ -340,37 +345,31 @@ async function engproofScenario(argv: string[], run: CheckRun): Promise<void> {
     fs.writeSync(fd, Buffer.alloc(512, 0x5a), 0, 512, 0);
     fs.closeSync(fd);
 
-    // THE #2771 regression: construction must survive. Since #4816 the
-    // throwing-shape corruption is quarantined and the store recovers to
-    // full mode on a fresh index.db — reads lazily import the session back
-    // from the legacy envelope, and the digest must be exact.
+    // THE #2771 regression: construction must survive. #4626-era owner
+    // decision: NO automatic quarantine/recovery — the corrupt files stay
+    // where they are and the store serves from the JSON envelopes (full
+    // recovery can't be guaranteed without operator involvement); the
+    // envelope read below must still be exact.
+    const beforeHash = createHash("sha256").update(fs.readFileSync(path.join(dir, "index.db"))).digest("hex");
     const store2 = new SessionStore({ dir, debounceMs: 1, enabled: true });
-    await run.run(ENGPROOF_CHECK_NAMES.quarantine, () => {
+    await run.run(ENGPROOF_CHECK_NAMES.noAutoRename, () => {
         const names = fs.readdirSync(dir);
-        const q = names.find((n) => n.startsWith("index.db.corrupt-"));
-        assert.ok(q, `no quarantined index.db.corrupt-* in ${names.join(", ")}`);
+        assert.ok(!names.some((n) => n.startsWith("index.db.corrupt-")), `an automatic .corrupt-* copy must never exist, got ${names.join(", ")}`);
+        const afterHash = createHash("sha256").update(fs.readFileSync(path.join(dir, "index.db"))).digest("hex");
+        assert.equal(afterHash, beforeHash, "the corrupt primary must stay byte-identical");
     });
-    await run.run(ENGPROOF_CHECK_NAMES.freshIndex, () =>
-        assert.ok(fs.existsSync(path.join(dir, "index.db")), "fresh index.db absent after quarantine"));
+    await run.run(ENGPROOF_CHECK_NAMES.degraded, () =>
+        assert.equal(store2.replicasAvailable(), false, "must serve legacy-only — nothing may auto-recover full mode"));
     const reloaded = store2.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
     store2.cancelAll();
     try {
         await run.run(ENGPROOF_CHECK_NAMES.lazyImport, () =>
-            assert.ok(reloaded, "recovered store returned null for a session whose legacy envelope exists"));
+            assert.ok(reloaded, "degraded store returned null for a session whose legacy envelope exists"));
         if (!reloaded) return;
 
-        // Leak guard (#2781/#4357): the DEAD quarantined file must carry no
-        // live handle. The whole-dir rename used pre-#4816 is wrong now —
-        // the store legitimately holds the FRESH index.db, and only a
-        // handle on the dead file is the leak class this guard hunts.
-        await run.run(ENGPROOF_CHECK_NAMES.midFlowGuard, () => {
-            const q = fs.readdirSync(dir).find((n) => n.startsWith("index.db.corrupt-"));
-            assert.ok(q, "quarantined file vanished before the leak guard ran");
-            const src = path.join(dir, q!);
-            const probe = `${src}-moved`;
-            fs.renameSync(src, probe);
-            fs.renameSync(probe, src);
-        });
+        // Leak guard (#2781/#4357): a degraded store must hold NO persistent
+        // handle into the dir at all — whole-dir rename round-trip.
+        await runGuard(run, ENGPROOF_CHECK_NAMES.midFlowGuard, dir, "-midflow");
 
         // #4316 PR3/3: the clean full-mode read carried the one-time ledger
         // alignment; the recovered load applies it again. The parent passes

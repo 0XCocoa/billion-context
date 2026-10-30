@@ -7,6 +7,7 @@
  * fails on the current tree.
  */
 import { strict as assert } from "node:assert";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -45,7 +46,7 @@ function legacyLike(id: string): LegacySessionLike {
     };
 }
 
-test("quick_check: a corrupt db fails open with a typed error, and the wrapper quarantines + reopens fresh", async () => {
+test("quick_check: a corrupt db fails open with a typed error, files left UNTOUCHED (#4626 policy)", async () => {
     const dir = freshDir();
     try {
         // 1. Create a valid db.
@@ -129,7 +130,7 @@ test("lockfile: a live foreign pid is reported, a dead pid is taken over, close 
     }
 });
 
-test("shadow open quarantines a corrupt index.db set and reopens fresh", async () => {
+test("shadow open degrades loudly on a corrupt index.db set — nothing renamed (#4626)", async () => {
     const { UnifiedShadow } = await import("../src/storage/shadow.ts");
     const { readdirSync } = await import("node:fs");
     const dir = freshDir();
@@ -139,32 +140,25 @@ test("shadow open quarantines a corrupt index.db set and reopens fresh", async (
         const store = UnifiedStore.open(path);
         store.close();
 
-        // Corrupt it (page area flip).
+        // Corrupt it (page area flip) and remember its exact bytes.
         const raw = readFileSync(path);
         for (let i = Math.floor(raw.length / 3); i < Math.floor(raw.length / 3) + 4096; i++) {
             raw[i] = raw[i] ^ 0xff;
         }
         writeFileSync(path, raw);
+        const beforeHash = createHash("sha256").update(raw).digest("hex");
 
-        // The shadow's maybeOpen (full mode) must quarantine + reopen fresh.
+        // The shadow's maybeOpen (full mode) must degrade legacy-only and
+        // leave EVERY file exactly where it was: no rename, no auto-reopen,
+        // no forensics copy (#4626-era owner decision — full recovery cannot
+        // be guaranteed without operator involvement).
         const env = { ...process.env, BILI_STORAGE_UNIFIED: "full" };
         const shadow = UnifiedShadow.maybeOpen(dir, env);
-        assert.ok(shadow, "shadow opens after quarantine");
-
+        assert.equal(shadow, null, "a provably-corrupt index must degrade loudly, not auto-recover");
         const names = readdirSync(dir);
-        const quarantined = names.filter((n) => n.includes(".corrupt-"));
-        assert.ok(quarantined.some((n) => n.startsWith("index.db.corrupt-")), "main db quarantined");
-        // sidecars (-wal/-shm) ride the quarantine when the engine's close
-        // left them behind; the freshly reopened db legitimately creates its
-        // own new -wal, so sidecar presence alone proves nothing here.
-        assert.ok(names.includes("index.db"), "fresh db exists");
-
-        // The fresh db is writable (ingest one session through it).
-        const fresh = UnifiedStore.open(path);
-        fresh.ingestSession(planIngest(legacyLike("post-quarantine")));
-        assert.deepEqual(fresh.listSessionIds(), ["post-quarantine"]);
-        fresh.close();
-        shadow.close();
+        assert.ok(!names.some((n) => n.includes(".corrupt-")), `no automatic copies allowed, got ${names.join(", ")}`);
+        const afterHash = createHash("sha256").update(readFileSync(path)).digest("hex");
+        assert.equal(afterHash, beforeHash, "the corrupt primary must stay byte-identical");
     } finally {
         rmSync(dir, { recursive: true, force: true });
     }

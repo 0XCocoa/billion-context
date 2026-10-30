@@ -26,14 +26,15 @@
  *                      load's migration → the file loads the exact digest.
  *   SELF-DISABLE     — 3 consecutive sidecar failures disable it; reads flip
  *                      back to legacy; the legacy file stays readable.
- *   CORRUPT INDEX    — a corrupt index.db is quarantined and the store
- *                      recovers to full mode instead of bricking
- *                      construction (#2771 → #4816).
+ *   CORRUPT INDEX    — a corrupt index.db degrades LOUDLY with the file set
+ *                      left in place (no automatic rename, #4626-era owner
+ *                      decision) instead of bricking construction (#2771).
  *   CAS REFCOUNT     — shared content blobs survive deleteSession of one
  *                      session and are collected only at refcount 0.
  *
  * The corrupt-index test is the regression for #2771 (re-pinned for the
- * #4816 quarantine-and-recover behavior); the rest are contract pins
+ * #4626 loud-degrade policy: nothing renamed, envelopes keep serving); the
+ * rest are contract pins
  * (proof-only, no product change).
  */
 
@@ -366,11 +367,11 @@ test("storage engine: sidecar self-disables after 3 consecutive failures (reads 
 });
 
 // ---------------------------------------------------------------------------
-// CORRUPT INDEX (#2771 → #4816): construction quarantines the corrupt index
-// and recovers to full mode.
+// CORRUPT INDEX (#2771 → #4626): construction survives a provably-corrupt
+// index and degrades loudly — files untouched, no automatic rename.
 // ---------------------------------------------------------------------------
 
-test("storage engine: corrupt index.db is quarantined and recovers to full mode instead of bricking construction (#2771/#4816)", { timeout: 180_000 }, async () => {
+test("storage engine: corrupt index.db degrades loudly instead of bricking construction (#2771/#4626)", { timeout: 180_000 }, async () => {
     const dir = tmpdir("bili-engproof-corrupt-");
     const prev = process.env.BILI_STORAGE_UNIFIED;
     try {
@@ -389,8 +390,8 @@ test("storage engine: corrupt index.db is quarantined and recovers to full mode 
         await clean.writeNow(viaFull);
         clean.closeQuietly();
 
-        // #4338: everything past this point (corrupt the header → quarantine
-        // + fresh reopen → lazy-import read → leak guards → write → close)
+        // #4338: everything past this point (corrupt the header → loud
+        // degrade → envelope read → leak guards → write → close)
         // runs in a spawned child. On Windows any sqlite file the scenario
         // touches can leave an OS handle with no JS reference to release, and
         // the resulting persistent EBUSY at rmrf would outlive the whole
@@ -400,7 +401,7 @@ test("storage engine: corrupt index.db is quarantined and recovers to full mode 
         // re-asserted here, so assertion coverage is 1:1 with the
         // in-process era (same asserts, executed in the child, verified in
         // the parent). The child also runs the #2781/#4357 mid-flow leak
-        // guard on the quarantined file plus a post-close guard, so future
+        // guard on the sessions dir plus a post-close guard, so future
         // handle-leak drift trips there by name instead of at teardown.
         // #4316 PR3/3: expected digest computed modulo the one-time ledger
         // alignment — the clean read above already carried it in memory, and

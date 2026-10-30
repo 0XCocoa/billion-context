@@ -347,8 +347,11 @@ function likeEscape(prefix: string): string {
 /**
  * #4175: raised when PRAGMA quick_check fails at open. Migrations must never
  * run against a corrupt file, so this fires BEFORE migrateSchema; the shadow
- * layer catches it, quarantines the file set (db/-wal/-shm → .corrupt-<ts>),
- * and reopens fresh (the JSON envelopes remain the recovery source).
+ * layer catches it and degrades to legacy-only LOUDLY without touching the
+ * file set — no automatic rename/repair (#4626-era owner decision: full data
+ * recovery cannot be guaranteed without operator involvement). The FAIL
+ * verdict is cached so later opens fail fast; the operator moves the files
+ * aside by hand (backed up first) to force a fresh rebuild.
  */
 export class StorageIntegrityError extends Error {
     constructor(public readonly dbPath: string, public readonly detail: string) {
@@ -416,7 +419,8 @@ export class UnifiedStore {
     private lastIntegrityOk = false;
     /** #5108/#4816: a completed check said the file set is CORRUPT — a clean
      * close refreshes the FAIL verdict onto post-checkpoint stats so the
-     * next boot's cached-fail path quarantines instead of rescan-looping
+     * next boot's cached-fail path fails fast (loud degrade) instead of
+     * rescan-looping
      * (a clean close moves the WAL, which would otherwise invalidate the
      * cache key and send a large corrupt store back to unverified forever).
      * Outranks lastIntegrityOk at close time. */
@@ -445,8 +449,9 @@ export class UnifiedStore {
         // preserved wherever it is cheap); a large store checks in the
         // background post-open (#4609: a 14 GB quick_check costs ~260 s and
         // the 60 s native spawn budget killed the child mid-scan). A cached
-        // failure throws here so the shadow's quarantine-and-reopen-fresh
-        // path (#4175) runs — including for failures found by the background
+        // failure throws here so the shadow degrades loudly INSTEAD of
+        // rescan-looping (#4626-era owner decision: no automatic quarantine —
+        // see maybeOpen) — including for failures found by the background
         // check of a previous run. BILI_STORAGE_QUICK_CHECK=0 opts out of all
         // of it (no check, no cache IO).
         let integrityOk = false;
@@ -470,24 +475,32 @@ export class UnifiedStore {
                 // Corrupt header (NOTADB) throws from the statement itself, so
                 // the verdict branch never runs: close the handle we opened
                 // before rethrowing — the #2771 fallback tells operators to
-                // DELETE the file, and Windows refuses to delete a file this
-                // process still holds (unlink EBUSY, #4347 probe).
+                // MOVE the file aside by hand (backed up first), and Windows
+                // refuses to move a file this process still holds (EBUSY,
+                // #4347 probe).
                 // #5108/#4816: corruption-shaped THROWS (truncated file, garbage
                 // header, broken overflow chain) must become StorageIntegrityError
                 // like the verdict-row path does — the raw rethrow escaped the
-                // shadow's quarantine guard (#4175) and left the corrupt set in
+                // shadow's integrity guard (#4175) and left the corrupt set in
                 // place forever. Transient shapes (BUSY/IOERR/CANTOPEN) stay raw:
                 // quarantining a locked-but-healthy index would be the bug.
                 recordIntegrityOutcome(path, false, Date.now() - started, String(err).slice(0, 400));
                 db.close();
                 const detail = sqliteCorruptionDetail(err);
-                if (detail !== null) throw new StorageIntegrityError(path, detail.slice(0, 400));
+                if (detail !== null) {
+                    // #4626-era owner decision: nothing is renamed away — cache
+                    // the FAIL verdict FIRST so every later open fails fast
+                    // without re-running the scan.
+                    writeIntegrityCache(path, false, detail.slice(0, 400));
+                    throw new StorageIntegrityError(path, detail.slice(0, 400));
+                }
                 throw err;
             }
             const durationMs = Date.now() - started;
             recordIntegrityOutcome(path, verdict === "ok", durationMs, verdict === "ok" ? undefined : verdict.slice(0, 400));
             if (verdict !== "ok") {
                 db.close();
+                writeIntegrityCache(path, false, verdict.slice(0, 400));
                 throw new StorageIntegrityError(path, verdict.slice(0, 400));
             }
             writeIntegrityCache(path, true);
@@ -551,13 +564,14 @@ export class UnifiedStore {
             migrateSchema(db);
         } catch (err) {
             // The handle we just opened must not leak when the file turns out
-            // to be corrupt: the #2771 fallback tells operators to DELETE the
-            // file to reset the index — and Windows refuses to delete a file a
-            // live process still holds open. Close, then rethrow for the
-            // shadow's legacy-only degradation.
+            // to be corrupt: the #2771 fallback tells operators to MOVE the
+            // file aside by hand (backed up first) to reset the index — and
+            // Windows refuses to move a file a live process still holds open.
+            // Close, then rethrow for the shadow's legacy-only degradation.
             // #5108/#4816: large stores (> sync threshold) skip the pre-migration
             // scan, so a corruption can surface HERE first — classify it the same
-            // way so the shadow quarantines instead of degrading forever.
+            // way so the loud degrade + fail-fast cache applies instead of an
+            // unexplained raw driver error.
             db.close();
             const detail = sqliteCorruptionDetail(err);
             if (detail !== null) throw new StorageIntegrityError(path, detail.slice(0, 400));
@@ -580,7 +594,8 @@ export class UnifiedStore {
         // #4609: a large store's cache-miss check runs post-open on a second
         // read-only connection — open() returns immediately; the verdict
         // lands in runtime-status and the cache (a cached failure makes the
-        // NEXT open quarantine + reopen fresh via the #4175 path).
+        // NEXT open fail fast and degrade loudly — no automatic file moves,
+        // #4175/#4626-era decision).
         if (mode.kind === "async") scheduleBackgroundIntegrityCheck(path, (ok, detail) => { if (ok) store.noteIntegrityOk(); else if (detail !== undefined) store.noteIntegrityFail(detail); });
         return store;
     }
