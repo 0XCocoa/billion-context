@@ -909,7 +909,7 @@ for (const storageMode of ["legacy", "full"] as const) {
             // #4316 PR3/3: only a unified cold load runs the one-time ledger
             // alignment; the CI legacy baseline retains the original state.
             const persistedState = JSON.parse(JSON.stringify(parent.state));
-            if (storageMode === "full") persistedState.refLedgerAligned = true;
+            if (h.store.replicasAvailable()) persistedState.refLedgerAligned = true;
             assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), persistedState);
             const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
             const req = forkRequest(snapshot);

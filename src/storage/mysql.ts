@@ -1422,7 +1422,7 @@ export class MysqlBackend implements StorageBackend {
                     role: str(r.role),
                     kind: str(r.kind),
                     contentHash,
-                    content: await this.hydrateMediaAsync((await this.getContent(this.pool, contentHash)) ?? ""),
+                    content: await this.hydrateMediaAsync((await this.getContent(this.pool, contentHash)) ?? "", this.pool),
                 });
             }
         }
@@ -1440,7 +1440,8 @@ export class MysqlBackend implements StorageBackend {
         return this.getMessagesOn(this.pool, sessionId, opts);
     }
 
-    private async getMessagesOn(conn: Pool | PoolConnection, sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]> {        // #4390: retired rows stay out of the replay by default.
+    private async getMessagesOn(conn: Pool | PoolConnection, sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): Promise<(MessageRow & { contentHash: string; retiredAt: number | null })[]> {
+        // #4390: retired rows stay out of the replay by default.
         if (opts?.seqs?.length === 0) return [];
         const seqFilter = opts?.seqs ? ` AND seq IN (${opts.seqs.map(() => "?").join(",")})` : "";
         const retiredFilter = opts?.includeRetired === true ? "" : " AND retired_at IS NULL";
@@ -1511,7 +1512,7 @@ export class MysqlBackend implements StorageBackend {
         const [rows] = (await conn.query(
             `SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
                     supersedes_block_id, active, created_at, covered_hash, payload_json
-             FROM blocks WHERE session_id = ? ORDER BY ord${opts ? ", block_id LIMIT ? OFFSET ?" : ""}`,
+             FROM blocks WHERE session_id = ? ORDER BY ord, block_id${opts ? " LIMIT ? OFFSET ?" : ""}`,
             [sessionId, ...(opts ? [opts.limit, opts.offset ?? 0] : [])],
         )) as unknown as Row[][];
         const out: (BlockRow & { summaryHash: string; oneHash: string | null })[] = [];

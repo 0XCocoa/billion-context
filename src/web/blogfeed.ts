@@ -105,6 +105,8 @@ export function _setBlogRootForTest(root: string | null): void {
 
 /** Mirror of the website tools' frontmatter parser (key: value between --- fences). */
 function parseFrontmatter(text: string): { fm: Record<string, string>; body: string } {
+    // Windows checkouts use CRLF; parse and render the same Markdown on every platform.
+    text = text.replace(/\r\n/g, "\n");
     const fm: Record<string, string> = {};
     // Git-for-Windows autocrlf checks .md posts out with CRLF; normalize
     // UNCONDITIONALLY so the exact-match fences survive Windows checkouts

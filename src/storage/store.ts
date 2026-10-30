@@ -2925,8 +2925,7 @@ export class UnifiedStore {
             .prepare(
                 `SELECT block_id, ord, start_seq, end_seq, start_ref, end_ref, tier, summary_hash, one_hash,
                         supersedes_block_id, active, created_at, covered_hash, payload_json
-                 FROM blocks WHERE session_id = ? ORDER BY ord${opts ? ", block_id LIMIT ? OFFSET ?" : ""}`,
-            )
+                 FROM blocks WHERE session_id = ? ORDER BY ord, block_id${opts ? " LIMIT ? OFFSET ?" : ""}`,            )
             .all(sessionId, ...(opts ? [opts.limit, opts.offset ?? 0] : [])) as Record<string, unknown>[];
         return rows.map((r) => ({
             blockId: r.block_id as string,

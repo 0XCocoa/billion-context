@@ -167,6 +167,7 @@ for (const wire of WIRES) {
             const record = await driveWire(wire as Wire, `golden-${wire}`, { storageUnified: "full", reloadAfterEdit: leg });
             assert.equal(record.turns.length, legacy.turns.length, `${wire}/${leg}: body count drifted vs legacy restart`);
             for (let i = 0; i < legacy.turns.length; i++) {
+                if (i <= record.editedAt) assert.equal(record.turns[i]!.sha, golden.turns[i]!.sha, `${wire}/${leg}: pre-migration body #${i} digest drift vs committed goldens`);
                 // #4316 PR3/3 (380ef4dac): a full-mode cold load re-homes citation
                 // numbers once (one-time ledger alignment) — the ONLY permitted
                 // wire delta. Citation-normalized digests must match turn-for-turn.

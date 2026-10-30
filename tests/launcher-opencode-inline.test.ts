@@ -126,7 +126,7 @@ test("runLaunch opencode-inline: no proxy spawned, BILI_OPENCODE_INLINE=1, attac
             assert.equal(cap.command, fakeOc);
             assert.deepEqual(cap.args, []);
         }
-        const env = spawns[0].env!;
+        const env = cap.env!;
         assert.equal(env.BILI_OPENCODE_INLINE, "1");
         assert.equal(env.BILLION_CONTEXT_PROXY, undefined, "inherited BILLION_CONTEXT_PROXY must be stripped (attach would win)");
         assert.equal(env.HTTPS_PROXY, undefined, "inherited HTTPS_PROXY must be stripped (no MITM lane)");
