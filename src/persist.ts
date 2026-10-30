@@ -417,6 +417,8 @@ export class SessionStore {
      *  per-turn debounced save unstamped and killed the ownership fast path. */
     private readonly saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private readonly saveBuilders = new Map<string, () => PersistedSession>();
+    /** #5155: afterNextFlush waiters, drained when the armed save lands. */
+    private readonly flushWaiters = new Map<string, Array<() => void>>();
     private readonly debounceMs: number;
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
@@ -1940,10 +1942,10 @@ export class SessionStore {
         this.liveShadow().vacuum(mode);
     }
 
-    unifiedRawMessages(sessionId: string): { seq: number; content: string }[] | null {
+    unifiedRawMessages(sessionId: string, fromSeqExclusive?: number): { seq: number; content: string }[] | null {
         if (!this.shadow || this.shadow.stats.disabled) return null;
         try {
-            return this.shadow.rawMessages(sessionId);
+            return this.shadow.rawMessages(sessionId, fromSeqExclusive);
         } catch {
             return null; // sidecar degraded mid-call: treat as unavailable
         }
@@ -2642,6 +2644,8 @@ export class SessionStore {
                     // escaping this microtask is fatal in embedded/plugin hosts
                     // without process-level handlers; the next markDirty retries.
                     this.log("error", `[persist] writerOff coalesced build failed for ${session.id}: ${String(err)}`);
+                } finally {
+                    this.drainFlushWaiters(session.id);
                 }
             };
             this.writerOffPending.set(session.id, run);
@@ -2664,10 +2668,42 @@ export class SessionStore {
             // keeps a failed timer write from becoming an unhandledRejection.
             void this.store.writeNow(id, build).then(() => {
                 this.stampOwnWrite(id); // #3406: the write LANDED — prove our bytes are on disk
-            }).catch(() => {});
+            }).catch(() => {}).finally(() => {
+                // #5155: settle waiters even on failure — waiting on a flush
+                // must never wedge a caller past a failed write (the next
+                // turn re-arms the whole path anyway).
+                this.drainFlushWaiters(id);
+            });
         }, this.debounceMs);
         timer.unref?.();
         this.saveTimers.set(id, timer);
+    }
+
+    /** #5155: resolve once the currently armed save for this session has
+     *  landed (or immediately when nothing is pending). Background upkeep —
+     * like the incremental lane's pointer recording — needs a "rows are in
+     * the table now" signal without paying a synchronous writeNow. */
+    afterNextFlush(sessionId: string): Promise<void> {
+        if (!this.saveTimers.has(sessionId) && !this.writerOffPending.has(sessionId)) return Promise.resolve();
+        return new Promise<void>((resolve) => {
+            const ws = this.flushWaiters.get(sessionId) ?? [];
+            ws.push(resolve);
+            this.flushWaiters.set(sessionId, ws);
+        });
+    }
+
+    private drainFlushWaiters(sessionId: string): void {
+        const ws = this.flushWaiters.get(sessionId);
+        if (!ws) return;
+        this.flushWaiters.delete(sessionId);
+        for (const w of ws) {
+            try {
+                w();
+            } catch {
+                // resolve callbacks cannot usefully fail; never let one
+                // breaker take down the flush chain
+            }
+        }
     }
 
     /** Asynchronously persist a session right now (skips the debounce). Throws
@@ -2704,6 +2740,7 @@ export class SessionStore {
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
         this.dropResidentMetadata(session);
+        this.drainFlushWaiters(session.id);
     }
 
     /** #4739: where this id's record lives RIGHT NOW — the one build-scoped

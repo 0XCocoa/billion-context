@@ -2774,18 +2774,24 @@ export class UnifiedStore {
         }));
     }
 
-    getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[] }): (MessageRow & { contentHash: string; retiredAt: number | null })[] {
+    getMessages(sessionId: string, opts?: { includeRetired?: boolean; seqs?: readonly number[]; fromSeqExclusive?: number }): (MessageRow & { contentHash: string; retiredAt: number | null })[] {
         // #4390: retired rows (rewound/undo history) stay out of the unified
         // replay by default — they are history, not view. Callers that need
         // the full historian record (export/diagnostics) opt in.
+        // #5155: fromSeqExclusive narrows the scan to rows appended after a
+        // recorded pointer — hot-path pointer upkeep must not walk the table.
         if (opts?.seqs?.length === 0) return [];
         const seqFilter = opts?.seqs ? ` AND seq IN (${opts.seqs.map(() => "?").join(",")})` : "";
+        const afterClause = !opts?.seqs && opts?.fromSeqExclusive !== undefined ? " AND seq > ?" : "";
         const retiredFilter = opts?.includeRetired === true ? "" : " AND retired_at IS NULL";
+        const params: unknown[] = [sessionId];
+        if (opts?.seqs) params.push(...opts.seqs);
+        if (!opts?.seqs && opts?.fromSeqExclusive !== undefined) params.push(opts.fromSeqExclusive);
         const rows = this.db
             .prepare(
-                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ?${retiredFilter}${seqFilter} ORDER BY seq`,
+                `SELECT seq, msg_id, ref, ref_num, role, kind, content_hash, retired_at FROM messages WHERE session_id = ?${retiredFilter}${seqFilter}${afterClause} ORDER BY seq`,
             )
-            .all(sessionId, ...(opts?.seqs ?? [])) as Record<string, unknown>[];
+            .all(...params) as Record<string, unknown>[];
         return rows.map((r) => {
             messageRowReads.count++;
             return {
