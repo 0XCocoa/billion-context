@@ -1235,8 +1235,11 @@ function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
 function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
     const messages = source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session);
     if (!messages) {
-        const base = session.metadata.publicSnapshotCapped === true ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request";
-        const why = reconMissReason(session.id);
+        const capped = session.metadata.publicSnapshotCapped === true;
+        const base = capped ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request";
+        // the capped base names the refusal itself; a gate recorded under it is
+        // incidental (reconstruction may bail before reaching the cap check)
+        const why = capped ? undefined : reconMissReason(session.id);
         throw new Error(why ? `${base} [reconstruction: ${why}]` : base);
     }
     if (session.metadata.publicSnapshotTextComparable === false || messages.some((m) => (m.thinkingTokens ?? 0) > 0)) throw new Error("multimodal or opaque content cannot be compared by text");
