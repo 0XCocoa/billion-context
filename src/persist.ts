@@ -123,6 +123,14 @@ const PERSIST_VERSION = 3;
 // after construction, before any save could trigger a retry).
 const SHADOW_REOPEN_COOLDOWN_MS = 30_000;
 const SHADOW_REOPEN_READ_CHECK_MS = 100;
+// #5188 round 3: patient-wait budget for the user-visible 409 paths
+// (snapshot/fork) when the sidecar is missing after a transient first-open
+// failure. The read-check slot above drives the recovery ATTEMPTS; this only
+// bounds how long a request waits for that recovery before failing closed
+// exactly as before. Latched-disabled never waits (nothing brings it back
+// without a restart), so the wait can never mask structural breakage.
+const RECON_REPLICAS_WAIT_MS = 750;
+const RECON_REPLICAS_POLL_MS = 50;
 let shadowReopenCooldownMsOverride: number | null = null;
 let shadowReopenReadCheckMsOverride: number | null = null;
 
@@ -1881,6 +1889,23 @@ export class SessionStore {
             }
         }
         return this.shadow !== undefined && !this.shadow.stats.disabled;
+    }
+
+    /** #5188 round 3: bounded patient wait for user-visible 409 paths. A first
+     *  open that died on a transient spike recovers on its own (the read-check
+     *  slot inside replicasAvailable() drives the attempts); #5140's flake was
+     *  a request racing that recovery — arriving before the first post-spike
+     *  slot could fire. Healthy returns immediately, latched-disabled returns
+     *  false immediately (waiting cannot help there), and a still-gone resource
+     *  costs at most `timeoutMs` of latency before failing closed as before. */
+    async waitForReplicas(timeoutMs = RECON_REPLICAS_WAIT_MS, pollMs = RECON_REPLICAS_POLL_MS): Promise<boolean> {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+            if (this.replicasAvailable()) return true;
+            if (this.sidecarDownReason() !== "sidecar-missing") return false;
+            if (Date.now() >= deadline) return false;
+            await new Promise((r) => setTimeout(r, pollMs));
+        }
     }
 
     /** #4804: true only in FULL mode — the one mode whose unified reads

@@ -1204,6 +1204,25 @@ function reconMissReason(sessionId: string): string | undefined {
     return hit && Date.now() - hit.at < 30_000 ? hit.gate : undefined;
 }
 
+// #5188 round 3: #5140's flake was a timing race — the ctor's first sidecar open
+// died on a transient disk spike under shard load, the resource cleared
+// milliseconds later, and the cold-restore snapshot request arrived before any
+// post-spike recovery attempt had fired. When reconstruction is actually needed
+// and the sidecar is merely MISSING (recoverable without restart), the two
+// user-visible 409 paths wait a bounded moment for that self-recovery instead
+// of racing it. Latched-disabled never waits — waiting cannot help there. The
+// pre-lock read of pluginSnapshot/lastPassIds is fine for gating: a stale answer
+// only costs one unnecessary wait or skips one (same immediate 409 as before).
+async function waitForReconstructionReplicas(session: Session): Promise<void> {
+    if (session.pluginSnapshot !== undefined) return;
+    const expected = session.state.lastPassIds;
+    if (!expected || expected.length === 0) return;
+    const store = getStore();
+    if (store.replicasAvailable()) return;
+    if (store.sidecarDownReason() !== "sidecar-missing") return;
+    await store.waitForReplicas();
+}
+
 function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
     const expected = session.state.lastPassIds;
     if (!expected || expected.length === 0) return reconMiss(session, "empty-lastPassIds");
@@ -1433,6 +1452,7 @@ export async function handlePluginSnapshot(conversationId: string, res: ServerRe
     if (!session) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "unknown plugin conversation" });
     acquireInFlight(session);
     try {
+        await waitForReconstructionReplicas(session); // #5188 round 3: don't race self-recovery into a 409
         await withSessionLock(session, () => forkReply(res, 200, { ok: true, conversationId, ...forkSnapshot(session) }));
     } catch (err) {
         forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) });
@@ -1496,6 +1516,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
     if (!parent) return forkReply(res, 404, { ok: false, code: "PARENT_NOT_FOUND", error: "parent conversation not found" });
     acquireInFlight(parent);
     try {
+        await waitForReconstructionReplicas(parent); // #5188 round 3: don't race self-recovery into a 409
         // #4911: async callback — the unified row clone below awaits the
         // backend on network backends; withSessionLock accepts () => T |
         // Promise<T>, so the lock scope and ordering are unchanged.

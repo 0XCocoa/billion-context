@@ -113,6 +113,80 @@ test("each pace gates its own retries and JSON durability holds while degraded (
     }
 });
 
+// #5188 round 3: the read-check slot only helps if ANOTHER consumer touches
+// availability after the spike clears — #5140's cold-restore GET was the last
+// touch, so it still raced the recovery. The user-visible 409 paths now wait a
+// bounded moment for that self-recovery (persist.waitForReplicas); all three
+// directions pinned below (#3617): recovery inside the window succeeds, a
+// still-gone resource costs exactly the budget and fails closed as before, and
+// latched-disabled never waits at all.
+
+test("waitForReplicas resolves once the resource returns inside the window (#5140 round 3)", async () => {
+    const dir = fs.mkdtempSync(path.join(HERMETIC, "wait-"));
+    let store: SessionStore | undefined;
+    try {
+        _resetStorageRuntimeStatusForTest();
+        setSqliteEnginesUnavailableForTests(true);
+        store = new SessionStore({ dir, enabled: true });
+        assert.equal(store.replicasAvailable(), false, "unlucky first open degrades to legacy-only");
+        // production pacing: 750 ms budget; the resource returns 200 ms in and
+        // the next read-check slot (100 ms) drives the successful attempt
+        const release = setTimeout(() => setSqliteEnginesUnavailableForTests(false), 200);
+        const t0 = Date.now();
+        const ok = await store.waitForReplicas();
+        const elapsed = Date.now() - t0;
+        clearTimeout(release);
+        assert.equal(ok, true, "the wait resolves successfully once the resource returns");
+        assert.ok(elapsed >= 150, "it actually waited for the recovery (no pre-existing replica)");
+        assert.ok(elapsed < 700, "bounded well inside the budget");
+        assert.equal(store.replicasAvailable(), true, "replicas stay available after the wait");
+    } finally {
+        setSqliteEnginesUnavailableForTests(false);
+        _resetStorageRuntimeStatusForTest();
+        store?.closeQuietly();
+    }
+});
+
+test("waitForReplicas gives up at the deadline when the resource stays gone", async () => {
+    const dir = fs.mkdtempSync(path.join(HERMETIC, "wait-gone-"));
+    let store: SessionStore | undefined;
+    try {
+        _resetStorageRuntimeStatusForTest();
+        setSqliteEnginesUnavailableForTests(true);
+        store = new SessionStore({ dir, enabled: true });
+        const t0 = Date.now();
+        const ok = await store.waitForReplicas();
+        const elapsed = Date.now() - t0;
+        assert.equal(ok, false, "a still-gone resource fails closed exactly as before");
+        assert.ok(elapsed >= 700 && elapsed < 2000, `waited out the full budget, bounded (elapsed=${elapsed}ms)`);
+        assert.equal(store.replicasAvailable(), false, "still legacy-only afterwards");
+    } finally {
+        setSqliteEnginesUnavailableForTests(false);
+        _resetStorageRuntimeStatusForTest();
+        store?.closeQuietly();
+    }
+});
+
+test("waitForReplicas never waits on a latched-disabled sidecar", async () => {
+    const dir = fs.mkdtempSync(path.join(HERMETIC, "wait-latch-"));
+    let store: SessionStore | undefined;
+    try {
+        _resetStorageRuntimeStatusForTest();
+        store = new SessionStore({ dir, enabled: true });
+        const sh = (store as unknown as { shadow?: { stats: { disabled: boolean } } }).shadow;
+        assert.ok(sh, "sidecar opens normally when the resource is healthy");
+        sh.stats.disabled = true; // simulate a structural-breakage latch
+        const t0 = Date.now();
+        const ok = await store.waitForReplicas();
+        assert.equal(ok, false, "latched-disabled resolves false immediately — waiting cannot help there");
+        assert.ok(Date.now() - t0 < 100, "no wait spent on an unrecoverable state");
+    } finally {
+        setSqliteEnginesUnavailableForTests(false);
+        _resetStorageRuntimeStatusForTest();
+        store?.closeQuietly();
+    }
+});
+
 test("an unlucky first open recovers on the next read check — no save, no 30 s wait (#5140 timeline)", async () => {
     const dir = fs.mkdtempSync(path.join(HERMETIC, "tl-"));
     let store: SessionStore | undefined;
