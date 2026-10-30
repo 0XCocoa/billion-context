@@ -81,6 +81,11 @@ function canonicalScalar(value: unknown, key: string | undefined): unknown {
     return value;
 }
 
+// Spec array index: "0" .. 2^32-2, no leading zeros.
+function isArrayIndexKey(k: string): boolean {
+    return /^(0|[1-9]\d*)$/.test(k) && Number(k) <= 4_294_967_294;
+}
+
 export function sha256(s: string): string {
     return createHash("sha256").update(s, "utf8").digest("hex");
 }
@@ -143,9 +148,15 @@ export function canonicalDigest(value: unknown): string {
         } else if (current && typeof current === "object") {
             write("{");
             let separator = "";
-            for (const k of Object.keys(current)) {
+            // Effective order of JSON.stringify(canonicalize(v)): array-index keys
+            // first, ascending numeric (spec enumeration overrides canonicalize's
+            // lexicographic sort), then the remaining keys lexicographic.
+            const keys = Object.keys(current);
+            const orderedKeys = keys.filter(isArrayIndexKey).sort((a, b) => Number(a) - Number(b))
+                .concat(keys.filter((k) => !isArrayIndexKey(k)).sort());
+            for (const k of orderedKeys) {
                 // Assigning __proto__ to canonicalize's plain output creates no JSON property.
-                if (k === "storageMode" || k === "tailGaps" || k === "__proto__") continue;
+                if (Object.hasOwn(DIGEST_SKIPPED_KEYS, k) || k === "__proto__") continue;
                 const v = (current as Record<string, unknown>)[k];
                 if (v === undefined || typeof v === "function" || typeof v === "symbol") continue;
                 write(separator);
