@@ -56,8 +56,8 @@ entries:
     kind: env-only
     audience: user
     group: envonly
-    desc_en: "Storage integrity self-check at open (#4175): every index.db open runs PRAGMA quick_check BEFORE migrations; on failure the shadow layer quarantines the file set (index.db/-wal/-shm renamed to .corrupt-<ts>) and reopens fresh (JSON envelopes remain the recovery source). Set 0 only for boot-time-sensitive huge deployments where the check's cost matters."
-    desc_zh: "存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check;失败时影子层把文件组（index.db/-wal/-shm 改名为 .corrupt-<ts>）隔离并重建新库（JSON 信封仍是恢复源）。仅当超大库的启动时间敏感时才设 0 跳过。"
+    desc_en: "Storage integrity self-check at open (#4175): every index.db open runs PRAGMA quick_check BEFORE migrations; on failure the files are left EXACTLY in place and bili runs legacy-only with a loud, actionable error (back up then move index.db/-wal/-shm aside by hand to force a fresh rebuild — JSON envelopes remain the recovery source). The FAIL verdict is cached so later opens fail fast without rescan. There is NO automatic rename/repair: an automatic move of a storage primary was withdrawn (#4626-era owner decision) because full data recovery cannot be guaranteed (checkpoint rows live only inside the index; with BILI_STORAGE_JSON_WRITER=off the index is the sole durable copy) and a corrupt-but-salvageable index stays operator-salvageable. Set 0 only for boot-time-sensitive huge deployments where the check's cost matters."
+    desc_zh: "存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check；失败时文件原样保留在原地，bili 以 legacy-only 方式降级运行并给出响亮、可操作的错误提示（要强制重建新库：手工备份后把 index.db/-wal/-shm 移开——JSON 信封仍是恢复源）。FAIL 判定会被缓存，之后的打开快速失败、无需重扫。没有自动改名/修复：自动搬移存储主索引的做法已撤回（#4626 时代的 owner 决策），因为无法保证完整数据恢复（checkpoint 行只存在于索引内部；BILI_STORAGE_JSON_WRITER=off 时索引是唯一的持久副本），且损坏但尚可抢救的索引应保持可由运维手工抢救。仅当超大部署对启动耗时敏感、检测成本构成问题时才设 0 跳过。"
   - key: BILI_SNAPSHOT_SHADOW
     type: boolean
     default: "true (on)"
