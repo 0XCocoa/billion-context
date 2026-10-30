@@ -26,13 +26,15 @@
  *                      load's migration → the file loads the exact digest.
  *   SELF-DISABLE     — 3 consecutive sidecar failures disable it; reads flip
  *                      back to legacy; the legacy file stays readable.
- *   CORRUPT INDEX    — a corrupt index.db degrades the store to legacy-only
- *                      instead of bricking construction (#2771).
+ *   CORRUPT INDEX    — a corrupt index.db is quarantined and the store
+ *                      recovers to full mode instead of bricking
+ *                      construction (#2771 → #4816).
  *   CAS REFCOUNT     — shared content blobs survive deleteSession of one
  *                      session and are collected only at refcount 0.
  *
- * The corrupt-index test is the regression for #2771; the rest are contract
- * pins (proof-only, no product change).
+ * The corrupt-index test is the regression for #2771 (re-pinned for the
+ * #4816 quarantine-and-recover behavior); the rest are contract pins
+ * (proof-only, no product change).
  */
 
 import { test } from "node:test";
@@ -364,10 +366,11 @@ test("storage engine: sidecar self-disables after 3 consecutive failures (reads 
 });
 
 // ---------------------------------------------------------------------------
-// CORRUPT INDEX (#2771): construction degrades to legacy-only.
+// CORRUPT INDEX (#2771 → #4816): construction quarantines the corrupt index
+// and recovers to full mode.
 // ---------------------------------------------------------------------------
 
-test("storage engine: corrupt index.db degrades to legacy-only instead of bricking construction (#2771)", { timeout: 180_000 }, async () => {
+test("storage engine: corrupt index.db is quarantined and recovers to full mode instead of bricking construction (#2771/#4816)", { timeout: 180_000 }, async () => {
     const dir = tmpdir("bili-engproof-corrupt-");
     const prev = process.env.BILI_STORAGE_UNIFIED;
     try {
@@ -386,17 +389,18 @@ test("storage engine: corrupt index.db degrades to legacy-only instead of bricki
         await clean.writeNow(viaFull);
         clean.closeQuietly();
 
-        // #4338: everything past this point (corrupt the header → degrade
-        // construction → fallback read → rename guards → write → close) runs
-        // in a spawned child. On Windows the FAILED open of the corrupt index
-        // can leave an OS handle with no JS reference to release, and the
-        // resulting persistent EBUSY at rmrf outlives the whole tmp-rm retry
-        // ladder; the child exiting RELEASES all its handles by OS guarantee,
-        // so this parent's rmrf below cannot be blocked. The child prints a
-        // JSON verdict of named checks; every one is re-asserted here, so
-        // assertion coverage is 1:1 with the in-process era (same asserts,
-        // executed in the child, verified in the parent). The child also runs
-        // the #2781 mid-flow rename guard plus a post-close guard, so future
+        // #4338: everything past this point (corrupt the header → quarantine
+        // + fresh reopen → lazy-import read → leak guards → write → close)
+        // runs in a spawned child. On Windows any sqlite file the scenario
+        // touches can leave an OS handle with no JS reference to release, and
+        // the resulting persistent EBUSY at rmrf would outlive the whole
+        // tmp-rm retry ladder; the child exiting RELEASES all its handles by
+        // OS guarantee, so this parent's rmrf below cannot be blocked. The
+        // child prints a JSON verdict of named checks; every one is
+        // re-asserted here, so assertion coverage is 1:1 with the
+        // in-process era (same asserts, executed in the child, verified in
+        // the parent). The child also runs the #2781/#4357 mid-flow leak
+        // guard on the quarantined file plus a post-close guard, so future
         // handle-leak drift trips there by name instead of at teardown.
         // #4316 PR3/3: expected digest computed modulo the one-time ledger
         // alignment — the clean read above already carried it in memory, and

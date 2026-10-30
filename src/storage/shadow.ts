@@ -26,7 +26,7 @@ import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendB
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
 import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
-import { renameSync } from "node:fs";
+import { existsSync, renameSync } from "node:fs";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
 import { canonicalDigest, canonicalize, sha256 } from "./canonical.ts";
@@ -262,14 +262,23 @@ export class UnifiedShadow {
                 if (!(err instanceof StorageIntegrityError)) throw err;
                 const stamp = Date.now();
                 const quarantined: string[] = [];
+                let primaryRenameFailure: string | null = null;
+                const sidecarLeft: string[] = [];
                 for (const suffix of ["", "-wal", "-shm"]) {
                     const from = `${dir}/index.db${suffix}`;
+                    if (!existsSync(from)) continue; // absent sidecar files are fine
                     const to = `${dir}/index.db${suffix}.corrupt-${stamp}`;
                     try {
                         renameSync(from, to);
                         quarantined.push(path.basename(to));
-                    } catch {
-                        /* absent sidecar files are fine */
+                    } catch (rerr) {
+                        // #5108/#4347: the old empty catch swallowed EVERY failure
+                        // — including a primary that could not be moved — and the
+                        // code below then claimed success. Capture the errno and
+                        // decide per file what a failed move actually means.
+                        const why = String((rerr as NodeJS.ErrnoException).code ?? rerr);
+                        if (suffix === "") primaryRenameFailure = why;
+                        else sidecarLeft.push(`${path.basename(from)} (${why})`);
                     }
                 }
                 // #4609: the verdict cache belongs to the quarantined file set —
@@ -279,8 +288,30 @@ export class UnifiedShadow {
                     const cacheFrom = `${dir}/index.db.chk`;
                     renameSync(cacheFrom, `${cacheFrom}.corrupt-${stamp}`);
                     quarantined.push(path.basename(`${cacheFrom}.corrupt-${stamp}`));
-                } catch {
-                    /* absent cache is fine */
+                } catch (rerr) {
+                    if (existsSync(`${dir}/index.db.chk`)) {
+                        // Present but unmovable — harmless (the fresh store's stats
+                        // key misses and rescans), but say so instead of staying silent.
+                        loggerLog("warn", `[storage] quarantined index.db but its .chk verdict cache could not be moved (${String((rerr as NodeJS.ErrnoException).code ?? rerr)}) — it will be overwritten by the next check`);
+                    }
+                }
+                if (primaryRenameFailure !== null) {
+                    // The corrupt PRIMARY is still in place: a fresh reopen would
+                    // just re-hit the same corrupt file, so do NOT attempt it —
+                    // degrade loudly with the real errno instead of claiming the
+                    // quarantine succeeded. The operator moves the file aside by
+                    // hand (the same manual workaround that always worked).
+                    loggerLog(
+                        "error",
+                        `[storage] index.db failed its integrity quick_check (${err.detail}) but the corrupt file could NOT be quarantined (rename ${primaryRenameFailure}${sidecarLeft.length > 0 ? `; also left behind: ${sidecarLeft.join(", ")}` : ""}) — staying legacy-only; move ${path.join(dir, "index.db")} aside by hand to rebuild the index (#5108/#4347)`,
+                    );
+                    throw new StorageIntegrityError(`${dir}/index.db`, `${err.detail}; quarantine rename failed: ${primaryRenameFailure}`);
+                }
+                if (sidecarLeft.length > 0) {
+                    // Probe-verified (node:sqlite v22): SQLite RESETS a stale -wal
+                    // whose parent db was replaced rather than replaying it onto
+                    // the fresh file, so leftover sidecars are safe to leave.
+                    loggerLog("warn", `[storage] quarantined index.db but ${sidecarLeft.join(", ")} could not be renamed — left in place (a stale -wal is reset, not replayed, on the next open)`);
                 }
                 loggerLog(
                     "error",

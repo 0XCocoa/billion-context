@@ -1,7 +1,8 @@
 // #3040 web surface: SQLite unified storage degrades to legacy-only through
 // several fail-open paths (#2825 contract): engine ladder exhausted,
-// self-download blocked in cooldown, corrupt index.db guard (#2771), 3-strike
-// sidecar disable. The proxy keeps running on JSON — correct — but until now
+// self-download blocked in cooldown, non-corruption index-open failures,
+// 3-strike sidecar disable (a corrupt index.db since #4816 quarantines and
+// recovers instead of degrading). The proxy keeps running on JSON — correct — but until now
 // the condition was only visible as one-time log lines, so environments that
 // cannot run SQLite were never learned about before the upcoming full-mode
 // default flip. These tests pin the wire contract the web banner reads:
@@ -263,21 +264,20 @@ test("#3040 BILI_ENCRYPTION_KEY opt-out is intentional: reported, never warned",
     }
 });
 
-test("#3040 corrupt index.db (guard #2771): degraded with the open-failure reason", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host", timeout: 180_000 }, async () => {
+test("#3040 engine-ladder-exhausted degrade: banner wire shape with the open-failure reason", { timeout: 180_000 }, async () => {
     const base = mkdtempSync(path.join(tmpdir(), "bili-storage-banner-"));
     try {
-        // #4338: the whole corrupt-index scenario (write the bad index.db →
+        // #4338: the whole scenario (force the engine ladder exhausted →
         // construct the store → serve /__bili/overview → assert the degraded
-        // wire shape → close) runs in a spawned child. On Windows the FAILED
-        // open of the corrupt index can leave an OS handle with no JS
-        // reference to release, and this test's rmrf(base) then died on a
-        // persistent EBUSY that outlived the whole tmp-rm retry ladder; the
-        // child exiting RELEASES all its handles by OS guarantee, so the
-        // rmrf below cannot be blocked. The child prints a JSON verdict of
-        // named checks; every one is re-asserted here, so assertion coverage
-        // is 1:1 with the in-process era (same asserts, executed in the
-        // child, verified in the parent). The spawn env below is the child's
-        // only isolation — this process's own env and seams stay untouched.
+        // wire shape → close) runs in a spawned child so any OS handle the
+        // store opens is released by process exit before this parent's
+        // rmrf(base) can hit a Windows EBUSY. (#4816 moved the trigger off
+        // the corrupt-index cause: that one now quarantines and recovers, so
+        // the banner surface is pinned through the deterministic no-engine
+        // path instead.) The child prints a JSON verdict of named checks;
+        // every one is re-asserted here, so assertion coverage stays 1:1
+        // with the in-process era. The spawn env below is the child's only
+        // isolation — this process's own env and seams stay untouched.
         const childEnv: NodeJS.ProcessEnv = { ...process.env };
         delete childEnv.BILI_STORAGE_UNIFIED;
         delete childEnv.BILI_ENCRYPTION_KEY;

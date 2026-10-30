@@ -261,6 +261,14 @@ export function clearSelfDownloadedEngineForTests(): void {
 
 let cachedEngine: ResolvedEngine | null = null;
 
+/** #5108: the last successfully resolved engine (null until resolution
+ * succeeds). Diagnostics surfaces use it to say WHICH engine resolved when a
+ * store open later failed with a real error — reporting "engine: none" for a
+ * corrupt-index failure misdirected triage toward an engine problem. */
+export function resolvedSqliteEngineInfo(): ResolvedEngine | null {
+    return cachedEngine;
+}
+
 function detectEngine(): ResolvedEngine {
     if (cachedEngine) return cachedEngine;
     if (probeBuiltinSqlite()) cachedEngine = { name: "node:sqlite", source: "builtin" };
