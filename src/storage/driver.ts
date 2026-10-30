@@ -14,11 +14,15 @@
  *                     engine-bootstrap.ts): pinned version + sha512, cached under
  *                     ~/.cache/billion-context/sqlite/. Registered via
  *                     registerSelfDownloadedBetterSqlite3().
- *   none             — no engine: openSqliteDatabase throws and the unified sidecar
- *                     degrades to legacy-only (contract pinned by #2825).
+ *   none             — no engine: openSqliteDatabase throws and a unified/full
+ *                     ask REFUSES TO START loudly (2026-10-30: no degradation in
+ *                     any case; JSON-only serve = explicit BILI_STORAGE_UNIFIED=
+ *                     legacy). Pre-policy contract was #2825 legacy-only degrade.
  *
  * The invariant: engine acquisition NEVER depends on host install-time build-script
- * approval, and every failure path lands in legacy JSON persistence.
+ * approval; every failure path stays durable (JSON persistence) — either by an
+ * explicit JSON-only opt-out or by refusing to start at all (never a silent
+ * half-mode).
  *
  * The interface is deliberately ~50 lines: everything above this file is
  * engine-agnostic SQL; nothing below it leaks into the store.

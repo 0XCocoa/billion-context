@@ -489,35 +489,39 @@ test("storage engine: CAS refcounts conserve shared content across deleteSession
 // the contract that lets us ship without a native SQLite dependency at all.
 // ---------------------------------------------------------------------------
 
-test("storage engine: no SQLite engine -> maybeOpen degrades to null (sidecar absent), never throws (#2823)", () => {
+test("storage engine: no SQLite engine -> maybeOpen REFUSES (throw), never silently degrades (#2823 re-pinned 2026-10-30)", () => {
     const dir = tmpdir("bili-engproof-noengine-open-");
     try {
         setSqliteEnginesUnavailableForTests(true);
-        const shadow = UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null);
-        assert.equal(shadow, null, "maybeOpen must return null (legacy-only) when no SQLite engine is available");
+        // No-degradation policy: the unified ask cannot be satisfied -> the
+        // open must throw (proxy boot then refuses loudly), not return null.
+        assert.throws(
+            () => UnifiedShadow.maybeOpen(dir, { BILI_STORAGE_UNIFIED: "full" }, () => null),
+            /no SQLite engine available/i,
+            "maybeOpen must REFUSE when no SQLite engine is available",
+        );
     } finally {
         setSqliteEnginesUnavailableForTests(false);
         rmrf(dir);
     }
 });
 
-test("storage engine: no SQLite engine -> SessionStore runs legacy-only, writes survive, no index.db (#2823)", async () => {
+test("storage engine: no SQLite engine -> construction REFUSES (no degradation in any case, 2026-10-30)", async () => {
     const dir = tmpdir("bili-engproof-noengine-e2e-");
     const prev = process.env.BILI_STORAGE_UNIFIED;
     try {
-        process.env.BILI_STORAGE_UNIFIED = "full"; // ask for the unified store...
-        setSqliteEnginesUnavailableForTests(true); // ...but pretend none exists
-        const session = loadFolded(path.join(dir, "seed"));
-        // THE #2823 regression: construction must survive with no engine at all.
-        const store = new SessionStore({ dir, debounceMs: 1, enabled: true });
-        await store.writeNow(session);
-        assert.ok(!fs.existsSync(path.join(dir, "index.db")), "no-engine mode must not create index.db");
-        const reloaded = store.loadSync("corpus-folded", { protocol: "anthropic", upstreamOrigin: "http://127.0.0.1:8199" });
-        store.closeQuietly();
-        assert.ok(reloaded, "legacy load returned null with no SQLite engine available");
-        const disk = findWrittenRecord(dir, "corpus-folded");
-        assert.ok(disk, "disk record not found");
-        assert.equal(viewDigest(toLegacyLike(reloaded)), recordDigest(disk), "no-engine: legacy load digest != disk record");
+        process.env.BILI_STORAGE_UNIFIED = "full"; // ask for the unified store
+        const session = loadFolded(path.join(dir, "seed")); // seed first (it constructs its own store)
+        setSqliteEnginesUnavailableForTests(true); // ...now pretend no engine exists
+        // #2823 re-pinned (2026-10-30 no-degradation policy): construction
+        // must REFUSE loudly — no engine at all means the unified ask cannot
+        // be served, and a silent legacy fallback was withdrawn.
+        assert.throws(
+            () => new SessionStore({ dir, debounceMs: 1, enabled: true }),
+            /no SQLite engine available/i,
+            "a unified/full ask with no engine must make construction refuse",
+        );
+        assert.ok(!fs.existsSync(path.join(dir, "index.db")), "refused construction must not leave an index.db behind");
     } finally {
         setSqliteEnginesUnavailableForTests(false);
         if (prev === undefined) delete process.env.BILI_STORAGE_UNIFIED;

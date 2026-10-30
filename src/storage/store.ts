@@ -347,9 +347,9 @@ function likeEscape(prefix: string): string {
 /**
  * #4175: raised when PRAGMA quick_check fails at open. Migrations must never
  * run against a corrupt file, so this fires BEFORE migrateSchema; the shadow
- * layer catches it and degrades to legacy-only LOUDLY without touching the
- * file set — no automatic rename/repair (#4626-era owner decision: full data
- * recovery cannot be guaranteed without operator involvement). The FAIL
+ * layer records it and RE-THROWS — bili REFUSES TO START with the files
+ * left exactly in place (no automatic rename/repair, no legacy fallback:
+ * full data recovery cannot be guaranteed without operator involvement). The FAIL
  * verdict is cached so later opens fail fast; the operator moves the files
  * aside by hand (backed up first) to force a fresh rebuild.
  */
@@ -595,8 +595,8 @@ export class UnifiedStore {
         // #4609: a large store's cache-miss check runs post-open on a second
         // read-only connection — open() returns immediately; the verdict
         // lands in runtime-status and the cache (a cached failure makes the
-        // NEXT open fail fast and degrade loudly — no automatic file moves,
-        // #4175/#4626-era decision).
+        // NEXT open fail fast and REFUSE TO START — no automatic file moves,
+        // #4175/#4626-era decision chain to 2026-10-30: no degradation).
         if (mode.kind === "async") scheduleBackgroundIntegrityCheck(path, (ok, detail) => { if (ok) store.noteIntegrityOk(); else if (detail !== undefined) store.noteIntegrityFail(detail); });
         return store;
     }

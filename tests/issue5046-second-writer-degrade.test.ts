@@ -1,12 +1,13 @@
 /**
- * #5046/B (owner decision 2026-10-29): a live foreign bili process holding
- * <db>.lock must make the proxy sidecar REFUSE to become a persistent second
- * writer and degrade to legacy-only — with one actionable error line (names
- * BILI_SESSIONS_DIR + BILI_CONFIG_FILE + what is lost) and status-wire
- * visibility. Both directions pinned: live foreign holder ⇒ degrade; no
- * foreign holder ⇒ the original fast path is unchanged; mixed-version fleet
- * (old marker without lane) ⇒ conservative branch degrades; the report-only
- * default policy (CLI/export open paths) stays byte-identical.
+ * #5046/B (owner decision chain 2026-10-29 → 2026-10-30): a live foreign
+ * bili process holding <db>.lock must make the proxy sidecar REFUSE TO START
+ * (throw StorageSecondWriterError — no-degradation-in-any-case) with one
+ * actionable error line (names BILI_SESSIONS_DIR + BILI_CONFIG_FILE) and
+ * status-wire visibility. Both directions pinned: live same-lane/unknown-lane
+ * foreign holder ⇒ refuse; no foreign holder ⇒ the original fast path is
+ * unchanged; dead-pid stale lock ⇒ takeover unchanged; cross-lane live holder
+ * ⇒ still opens (#5091 supported shared topology); the report-only default
+ * policy (CLI/export open paths) stays byte-identical.
  */
 import assert from "node:assert";
 import { spawn } from "node:child_process";
@@ -16,7 +17,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
 import { UnifiedShadow } from "../src/storage/shadow.ts";
-import { UnifiedStore } from "../src/storage/store.ts";
+import { UnifiedStore, StorageSecondWriterError } from "../src/storage/store.ts";
 import type { LegacySessionLike } from "../src/storage/ingest.ts";
 import { setLogCapture } from "../src/logger.ts";
 import { _resetStorageRuntimeStatusForTest, storageStatusWire } from "../src/storage/runtime-status.ts";
@@ -102,7 +103,7 @@ after(() => {
     else process.env.BILI_LAUNCHER_LANE = savedLauncherLane;
 });
 
-test("#5046/B: live same-lane foreign holder ⇒ sidecar degrades to legacy-only, lock untouched, actionable error + status wire", () => {
+test("#5046/B: live same-lane foreign holder ⇒ open REFUSES TO START (throw), lock untouched, actionable error + status wire", () => {
     if (!engineAvailable) return;
     _resetStorageRuntimeStatusForTest();
     const state = freshState();
@@ -112,17 +113,23 @@ test("#5046/B: live same-lane foreign holder ⇒ sidecar degrades to legacy-only
     const logs: string[] = [];
     setLogCapture((_level, msg) => logs.push(msg));
     withEnv({ XDG_STATE_HOME: state, BILI_LAUNCHER_LANE: "dsh" }, () => {
-        const shadow = UnifiedShadow.maybeOpen(sessions, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
-        assert.equal(shadow, null, "must degrade to legacy-only (null), not open a second writer");
+        // 2026-10-30 "no degradation in any case": refused co-writing must
+        // THROW so boot dies before listen(), not return null + run legacy.
+        assert.throws(
+            () => UnifiedShadow.maybeOpen(sessions, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike),
+            (err: unknown) => err instanceof StorageSecondWriterError,
+            "must REFUSE with StorageSecondWriterError, not open a second writer",
+        );
         const refused = logs.find((m) => m.includes("unified storage REFUSED"));
         assert.ok(refused, `actionable error line expected, got: ${logs.join(" | ")}`);
+        assert.ok(refused!.includes("REFUSES TO START"), "the refusal must state its consequence");
         assert.ok(refused!.includes("BILI_SESSIONS_DIR") && refused!.includes("BILI_CONFIG_FILE"), "the fix must name both isolation vars");
-        assert.ok(refused!.includes("CCR") && refused!.includes("checkpoints"), "must say what degradation loses");
         assert.equal(lockHolderPid(sessions), foreign.pid, "the foreign lock must NOT be stolen");
+        // Pre-death diagnostic surface (#3040 visibility): the failure is
+        // recorded BEFORE the throw so post-crash forensics can read why.
         withEnv({ BILI_STORAGE_UNIFIED: "shadow" }, () => {
             const wire = storageStatusWire();
-            assert.equal(wire.degraded, true, "status wire must show degraded");
-            assert.equal(wire.effective, "legacy");
+            assert.equal(wire.degraded, true, "status wire must record the failed open");
             assert.ok(wire.reason?.startsWith("second-writer:"), `reason should be the pre-formatted refusal, got: ${wire.reason}`);
             assert.ok((wire.reason ?? "").includes("BILI_SESSIONS_DIR"), "wire reason must carry the fix");
         });
@@ -184,7 +191,7 @@ test("#5046/B negative: no foreign holder ⇒ original fast path (ENABLED line, 
     setLogCapture(null);
 });
 
-test("#5046/B: mixed-version fleet — old marker WITHOUT lane ⇒ conservative branch degrades", () => {
+test("#5046/B: mixed-version fleet — old marker WITHOUT lane ⇒ conservative branch REFUSES", () => {
     if (!engineAvailable) return;
     _resetStorageRuntimeStatusForTest();
     const state = freshState();
@@ -194,8 +201,11 @@ test("#5046/B: mixed-version fleet — old marker WITHOUT lane ⇒ conservative 
     const logs: string[] = [];
     setLogCapture((_level, msg) => logs.push(msg));
     withEnv({ XDG_STATE_HOME: state, BILI_LAUNCHER_LANE: "dsh" }, () => {
-        const shadow = UnifiedShadow.maybeOpen(sessions, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike);
-        assert.equal(shadow, null, "unknown peer lane must stay conservative (degrade), never grant info-level amnesty");
+        assert.throws(
+            () => UnifiedShadow.maybeOpen(sessions, { BILI_STORAGE_UNIFIED: "shadow" }, (r) => r as LegacySessionLike),
+            (err: unknown) => err instanceof StorageSecondWriterError,
+            "unknown peer lane must stay conservative and refuse (no info-level amnesty)",
+        );
         assert.ok(logs.some((m) => m.includes("unified storage REFUSED")));
     });
     setLogCapture(null);

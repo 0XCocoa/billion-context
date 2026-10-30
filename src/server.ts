@@ -555,6 +555,16 @@ export async function createEngineContext(opts: ProxyOptions): Promise<EngineCon
     // that survived a restart keep their folded view (otherwise long sessions
     // re-send oversized raw history and hang).
     await initSessions();
+    // No-degradation policy (2026-10-30): an ASYNC storage backend (mysql)
+    // attaches after construction; awaiting here makes "backend never came up"
+    // refuse at boot BEFORE listen() instead of surfacing on the first request
+    // (the old contract was openAsync degrades-to-null + first-request failure).
+    try {
+        await getStore().ready();
+    } catch (e) {
+        log("error", `[storage] refusing to start: ${String(e)}`);
+        process.exit(1);
+    }
     loadConversations();
     log("info", `[persist] ${getStore().enabled ? "enabled" : "disabled"}`);
     // #2807: restore fork lineage that a restart orphaned. Every fork writes

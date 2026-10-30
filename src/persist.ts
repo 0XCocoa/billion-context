@@ -407,8 +407,10 @@ export class SessionStore {
      *  ready() resolves this.shadow is still undefined while the DB already
      *  carries rows. */
     private readonly networkFullExpected: boolean = false;
-    /** Await the storage backend before first use (mysql pool + DDL). openAsync
-     *  never rejects (it degrades to null), so awaiting this cannot throw. */
+    /** Await the storage backend before first use (mysql pool + DDL). #5046
+     *  owner policy 2026-10-30 (no degradation in any case): a backend that
+     *  cannot come up REJECTS — boot awaits this before listen(); async
+     *  request paths see it on first use. */
     ready(): Promise<void> {
         return this.mysqlReady;
     }
@@ -532,6 +534,12 @@ export class SessionStore {
             ).then((sh) => {
                 this.shadow = sh ?? undefined;
             });
+            // #5046 chain (2026-10-30): openAsync now REJECTS on backend failure
+            // (no degradation in any case). Boot awaits ready() and exits
+            // deterministically; the .catch here keeps every OTHER construct-
+            // then-later-await path from dying via unhandled rejection instead
+            // of the caller seeing the rejection on await.
+            this.mysqlReady.catch(() => {});
             this.shadow = undefined;
             this.networkFullExpected = storageMode === "full";
         } else {

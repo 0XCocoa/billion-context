@@ -43,6 +43,7 @@ import { defaultConfig } from "acp-kernel";
 import type { ProxyOptions } from "../src/config.ts";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
+import { storageStatusWire } from "../src/storage/runtime-status.ts";
 import { StorageIntegrityError } from "../src/storage/store.ts";
 import { setSqliteEnginesUnavailableForTests } from "../src/storage/driver.ts";
 import { loadLegacyView, toLegacyLike } from "../src/storage/ingest.ts";
@@ -215,13 +216,13 @@ export const ENGPROOF_CHECKS: readonly string[] = Object.values(ENGPROOF_CHECK_N
 // is pinned here through the remaining deterministic cross-platform degrade
 // cause: the engine ladder exhausted.
 const BANNER_CHECK_NAMES = {
-    overviewAnswers: "/__bili/overview answers 200 with JSON",
-    requestedFull: "storage.requested is full",
-    effectiveLegacy: "storage.effective is legacy",
-    degraded: "storage.degraded is true (the no-engine degrade trips the warning)",
-    intentionalOptOut: "storage.intentionalOptOut is false",
-    reason: "storage.reason names the missing engine",
-    engine: "storage.engine is null when no engine resolved",
+    /** Construction THROWS instead of degrading — no server serves a
+     *  degraded page (2026-10-30: no degradation in any case). */
+    constructionRefuses: "construction-refuses-to-start",
+    /** The refused open leaves no half-created index.db behind. */
+    noSidecarLeftBehind: "no-index-db-left-behind",
+    /** Pre-death #3040 forensics: the wire names the cause. */
+    wireNamesEngine: "status-wire-names-missing-engine",
 } as const;
 export const BANNER_CHECKS: readonly string[] = Object.values(BANNER_CHECK_NAMES);
 
@@ -401,38 +402,26 @@ async function bannerScenario(argv: string[], run: CheckRun): Promise<void> {
     if (!base) throw new Error("banner mode needs <base>");
     const dir = path.join(base, "sessions");
     mkdirSync(dir, { recursive: true });
-    // #4816: the former corrupt-index cause here now quarantines and recovers
-    // instead of degrading — force the engine ladder exhausted (deterministic
-    // on every platform) as the degrade trigger for the banner wire shape.
+    // #4816 chain -> 2026-10-30 "no degradation in any case": an
+    // unfulfillable unified ask (here: engine ladder exhausted) must make
+    // CONSTRUCTION REFUSE loudly — no server ever comes up to serve a
+    // degraded page. The pre-death wire still records WHY (forensics).
     setSqliteEnginesUnavailableForTests(true);
-    const store = new SessionStore({ dir, enabled: true });
-    _setStoreForTest(store);
-    const upstreamPort = await freePort();
-    const proxy = await startServer(makeOpts(upstreamPort));
-    await once(proxy, "listening");
-    try {
-        const port = (proxy.address() as { port: number }).port;
-        // Holder (not a plain let): the assignment happens inside the check
-        // closure, and TS control-flow narrowing cannot see closure writes —
-        // a `let overview = null` would narrow to `never` at the guard below.
-        const overview: { storage?: StorageWire } = {};
-        await run.run(BANNER_CHECK_NAMES.overviewAnswers, async () => {
-            const res = await fetch(`http://127.0.0.1:${port}/__bili/overview`);
-            assert.equal(res.status, 200, "/__bili/overview answers 200");
-            overview.storage = ((await res.json()) as { storage: StorageWire }).storage;
-        });
-        const storage = overview.storage;
-        if (!storage) return;
-        await run.run(BANNER_CHECK_NAMES.requestedFull, () => assert.equal(storage.requested, "full"));
-        await run.run(BANNER_CHECK_NAMES.effectiveLegacy, () => assert.equal(storage.effective, "legacy"));
-        await run.run(BANNER_CHECK_NAMES.degraded, () => assert.equal(storage.degraded, true, "no-engine degrade trips the warning"));
-        await run.run(BANNER_CHECK_NAMES.intentionalOptOut, () => assert.equal(storage.intentionalOptOut, false));
-        await run.run(BANNER_CHECK_NAMES.reason, () => assert.match(storage.reason ?? "", /no SQLite engine available/));
-        await run.run(BANNER_CHECK_NAMES.engine, () => assert.equal(storage.engine, null));
-    } finally {
-        await close(proxy);
-        store.closeQuietly();
-    }
+    await run.run(BANNER_CHECK_NAMES.constructionRefuses, () => {
+        assert.throws(
+            () => new SessionStore({ dir, enabled: true }),
+            /no SQLite engine available/i,
+            "construction must refuse, not degrade",
+        );
+    });
+    await run.run(BANNER_CHECK_NAMES.noSidecarLeftBehind, () =>
+        assert.ok(!fs.existsSync(path.join(dir, "index.db"))),
+    );
+    await run.run(BANNER_CHECK_NAMES.wireNamesEngine, () => {
+        // requested mode still reads as full from env; the recorded failure is
+        // exactly what the refusing open wrote before throwing.
+        assert.match(storageStatusWire().reason ?? "", /no SQLite engine available/);
+    });
 }
 
 async function main(argv: string[]): Promise<number> {

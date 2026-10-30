@@ -252,7 +252,7 @@ export class UnifiedShadow {
             try {
                 store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit, secondWriterPolicy: "degrade" });
             } catch (err) {
-                // #5046/B: a live foreign writer owns this db — never touch it (the file is NOT corrupt) and never take over its lock; the outer catch degrades.
+                // #5046/B: a live foreign writer owns this db — never touch it (the file is NOT corrupt) and never take over its lock; the outer catch REFUSES.
                 if (err instanceof StorageSecondWriterError) throw err;
                 // #4175: anything else throwing StorageIntegrityError means quick_check
                 // proved the file set corrupt — handled below WITHOUT moving any file
@@ -299,10 +299,10 @@ export class UnifiedShadow {
             if (err instanceof StorageSecondWriterError) {
                 loggerLog(
                     "error",
-                    `[storage] unified storage REFUSED for this instance (pid ${process.pid}): another bili process (pid ${err.pid}) already writes ${err.dbPath} — sharing one sessions dir across lanes is the supported topology (#5082/#5091), but two processes writing the SAME sessions dir can split-brain it (#3923/#3959), so this one refuses to co-write rather than risk it. DEGRADED to legacy-only (defense-in-depth) until isolated: CCR / checkpoints / the unified fast-read path are OFF. Fix: give each install its own sessions dir — set BILI_SESSIONS_DIR (and BILI_CONFIG_FILE if the configs differ) for THIS install, then restart (README "Running multiple instances", #5046/#5068).`,
+                    `[storage] unified storage REFUSED for this instance (pid ${process.pid}): another bili process (pid ${err.pid}) already writes ${err.dbPath} — sharing one sessions dir across lanes is the supported topology (#5082/#5091), but two processes writing the SAME sessions dir can split-brain it (#3923/#3959), so this one refuses to co-write and REFUSES TO START until isolated (#5046 owner chain 2026-10-30: no silent degradation of any kind). Fix: give each install its own sessions dir — set BILI_SESSIONS_DIR (and BILI_CONFIG_FILE if the configs differ) for THIS install, then restart (README "Running multiple instances", #5046/#5068); or force legacy explicitly (BILI_STORAGE_UNIFIED=legacy).`,
                 );
-                recordSidecarOpenFailure(`second-writer: another bili process (pid ${err.pid}) owns index.db — isolate via BILI_SESSIONS_DIR(+BILI_CONFIG_FILE); unified features off until then (#5046)`);
-                return null;
+                recordSidecarOpenFailure(`second-writer: another bili process (pid ${err.pid}) owns index.db — isolate via BILI_SESSIONS_DIR(+BILI_CONFIG_FILE); refusing to start until then (#5046)`);
+                throw err;
             }
             const errStr = String(err);
             // Deleting the index cannot fix a no-engine failure (this Node.js has neither builtin
@@ -310,15 +310,16 @@ export class UnifiedShadow {
             // either (#3823 lock; #4614 readonly — where it would DESTROY the only copy of recent
             // session state in unified-full mode). The Node.js upgrade lever is surfaced via
             // /__bili/status + the bootstrap warn.
-            // #4626-era owner decision chain (2026-10-30): quick_check PROVED
-            // the file set corrupt — refusing to start is the ONLY safe
-            // outcome: renaming risks destroying the sole durable copy without
-            // proving recovery, and a legacy-only fallback diverges from the
-            // dead index forever (never reconcilable). Transient shapes
-            // (CANTOPEN/no-engine/second-writer/readonly) NEVER reach here —
-            // they classify out before any StorageIntegrityError exists, and
-            // keep degrading as before. Integrity errors never reach the
-            // "delete to reset" advice below either.
+            // #4626-era owner decision chain (2026-10-30): ANY sidecar-open
+            // failure now REFUSES TO START instead of degrading — proven
+            // corruption (renaming risks destroying the sole durable copy
+            // without proving recovery; a legacy-only fallback diverges from
+            // the dead index forever) and every transient shape alike
+            // (no-engine/CANTOPEN/readonly/second-writer: availability at the
+            // price of a silently different storage path was withdrawn by
+            // owner instruction "在任何情况下不降级"). Intentional opt-outs
+            // (legacy mode / encryption opt-out / persistence off) resolve to
+            // mode===legacy above and never reach here.
             if (err instanceof StorageIntegrityError) {
                 recordSidecarOpenFailure(errStr);
                 throw err;
@@ -326,13 +327,13 @@ export class UnifiedShadow {
             const hint = sqliteOpenFailureHint(errStr);
             const tail = /no SQLite engine available/i.test(errStr)
                 ? ""
-                : hint !== "" ? hint : "; delete the file to reset the index";
+                : hint !== "" ? `; ${hint}` : "; check file/OS state (CANTOPEN/readonly) or move index.db{,-wal,-shm} aside after backing up to force a fresh rebuild";
             loggerLog(
-                "warn",
-                `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${tail}`,
+                "error",
+                `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — REFUSING TO START (owner policy 2026-10-30: NO degradation in any case — fix the environment or set BILI_STORAGE_UNIFIED=legacy explicitly to serve JSON-only${tail})`,
             );
             recordSidecarOpenFailure(errStr);
-            return null;
+            throw err;
         }
         const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null), undefined, `${dir}/index.db`);
         recordSidecarInstance(shadow);
@@ -367,9 +368,10 @@ export class UnifiedShadow {
         if (mode === "legacy") return null;
         const dsn = (env.BILI_MYSQL_DSN ?? fileMysqlDsn ?? "").trim();
         if (!dsn) {
-            loggerLog("warn", "[storage] storage.backend=mysql selected but no DSN is configured (BILI_MYSQL_DSN or storage.mysql.dsn) — staying legacy-only; see the CONFIGURATION storage section");
+            const msg = "[storage] storage.backend=mysql selected but no DSN is configured (BILI_MYSQL_DSN or storage.mysql.dsn) — REFUSING TO START; configure the DSN or unset storage.backend (see the CONFIGURATION storage section)";
+            loggerLog("error", msg);
             recordSidecarOpenFailure("mysql backend selected without a DSN");
-            return null;
+            throw new Error(msg);
         }
         try {
             const backend = await openBackend("mysql", dsn);
@@ -380,9 +382,9 @@ export class UnifiedShadow {
             return shadow;
         } catch (err) {
             const errStr = String(err);
-            loggerLog("warn", `[storage] mysql backend failed to open (${errStr}) — staying legacy-only`);
+            loggerLog("error", `[storage] mysql backend failed to open (${errStr}) — REFUSING TO START (no degradation in any case, 2026-10-30 owner policy); fix the connection or unset storage.backend`);
             recordSidecarOpenFailure(errStr);
-            return null;
+            throw err;
         }
     }
 

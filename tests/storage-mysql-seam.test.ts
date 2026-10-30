@@ -527,30 +527,46 @@ test("seam: plugin conversation resolution materializes DB-only sessions through
     }
 });
 
-test("gate: jsonWriter=off stays ignored on mysql (the #4936 gate)", async () => {
+test("gate: jsonWriter=off stays ignored on mysql; DSN-less mysql ask REFUSES at ready() (2026-10-30)", async () => {
     const prev = {
         BILI_STORAGE_BACKEND: process.env.BILI_STORAGE_BACKEND,
         BILI_STORAGE_UNIFIED: process.env.BILI_STORAGE_UNIFIED,
         BILI_STORAGE_JSON_WRITER: process.env.BILI_STORAGE_JSON_WRITER,
     };
+    const logs: string[] = [];
+    // Seed FIRST: under the refusal policy the loader store built inside
+    // seedCorpusSession must still use the sqlite backend — flipping the env
+    // to DSN-less mysql first would refuse ITS construction too.
+    const baseDir = tmpDir("bili-seam-gate-");
+    const loaded = await seedCorpusSession(baseDir);
+    // Now ask for mysql WITHOUT a DSN: construction succeeds (the backend
+    // attach is async), the #4936 gate warning fires at construct time, and
+    // ready() must REJECT with the actionable message instead of silently
+    // degrading (#5046 chain, 2026-10-30 owner policy).
     process.env.BILI_STORAGE_BACKEND = "mysql";
     process.env.BILI_STORAGE_UNIFIED = "full";
     process.env.BILI_STORAGE_JSON_WRITER = "off";
-    const logs: string[] = [];
-    const baseDir = tmpDir("bili-seam-gate-");
-    const loaded = await seedCorpusSession(baseDir);
     const seamDir = tmpDir("bili-seam-gate-store-");
     const store = new SessionStore({ dir: seamDir, debounceMs: 1, enabled: true, log: (_l, m) => logs.push(m) });
     try {
-        store.flushSync(loaded);
         assert.ok(
             logs.some((m) => m.includes("storage.jsonWriter=off ignored")),
             `expected the sqlite-only gate warning, got: ${logs.join(" | ")}`,
         );
-        assert.ok(findEnvelopeFiles(seamDir).length > 0, "the envelope MUST keep being written on mysql");
+        let refusalMsg = "";
+        try {
+            await store.ready();
+        } catch (e) {
+            refusalMsg = String(e);
+        }
+        assert.match(refusalMsg, /no DSN is configured/, `ready() must reject naming the missing DSN, got: "${refusalMsg}"`);
+        // A refused boot persists NOTHING: no turn was ever flushed through
+        // the dead backend, so the dir holds no envelopes.
+        assert.equal(findEnvelopeFiles(seamDir).length, 0, "a refused backend must not leave persisted state behind");
+        void loaded; // corpus seeded only to prove the ordering above is what saves it
     } finally {
         store.cancelAll();
-        await store.closeQuietlyAsync();
+        await store.closeQuietlyAsync().catch(() => {});
         for (const [k, v] of Object.entries(prev)) {
             if (v === undefined) delete process.env[k];
             else process.env[k] = v;
