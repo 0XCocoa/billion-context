@@ -253,7 +253,7 @@ test("--jsonl enforces the backend selection at open time: the mysql stub fails 
                 () => exportSession(session.id, { dir: path.join(dir, "folded"), jsonl: true }),
                 (err: unknown) => {
                     const msg = String((err as Error).message);
-                    return msg.includes("mysql") && msg.includes("#3388");
+                    return msg.includes("mysql") && msg.includes("no DSN");
                 },
                 "a deliberate mysql selection must fail at open time, not silently read sqlite",
             );

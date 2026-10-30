@@ -208,6 +208,12 @@ test("two live instances over one sessions dir: serve, guard, converge (#394/#40
 
     const childEnv = (p: number): NodeJS.ProcessEnv => ({
         ...process.env,
+        // The global baseline preload pins BILI_STORAGE_UNIFIED=legacy process-wide;
+        // spread into every child it would keep them BOTH legacy — A would never
+        // write the sidecar lockfile and B would have nothing to refuse over
+        // (boot-refusal needs a live foreign writer holding the shared index.db).
+        // Pin the production default so the refusal contract runs like a real boot.
+        BILI_STORAGE_UNIFIED: "full",
         BILI_SESSIONS_DIR: sessionsDir,
         XDG_STATE_HOME: stateDir,
         // #5012: non-TTY pipes now mute once the file leg proves live; this
