@@ -97,7 +97,7 @@ import { clearConflictEvents, recordConflict, summarizeConflicts } from "./confl
 import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, shouldMuteStderrLegAfterFileLive, logTimestamp } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
-import { configFile, defaultLogFile, stateDir } from "./paths.js";
+import { configFile, defaultLogFile, sessionsDir, stateDir } from "./paths.js";
 import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, markPortReleased, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest } from "./storage/runtime-status.js";
@@ -1225,9 +1225,17 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         // launcher-private launchToken) so lane-aware attach discovery and
         // the #394 warning can reason about EVERY live instance — the single
         // proxy-origin file only reflects the last writer.
-        const registryRecord = { ...instanceRecord };
+        // #5046: carry the resolved sessions dir on the REGISTRY marker only
+        // (not the proxy-origin file) so the #394 warning can judge by
+        // directory — a lane-overlapping peer with a different dir shares no
+        // state and must not get the "stop one" advice.
+        const registryRecord = { ...instanceRecord, sessionsDir: sessionsDir() };
         delete registryRecord.launchToken;
-        const warnedAtRegistration = registerInstanceAndWarn(registryRecord, (msg) => log("warn", `[instances] ${msg}`));
+        const warnedAtRegistration = registerInstanceAndWarn(
+            registryRecord,
+            (msg) => log("warn", `[instances] ${msg}`),
+            (msg) => log("info", `[instances] ${msg}`),
+        );
         // #2401: registration warns the late starter only — a resident that is
         // ALREADY serving stays blind to a peer appearing later (the exact
         // dual-generation shape behind the stale-serving report). Rescan the
@@ -1236,7 +1244,12 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
             const warnedPeers = new Set<string>(warnedAtRegistration);
             const peerRescanMs = 60_000;
             const peerTimer = setInterval(() => {
-                for (const id of warnOnNewPeers({ instanceId, lane: launcherLane }, warnedPeers, (msg) => log("warn", `[instances] ${msg}`))) {
+                for (const id of warnOnNewPeers(
+                    { instanceId, lane: launcherLane, sessionsDir: sessionsDir() },
+                    warnedPeers,
+                    (msg) => log("warn", `[instances] ${msg}`),
+                    (msg) => log("info", `[instances] ${msg}`),
+                )) {
                     warnedPeers.add(id);
                 }
             }, peerRescanMs);

@@ -381,6 +381,23 @@ function processAlive(pid: number): boolean {
     }
 }
 
+/** #5046/B: a live foreign bili process holds <db>.lock and this open is not
+ *  a benign cross-lane share — thrown when the caller opted into
+ *  secondWriterPolicy:"degrade" so it can REFUSE to become a persistent
+ *  second writer instead of reporting-and-running (#3923/#3959). The foreign
+ *  lockfile is left untouched and the raw handle is closed before the throw
+ *  (a leaked WAL handle would defeat the isolation on Windows). */
+export class StorageSecondWriterError extends Error {
+    readonly pid: number;
+    readonly dbPath: string;
+    constructor(pid: number, dbPath: string) {
+        super(`another bili process (pid ${pid}) is already writing ${dbPath}`);
+        this.name = "StorageSecondWriterError";
+        this.pid = pid;
+        this.dbPath = dbPath;
+    }
+}
+
 export class UnifiedStore {
     readonly engine: SqliteEngineName;
     /** Where the engine came from (#2833): builtin / host / self-downloaded — logged at enable so field diagnosis can tell which acquisition path a lane ran on. */
@@ -417,7 +434,7 @@ export class UnifiedStore {
     static open(
         path: string,
         engine?: SqliteEngineName,
-        opts?: { walJournalSizeLimitBytes?: number },
+        opts?: { walJournalSizeLimitBytes?: number; secondWriterPolicy?: "report" | "degrade" },
     ): UnifiedStore {
         mkdirSync(dirname(path), { recursive: true });
         const { db, engine: used, source } = openSqliteDatabase(path, engine);
@@ -477,8 +494,11 @@ export class UnifiedStore {
             integrityOk = true;
         }
         // #4175: second-process-on-the-same-db detection. A live foreign pid
-        // is surfaced (web wire + banner) but never blocks — blocking would
-        // brick the second lane outright. #5082: coexistence on one index.db
+        // is surfaced (web wire + banner); the default policy never blocks
+        // (blocking would brick the second lane outright) — a caller that opts
+        // into secondWriterPolicy:"degrade" may instead refuse unified storage
+        // and degrade to legacy-only (#5046/B), which preserves availability.
+        // #5082: coexistence on one index.db
         // is the SUPPORTED topology — SQLite WAL is multi-process safe on a
         // local filesystem and the machine-global sessions dir is
         // deliberately shared — so the foreign pid is informational WHATEVER
@@ -499,13 +519,30 @@ export class UnifiedStore {
                     const peer = listInstances()
                         .filter((e) => e.pid === pid)
                         .reduce<RegistryEntry | undefined>((best, e) => (best === undefined || (e.startedAt ?? 0) > (best.startedAt ?? 0) ? e : best), undefined);
+                    // #5046/B (owner decision 2026-10-29): the degrade POLICY decides whether
+                    // THIS caller may become a persistent second writer. Cross-lane sharing is
+                    // the supported topology (#5082/#3923) — stay open. Same-lane, or a peer whose
+                    // lane is unknown (inline lanes never register / pre-#5046 markers carry none),
+                    // is the risky double-write shape — refuse BEFORE taking over the lockfile when
+                    // degrade is opted in; the caller owns the actionable user-facing line.
+                    const ownLane = process.env.BILI_LAUNCHER_LANE?.trim() || undefined;
+                    const crossLaneSafe = peer !== undefined && ownLane !== undefined && peer.lane !== undefined && peer.lane !== ownLane;
+                    if (opts?.secondWriterPolicy === "degrade" && !crossLaneSafe) {
+                        db.close();
+                        throw new StorageSecondWriterError(pid, path);
+                    }
+                    // #5091/#5082: reporting is INFORMATIONAL for every live foreign holder —
+                    // SQLite WAL multi-process open is safe on a local disk; the real hazard (two
+                    // instances writing the SAME session) alarms separately (split-brain contest).
                     const peerOf = peer !== undefined ? ` (lane ${peer.lane ?? "?"}, instance ${peer.instanceId.slice(0, 8)})` : "";
-                    loggerLog("info", `[storage] process pid ${pid}${peerOf} is also using ${path} — multiple instances sharing one sessions dir is the supported topology (#5082/#3923); two instances writing the SAME session alarm separately (split-brain contest)`);
+                    loggerLog("info", `[storage] process pid ${pid}${peerOf} is also using ${path} — multiple instances sharing one sessions dir is the supported topology (#5082/#3923); two instances walking the SAME session alarm separately (split-brain contest)`);
                     recordSecondProcessOwner(pid, { lane: peer?.lane, instanceId: peer?.instanceId, benign: true });
                 }
             }
             writeFileSync(lockPath, JSON.stringify({ pid: process.pid, boot: Date.now() }));
         } catch (err) {
+            // #5046/B: a second-writer refusal is a decision, not a skipped discipline — it must propagate to the caller's degrade path, not be absorbed here.
+            if (err instanceof StorageSecondWriterError) throw err;
             loggerLog("warn", `[storage] lockfile discipline skipped for ${path}: ${String(err)}`);
         }
         try {

@@ -25,7 +25,7 @@ import { log as loggerLog } from "../logger.js";
 import { planIngest, planIngestDelta, loadLegacyView, LegacyViewBuilder, appendBlockContents, mergeOrphanBlockContents, completeBlockContents, type LegacySessionLike } from "./ingest.ts";
 import type { BlockView } from "../session.js";
 import { resolveStorageMode, resolveStorageWalJournalSizeLimit, type StorageMode } from "../knobs.ts";
-import { UnifiedStore, StorageIntegrityError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
+import { UnifiedStore, StorageIntegrityError, StorageSecondWriterError, type CheckpointRow, type SessionSummaryRow, type WebSummaryRow } from "./store.ts";
 import { existsSync, renameSync } from "node:fs";
 import path from "node:path";
 import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBackend, type StorageBackend } from "./backend.ts";
@@ -251,8 +251,10 @@ export class UnifiedShadow {
         let store: UnifiedStore;
         try {
             try {
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit, secondWriterPolicy: "degrade" });
             } catch (err) {
+                // #5046/B: a live foreign writer owns this db — never quarantine (the file is NOT corrupt) and never take over its lock; the outer catch degrades.
+                if (err instanceof StorageSecondWriterError) throw err;
                 // #4175: quick_check failed — the file set is provably corrupt.
                 // Quarantine it (db/-wal/-shm → .corrupt-<ts>, same suffix
                 // discipline as the session envelopes) and retry ONCE with a
@@ -317,7 +319,7 @@ export class UnifiedShadow {
                     "error",
                     `[storage] index.db failed its integrity quick_check (${err.detail}) — quarantined ${quarantined.join(", ")} and reopened fresh; JSON envelopes remain the recovery source (#4175)`,
                 );
-                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit });
+                store = UnifiedStore.open(`${dir}/index.db`, undefined, { walJournalSizeLimitBytes: walLimit, secondWriterPolicy: "degrade" });
             }
             // #3285: watermark trust does not cross process boundaries — a
             // restart-handoff overlap leaves the previous writer's rows AND
@@ -325,6 +327,15 @@ export class UnifiedShadow {
             // per session re-establishes trust from its own view.
             store.resetAllIngestWatermarks();
         } catch (err) {
+            // #5046/B (owner decision 2026-10-29): refuse to become a persistent second writer — degrade to legacy-only with ONE actionable error. Availability is preserved (legacy persist keeps compression working); CCR / checkpoints / the unified fast-read path are off until isolated. The status wire carries the same fact via recordSidecarOpenFailure (#3040).
+            if (err instanceof StorageSecondWriterError) {
+                loggerLog(
+                    "error",
+                    `[storage] unified storage REFUSED for this instance (pid ${process.pid}): another bili process (pid ${err.pid}) already writes ${err.dbPath} — sharing one sessions dir across lanes is the supported topology (#5082/#5091), but two processes writing the SAME sessions dir can split-brain it (#3923/#3959), so this one refuses to co-write rather than risk it. DEGRADED to legacy-only (defense-in-depth) until isolated: CCR / checkpoints / the unified fast-read path are OFF. Fix: give each install its own sessions dir — set BILI_SESSIONS_DIR (and BILI_CONFIG_FILE if the configs differ) for THIS install, then restart (README "Running multiple instances", #5046/#5068).`,
+                );
+                recordSidecarOpenFailure(`second-writer: another bili process (pid ${err.pid}) owns index.db — isolate via BILI_SESSIONS_DIR(+BILI_CONFIG_FILE); unified features off until then (#5046)`);
+                return null;
+            }
             // #2771: a corrupt/unreadable index.db must degrade to legacy-only
             // (same shape as the encryption opt-out), never brick SessionStore
             // construction. No auto-delete: the index may hold pinned checkpoint
