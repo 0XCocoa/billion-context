@@ -608,6 +608,7 @@ export class UnifiedStore {
         } finally {
             db.close(); // closing rolls back the read-only transaction
         }
+    }
 
     /** #5108/#4816: mirror of noteIntegrityOk for a completed FAIL verdict —
      * see lastIntegrityFailDetail for why the close-time refresh needs it. */

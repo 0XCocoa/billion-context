@@ -411,6 +411,13 @@ export class UnifiedShadow {
         }
     }
 
+    /** #4942 test seam: build a shadow directly on an async backend without
+     *  env-driven open or sidecar-instance registration (hermetic suites
+     *  stub the StorageBackend contract; see tests/storage-mysql-seam.test.ts). */
+    static fromBackend(mode: StorageMode, backend: StorageBackend, legacyLoad?: (record: unknown) => LegacySessionLike | null): UnifiedShadow {
+        return new UnifiedShadow(mode, null, legacyLoad ?? (() => null), backend);
+    }
+
     /** True when reads should go unified-first (full mode, sidecar healthy). */
     get readsUnified(): boolean {
         return this.mode === "full" && !this.stats.disabled;
