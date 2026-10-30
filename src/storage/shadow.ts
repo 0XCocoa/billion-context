@@ -37,6 +37,15 @@ import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
 import type { MessageRow, BlockRow, SessionRow, RefRow, MessageRefContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
+// True once quick_check proved this process's index corrupt. such a boot is
+// alarm-only by design (files stay put; the operator repairs/moves them by
+// hand), so the #5188 demand-driven reopen must NOT keep re-scanning the same
+// broken file set forever.
+let integrityQuickCheckFailed = false;
+export function hadIntegrityQuickCheckFailure(): boolean {
+    return integrityQuickCheckFailed;
+}
+
 const VERIFY_BATCH_SIZE = 32;
 
 /** Bound transient CAS strings during normal cold loads, not the retained history. */
@@ -273,6 +282,7 @@ export class UnifiedShadow {
                     `[storage] index.db FAILED its integrity quick_check (${err.detail}) — starting WITHOUT the index (no file moved, no copy, no automatic rebuild; 2026-10-30 owner policy): back up ${path.join(dir, "index.db")}{,-wal,-shm}, then MOVE those files aside by hand and start again — the fresh index re-imports the JSON envelopes (#4175/#4626/#4816)`,
                 );
                 recordSidecarOpenFailure(`integrity quick_check failed: ${err.detail}`);
+                integrityQuickCheckFailed = true; // proven-corrupt: operator hand-fix only — no in-process auto-retry
                 return null;
             }
             // #3285: watermark trust does not cross process boundaries — a
