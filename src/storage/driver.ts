@@ -88,7 +88,23 @@ function wrapBetterSqlite3(db: BetterSqlite3Database): SqliteDatabase {
         // a write lock mid-flight — SQLITE_BUSY_SNAPSHOT, which busy_timeout
         // cannot resolve. Taking the write lock up front makes concurrent
         // writers queue on busy_timeout instead (#2690 review blocking 5).
-        transaction: (fn) => db.transaction(fn).immediate(),
+        transaction: (fn) => {
+            try {
+                return db.transaction(fn).immediate();
+            } catch (err) {
+                // #4949: better-sqlite3's own wrapper runs ROLLBACK after ANY
+                // inner failure; when BEGIN or COMMIT itself failed there was
+                // nothing left to roll back, and its "cannot rollback - no
+                // transaction is active" REPLACES the real error (commonly
+                // disk full / SQLITE_FULL) before it reaches us. Name the
+                // masking at our seam so operators see the likely cause.
+                const msg = String(err);
+                if (/cannot rollback|no transaction is active/i.test(msg)) {
+                    throw new SqliteDriverError(`${msg} — masked by better-sqlite3's automatic rollback after a failed BEGIN/COMMIT; the original error no longer survives (disk full / SQLITE_FULL is the common cause)`, "better-sqlite3");
+                }
+                throw err;
+            }
+        },
         readTransaction: (fn) => db.transaction(fn).deferred(),
         close: () => void db.close(),
         get open() {
@@ -97,15 +113,28 @@ function wrapBetterSqlite3(db: BetterSqlite3Database): SqliteDatabase {
     };
 }
 
+let databaseSyncFactoryForTests: ((path: string) => NodeSqliteDatabase) | null = null;
+
+/** Test seam: substitute how the node:sqlite emulation obtains its database
+ *  handle (e.g. an adapter injecting engine-level I/O failures, #4949).
+ *  Null = the real builtin node:sqlite module. */
+export function setDatabaseSyncFactoryForTests(factory: ((path: string) => NodeSqliteDatabase) | null): void {
+    databaseSyncFactoryForTests = factory;
+}
+
 function openNodeSqlite(path: string): SqliteDatabase {
     // node:sqlite is synchronous like better-sqlite3, but has no
     // .transaction() helper — emulate with BEGIN/COMMIT + savepoints for
     // nesting, which is the only behavioral difference the store relies on.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const { DatabaseSync } = require("node:sqlite") as {
-        DatabaseSync: new (path: string) => NodeSqliteDatabase;
-    };
-    const db = new DatabaseSync(path);
+    const db = databaseSyncFactoryForTests
+        ? databaseSyncFactoryForTests(path)
+        : (() => {
+              // eslint-disable-next-line @typescript-eslint/no-require-imports
+              const { DatabaseSync } = require("node:sqlite") as {
+                  DatabaseSync: new (path: string) => NodeSqliteDatabase;
+              };
+              return new DatabaseSync(path);
+          })();
     let depth = 0;
     const begin = (readOnly: boolean) => db.exec(depth === 0 ? (readOnly ? "BEGIN DEFERRED" : "BEGIN IMMEDIATE") : `SAVEPOINT sp${depth}`);
     const commit = () => db.exec(depth === 1 ? "COMMIT" : `RELEASE sp${depth - 1}`);
@@ -123,7 +152,16 @@ function openNodeSqlite(path: string): SqliteDatabase {
             commit();
             return out;
         } catch (err) {
-            rollback();
+            // #4949: a failed BEGIN/COMMIT can leave NO transaction active
+            // (SQLite auto-aborts on I/O-class failures such as disk full);
+            // the follow-up ROLLBACK then throws "cannot rollback - no
+            // transaction is active" and would MASK the original failure.
+            // The original error below is always authoritative.
+            try {
+                rollback();
+            } catch {
+                /* secondary rollback failure — original error wins (#4949) */
+            }
             throw err;
         } finally {
             depth--;
@@ -146,7 +184,7 @@ interface NodeSqliteStatement {
     get(...args: unknown[]): unknown;
     all(...args: unknown[]): unknown[];
 }
-interface NodeSqliteDatabase {
+export interface NodeSqliteDatabase {
     exec(sql: string): unknown;
     prepare(sql: string): NodeSqliteStatement;
     getAutoCommit(): boolean;

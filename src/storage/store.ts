@@ -2163,6 +2163,16 @@ export class UnifiedStore {
         return Number(this.db.prepare("DELETE FROM session_ext WHERE session_id = ? AND key = ?").run(sessionId, key).changes);
     }
 
+    /** #4949: circuit-breaker re-enable probe — one REAL committed write
+     *  through the production transaction path (proves lock acquisition +
+     *  disk space, not just connectivity). A single fixed kv key keeps the
+     *  trace constant; the row doubles as a liveness marker. Throws on failure. */
+    probeWritable(): void {
+        this.db.transaction(() => {
+            this.setKv("__bili", "writability-probe", { probedAt: Date.now() });
+        });
+    }
+
     setKv(namespace: string, key: string, value: unknown): void {
         validateExtKey(namespace, "namespace");
         validateExtKey(key, "key");

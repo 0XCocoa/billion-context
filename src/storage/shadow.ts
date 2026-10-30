@@ -47,6 +47,15 @@ interface ResidentFields {
     blockContents?: Map<string, { one: BlockView | null; full: BlockView }>;
 }
 
+/** #4949: re-enable cadence for the disabled sidecar. The 3-strike breaker used
+ *  to be permanent until process restart even after the store healed. Now each
+ *  cooldown window lets the NEXT save run one writability probe (a single-row
+ *  committed write through the production path); success clears the breaker and
+ *  the triggering record ingests normally. Missed saves converge via the
+ *  load-side staleness guard (envelope savedAt > index row) + next full ingest,
+ *  so no global pre-check is needed before unified reads resume. */
+export const REENABLE_PROBE_COOLDOWN_MS = 5 * 60 * 1000;
+
 /** #3133: read-back verification cadence — the verify leg (full read-back +
  *  double shadowDigest) is O(log) per save, while the drift it guards is a
  *  migration-parity property, not a per-commit one. The FIRST ingest of a
@@ -169,6 +178,9 @@ export class UnifiedShadow {
      *  path left users hunting %TEMP% logs for which file said what. */
     private readonly dbPath: string | null;
     private consecutiveFailures = 0;
+    /** #4949: timestamp until which the disabled sidecar stays quiet; the first
+     *  save after it runs the writability probe (REENABLE_PROBE_COOLDOWN_MS). */
+    private nextReenableProbeAt = 0;
     /** #3133: per-session ingest counters (verify sampling). Per-process
      *  only — nothing persisted, no schema change. */
     private readonly ingestCounts = new Map<string, number>();
@@ -380,7 +392,21 @@ export class UnifiedShadow {
             this.enqueueAsyncRecord(record, rawTail, liveCcr);
             return;
         }
-        if (this.stats.disabled) return;
+        // #4949: a disabled sidecar is no longer dead for the process lifetime —
+        // one cooldown-gated writability probe per window; on success the
+        // breaker clears and THIS record falls through to the normal ingest.
+        if (this.stats.disabled) {
+            const now = Date.now();
+            if (now < this.nextReenableProbeAt) return;
+            this.nextReenableProbeAt = now + REENABLE_PROBE_COOLDOWN_MS;
+            try {
+                this.sync.probeWritable();
+            } catch (err) {
+                this.noteProbeFailure(err);
+                return;
+            }
+            this.clearBreaker();
+        }
         try {
             const loaded = this.legacyLoad(record);
             if (!loaded) return;
@@ -516,6 +542,21 @@ export class UnifiedShadow {
         } catch (err) {
             this.noteIngestFailure(err);
         }
+    }
+
+    /** #4949: re-enable-probe failure tail — keeps the breaker armed while the
+     *  latest error stays visible on the status wire via stats.lastError. */
+    private noteProbeFailure(err: unknown): void {
+        this.stats.lastError = String(err);
+        loggerLog("debug", `[storage] unified store re-enable probe failed (${String(err)}) — staying disabled, next probe after ${REENABLE_PROBE_COOLDOWN_MS / 60_000}min (#4949)`);
+    }
+
+    /** #4949: clears the 3-strike breaker after a successful writability probe. */
+    private clearBreaker(): void {
+        this.stats.disabled = false;
+        this.stats.lastError = null;
+        this.consecutiveFailures = 0;
+        loggerLog("info", "[storage] unified store RE-ENABLED: writability probe succeeded after disable (#4949); sessions missed during the outage converge via the envelope staleness guard + next full ingest");
     }
 
     /** #3133 delta ingest attempt for one record's legacy view — returns
@@ -1037,7 +1078,21 @@ export class UnifiedShadow {
      *  shadow queue; failures feed the same 3-strike disable. */
     private enqueueAsyncRecord(record: unknown, rawTail?: { lastMessages: CoreMessage[]; lastMessagesFolded?: boolean }, liveCcr?: MessageContentStore): void {
         void this.enqueue(async () => {
-            if (this.stats.disabled) return;
+            // #4949: async twin of the sync re-enable probe in record() — MUST
+            // stay in lockstep with it; setKv is the backend's single-row
+            // committed write probe.
+            if (this.stats.disabled) {
+                const now = Date.now();
+                if (now < this.nextReenableProbeAt) return;
+                this.nextReenableProbeAt = now + REENABLE_PROBE_COOLDOWN_MS;
+                try {
+                    await this.backend!.setKv("__bili", "writability-probe", { probedAt: now });
+                } catch (err) {
+                    this.noteProbeFailure(err);
+                    return;
+                }
+                this.clearBreaker();
+            }
             try {
                 const backend = this.backend!;
                 const loaded0 = this.legacyLoad(record);
