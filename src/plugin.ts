@@ -1181,36 +1181,64 @@ function sessionRevisionOf(session: Session): string {
  *  equal state.lastPassIds in exact order, and it sits under the UTF-8 byte cap.
  *  Pure — never mutates the session. Any miss returns null so callers fail
  *  closed exactly as before. */
+// #5140 CI-red follow-up: every reconstruction miss records WHICH gate fired,
+// so a 409 SNAPSHOT_UNAVAILABLE is diagnosable from server logs and the
+// client-visible error instead of being one silent null among five.
+const reconMissGate = new Map<string, { gate: string; at: number }>();
+const reconMissLastLogMs = new Map<string, number>();
+
+function reconMiss(session: Session, gate: string, detail?: string): null {
+    const why = detail ? `${gate} ${detail}` : gate;
+    const key = `${session.id}:${gate}`;
+    const now = Date.now();
+    if (now - (reconMissLastLogMs.get(key) ?? 0) >= 10_000) {
+        reconMissLastLogMs.set(key, now);
+        loggerLog("warn", `[plugin] raw-tail reconstruction unavailable for ${session.id} (${why}) — snapshot/fork falls back to the legacy path`);
+    }
+    reconMissGate.set(session.id, { gate: why, at: now });
+    return null;
+}
+
+function reconMissReason(sessionId: string): string | undefined {
+    const hit = reconMissGate.get(sessionId);
+    return hit && Date.now() - hit.at < 30_000 ? hit.gate : undefined;
+}
+
 function reconstructRawTailForFork(session: Session): CoreMessage[] | null {
     const expected = session.state.lastPassIds;
-    if (!expected || expected.length === 0) return null;
+    if (!expected || expected.length === 0) return reconMiss(session, "empty-lastPassIds");
     const store = getStore();
-    if (!store.replicasAvailable()) return null;
+    if (!store.replicasAvailable()) return reconMiss(session, "replicasUnavailable");
     const seqs = store.unifiedTailSeqs(session.id);
-    if (!seqs || seqs.length === 0) return null;
+    if (!seqs || seqs.length === 0) return reconMiss(session, "empty-tailSeqs", `expected=${expected.length}`);
     const rows = store.unifiedTailViewRows(session.id);
-    if (!rows) return null;
+    if (!rows) return reconMiss(session, "null-tailViewRows", `seqs=${seqs.length}`);
     const bySeq = new Map<number, string>();
     for (const row of rows) bySeq.set(row.seq, row.content);
     const out: CoreMessage[] = [];
     for (const seq of seqs) {
         const content = bySeq.get(seq);
-        if (content === undefined) return null; // gap: a logical seq has no stored row
+        if (content === undefined) return reconMiss(session, "gap-tailRow", `seq=${seq}/${seqs.length} rows=${rows.length}`); // gap: a logical seq has no stored row
         let msg: CoreMessage;
-        try { msg = JSON.parse(content) as CoreMessage; } catch { return null; }
-        if (typeof msg.id !== "string" || typeof msg.role !== "string") return null;
+        try { msg = JSON.parse(content) as CoreMessage; } catch { return reconMiss(session, "unparseable-row", `seq=${seq}`); }
+        if (typeof msg.id !== "string" || typeof msg.role !== "string") return reconMiss(session, "bad-row-shape", `seq=${seq}`);
         out.push(msg);
     }
-    if (out.length !== expected.length) return null;
-    for (let i = 0; i < out.length; i += 1) if (out[i]!.id !== expected[i]) return null;
+    if (out.length !== expected.length) return reconMiss(session, "length-mismatch", `rows=${out.length} expected=${expected.length}`);
+    for (let i = 0; i < out.length; i += 1) if (out[i]!.id !== expected[i]) return reconMiss(session, "id-mismatch", `index=${i}`);
     const cap = publicSnapshotCapBytes();
-    if (Buffer.byteLength(stableJson(out), "utf8") > cap) return null;
+    if (Buffer.byteLength(stableJson(out), "utf8") > cap) return reconMiss(session, "cap-exceeded");
+    reconMissGate.delete(session.id);
     return out;
 }
 
 function forkSnapshot(session: Session, source?: CoreMessage[] | null) {
     const messages = source ?? session.pluginSnapshot ?? reconstructRawTailForFork(session);
-    if (!messages) throw new Error(session.metadata.publicSnapshotCapped === true ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request");
+    if (!messages) {
+        const base = session.metadata.publicSnapshotCapped === true ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request";
+        const why = reconMissReason(session.id);
+        throw new Error(why ? `${base} [reconstruction: ${why}]` : base);
+    }
     if (session.metadata.publicSnapshotTextComparable === false || messages.some((m) => (m.thinkingTokens ?? 0) > 0)) throw new Error("multimodal or opaque content cannot be compared by text");
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
