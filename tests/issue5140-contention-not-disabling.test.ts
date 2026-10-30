@@ -66,15 +66,18 @@ function fix(): LegacySessionLike {
 }
 
 /** Fault seam on the verify leg's read-back: record()'s ingest runs for real
- *  (the row lands), then getMessages throws the exact engine error text — so
+ *  (the row lands), then getBlocks throws the exact engine error text — so
  *  the throw travels the same catch as a genuine sqlite write/read failure
- *  and reaches noteIngestFailure without stubbing the store itself. */
-type SyncLike = { getMessages: (id: string) => unknown[] };
+ *  and reaches noteIngestFailure without stubbing the store itself. The seam
+ *  sits on getBlocks (not getMessages) because the #5198 batched verifier
+ *  only fetches messages for the tail seqs it needs — this fixture carries
+ *  none, while getBlocks is the verify leg's unconditional first read-back. */
+type SyncLike = { getBlocks: (id: string, opts?: { limit: number; offset?: number }) => unknown[] };
 function installFault(shadow: UnifiedShadow, message: string): () => void {
     const sync = (shadow as unknown as { sync: SyncLike }).sync;
-    const orig = sync.getMessages;
-    sync.getMessages = () => { throw new Error(message); };
-    return () => { sync.getMessages = orig; };
+    const orig = sync.getBlocks;
+    sync.getBlocks = () => { throw new Error(message); };
+    return () => { sync.getBlocks = orig; };
 }
 
 const BUSY = "SQLITE_BUSY: database is busy";
