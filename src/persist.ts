@@ -14,6 +14,7 @@ import {
     persistEpermAlertThreshold as knobPersistEpermAlertThreshold,
     persistEpermAlertRepeatMs as knobPersistEpermAlertRepeatMs,
     resolveJsonWriterOff as knobResolveJsonWriterOff,
+    sessionResidentHardMaxBytes,
     resolveArchiveAfterDays,
     fileStorageUnified,
     fileStorageJsonWriter,
@@ -31,7 +32,7 @@ import { createInitialState, defaultCountTokens, prune, type CompressionState, t
 import { markDirty } from "./session.js";
 import { mergeState } from "./state-hydration.js";
 import { restampRefsToLedger, restampContentStore } from "acp-kernel";
-import { LazyBlockContents, isDroppedMetadata, lazyMetadata } from "./session.js";
+import { LazyBlockContents, isDroppedMetadata, lazyMetadata, peekSession, sessionWeight } from "./session.js";
 import type { Session, BlockContent, BlockView } from "./session.js";
 import { orphanContents, resolveStorageMode, UnifiedShadow, type StorageMode } from "./storage/shadow.js";
 import { resolveBackendName } from "./storage/backend.js";
@@ -417,8 +418,32 @@ export class SessionStore {
      *  per-turn debounced save unstamped and killed the ownership fast path. */
     private readonly saveTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private readonly saveBuilders = new Map<string, () => PersistedSession>();
-    /** #5155: afterNextFlush waiters, drained when the armed save lands. */
-    private readonly flushWaiters = new Map<string, Array<() => void>>();
+    /** #5155/#4788 D2: afterNextFlush waiters — drained with a success verdict
+     *  (true = a landing proof exists, false = no proof / failed settle) when
+     *  the armed save settles. Callers may decline unsafe follow-up work (the
+     *  #4788 between-turns spill) on false. */
+    private readonly flushWaiters = new Map<string, Array<(ok: boolean) => void>>();
+    /** #4788 D2: verdict of the LAST settled write per id — read at drain time
+     *  to hand waiters the landing-proof flag. Absent entry = no proof yet, so
+     *  consumers fail closed (treat the session as unsaved). */
+    private readonly lastSaveLanded = new Map<string, boolean>();
+    /** #4788 D2: ids with a save still running on the kernel write chain
+     *  (armed from enqueue until settle). afterNextFlush must treat these as
+     *  pending — otherwise a waiter armed AFTER the debounce arm was consumed
+     *  would see "nothing queued" even though its proof is mid-write. */
+    private readonly saveWritesInFlight = new Set<string>();
+    /** #4788 D2/D1-A: revisionEpoch covered by a durable DISK copy per id —
+     *  stamped only by (a) successful save settles and (b) cold loads (a load
+     *  IS a disk proof; a fresh stamp also retires any stamp belonging to a
+     *  previous object generation of the same id). The between-turns spill
+     *  gate demands EQUALITY with the live revisionEpoch: then every markDirty
+     *  since the last disk proof has itself landed, so dropping resident fields
+     *  behind disk-narrow-read loaders loses nothing; any newer mutation keeps
+     *  the gate closed until its own save lands. Absent entry = this process
+     *  has no disk proof for the id yet → treated as unsaved (conservative). */
+    private readonly durableRevision = new Map<string, number>();
+    /** #4788 D1-A: hard-cap warn timestamp per id (60 s throttle). */
+    private readonly capWarnAt = new Map<string, number>();
     private readonly debounceMs: number;
 
     constructor(opts?: { dir?: string; debounceMs?: number; enabled?: boolean; log?: Logger }) {
@@ -676,7 +701,9 @@ export class SessionStore {
                 // #408 one-time migration: the in-memory value is already
                 // clamped by buildSession — rewrite the stale file so the
                 // negative value is gone from disk.
+                const warmProof = session.revisionEpoch; // #4788 D2
                 await this.store.writeNow(id, () => this.buildRecordForSave(session));
+                this.noteDurable(id, warmProof); // clamp rewrite landed
                 clamped++;
                 // #3049: the clamp rewrite writes a DIFFERENT payload than any
                 // ingested record (clamped stats) without a sidecar ingest —
@@ -1156,7 +1183,9 @@ export class SessionStore {
                 continue;
             }
             session.id = label;
+            const rekeyProof = session.revisionEpoch; // #4788 D2
             await this.store.writeNow(label, () => this.buildRecordForSave(session));
+            this.noteDurable(label, rekeyProof); // rekey rewrite landed
             // #3049: direct write bypassing guardedBuild — the boot rekey
             // rewrites envelopes without the sidecar ingest, so any prior
             // ownership token for this id is stale.
@@ -1445,6 +1474,10 @@ export class SessionStore {
 
     loadSync(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Session | null {
         if (!this.enabled) return null;
+        // #4788 D2: retire any durable-revision stamp belonging to a PREVIOUS
+        // object generation of this id — a fresh cold load re-proves its own
+        // copy below (stamps must never vouch across generations).
+        this.durableRevision.delete(id);
         if (this.shadow?.readsUnified) {
             // #3135 ④/#3818: the last sampled verify drifted for this
             // session — the envelope is the fresher/authoritative copy while
@@ -1502,6 +1535,7 @@ export class SessionStore {
                     }
                     this.log("info", `[persist] serving ${id} from the legacy envelope: last sampled digest drifted (#3135 ④)`);
                     this.logColdLoad(id, "legacy file (drift fallback)", drifted, driftedEnvelope.payload.savedAt);
+                    this.noteDurable(id, drifted.revisionEpoch); // #4788 D2
                     return drifted;
                 }
             }
@@ -1559,6 +1593,7 @@ export class SessionStore {
             }
             this.logColdLoad(id, "legacy file", session, envelope.payload.savedAt);
             this.adoptRequestedRoute(id, session, meta);
+            this.noteDurable(id, session.revisionEpoch); // #4788 D2
             return session;
         }
         const envelope = this.loadEnvelope(id, meta);
@@ -1577,6 +1612,7 @@ export class SessionStore {
         }
         this.logColdLoad(id, "legacy file", session, envelope.payload.savedAt);
         this.adoptRequestedRoute(id, session, meta);
+        this.noteDurable(id, session.revisionEpoch); // #4788 D2
         return session;
     }
 
@@ -1587,6 +1623,8 @@ export class SessionStore {
     private afterLoad(id: string, view: LegacySessionLike): Session {
         const record = viewToRecord(view);
         const session = buildSession(record);
+        // #4788 D2: a cold load IS a disk proof of this live revision.
+        this.noteDurable(id, session.revisionEpoch);
         if (hasNegativePersistedTokens(record)) {
             this.scheduleSave(session);
             this.log("info", `[persist] clamped negative token stats on reload for ${id} (#408)`);
@@ -2615,6 +2653,13 @@ export class SessionStore {
             if (this.writerOffPending.has(session.id)) return;
             const run = (): void => {
                 this.writerOffPending.delete(session.id);
+                // #4788 D2: prove what THIS build covers BEFORE it starts —
+                // the closure reads live state at run time; newer mutations
+                // can only ride along, never be missing, so the spill gate's
+                // equality check against the CURRENT epoch stays conservative.
+                const proofRevision = session.revisionEpoch;
+                let innerDrained = false;
+                let settledOk = false;
                 try {
                     this.guardedBuild(session)();
                     this.maybeCutForkBase(session);
@@ -2628,10 +2673,34 @@ export class SessionStore {
                     // the data on the durable file copy.
                     if (this.shadow && this.shadow.stats.disabled) {
                         this.log("warn", `[persist] unified sidecar disabled mid-build for ${session.id} — landing an immediate JSON envelope write (#3135 ①)`);
+                        const innerProof = session.revisionEpoch;
                         const build = this.guardedBuild(session);
-                        void this.store.writeNow(session.id, build).then(() => this.stampOwnWrite(session.id)).catch(() => {
-                            // Errors surface through the kernel write chain's own logging.
-                        });
+                        this.saveWritesInFlight.add(session.id);
+                        void this.store.writeNow(session.id, build)
+                            .then(() => {
+                                this.stampOwnWrite(session.id);
+                                this.noteDurable(session.id, innerProof);
+                                this.lastSaveLanded.set(session.id, true);
+                                this.runIdleSpillIfIdle(session.id);
+                                innerDrained = true;
+                                this.drainFlushWaiters(session.id, true);
+                            })
+                            .catch(() => {
+                                // Errors surface through the kernel write chain's own logging.
+                                this.lastSaveLanded.set(session.id, false);
+                                innerDrained = true;
+                                this.drainFlushWaiters(session.id, false);
+                            })
+                            .finally(() => { this.saveWritesInFlight.delete(session.id); });
+                    } else {
+                        // #4788 D2: the index-only build landed synchronously —
+                        // run the same settle protocol as a kernel-write land
+                        // (invariant #5: this routing path gets equivalent
+                        // drop behavior, gated identically).
+                        this.noteDurable(session.id, proofRevision);
+                        this.lastSaveLanded.set(session.id, true);
+                        this.runIdleSpillIfIdle(session.id);
+                        settledOk = true;
                     }
                     // #3818 writerOff safety valve REMOVED (#4216/#4242):
                     // the orphan/reap shape is now representable — its
@@ -2645,7 +2714,9 @@ export class SessionStore {
                     // without process-level handlers; the next markDirty retries.
                     this.log("error", `[persist] writerOff coalesced build failed for ${session.id}: ${String(err)}`);
                 } finally {
-                    this.drainFlushWaiters(session.id);
+                    if (!innerDrained) {
+                        this.drainFlushWaiters(session.id, settledOk);
+                    }
                 }
             };
             this.writerOffPending.set(session.id, run);
@@ -2664,46 +2735,150 @@ export class SessionStore {
             const build = this.saveBuilders.get(id);
             this.saveBuilders.delete(id);
             if (!build) return;
+            // #4788 D2: prove what THIS write covers BEFORE the chain starts
+            // building (the closure reads live state at chain-run time; newer
+            // mutations can only ride along — the spill gate's equality check
+            // against the CURRENT epoch stays conservative). peekSession: the
+            // debounced path does not keep the Session object itself.
+            const proofRevision = peekSession(id)?.revisionEpoch;
             // Errors are logged inside the kernel write chain; swallowing here
             // keeps a failed timer write from becoming an unhandledRejection.
+            this.saveWritesInFlight.add(id);
             void this.store.writeNow(id, build).then(() => {
                 this.stampOwnWrite(id); // #3406: the write LANDED — prove our bytes are on disk
-            }).catch(() => {}).finally(() => {
-                // #5155: settle waiters even on failure — waiting on a flush
-                // must never wedge a caller past a failed write (the next
-                // turn re-arms the whole path anyway).
-                this.drainFlushWaiters(id);
+                this.noteDurable(id, proofRevision);
+                this.lastSaveLanded.set(id, true);
+                // #4788 D2: discharge the droppable fields once the debounced
+                // save has actually settled — before this PR the trio sat on
+                // landed writes that fired MID-request (#4788), where it saw
+                // inFlight>0 and skipped everything. Each drop re-checks
+                // inFlight itself; the request-end boundary (spillBetweenTurns)
+                // gives the same discharge at every turn edge.
+                this.runIdleSpillIfIdle(id);
+            }).catch(() => {
+                this.lastSaveLanded.set(id, false);
+            }).finally(() => {
+                this.saveWritesInFlight.delete(id);
+                // #5155/#4788 D2: settle waiters even on failure — waiting on a
+                // flush must never wedge a caller past a failed write (the next
+                // turn re-arms the whole path anyway). The verdict tells spill
+                // callers whether a landing proof actually exists.
+                this.drainFlushWaiters(id, this.lastSaveLanded.get(id) === true);
             });
         }, this.debounceMs);
         timer.unref?.();
         this.saveTimers.set(id, timer);
     }
 
-    /** #5155: resolve once the currently armed save for this session has
-     *  landed (or immediately when nothing is pending). Background upkeep —
-     * like the incremental lane's pointer recording — needs a "rows are in
-     * the table now" signal without paying a synchronous writeNow. */
-    afterNextFlush(sessionId: string): Promise<void> {
-        if (!this.saveTimers.has(sessionId) && !this.writerOffPending.has(sessionId)) return Promise.resolve();
-        return new Promise<void>((resolve) => {
+    /** #5155/#4788 D2: resolves once everything currently queued or in flight
+     *  for this session has settled on the kernel write chain — true only when
+     *  every settle carried a landing proof. Resolves immediately when nothing
+     *  is armed and nothing is mid-write. Used by callers that need a "the
+     *  row has landed" signal without paying for a synchronous writeNow, and by
+     *  the #4788 between-turns spill gate which must never thin resident state
+     *  behind a missing/failed write. */
+    async afterNextFlush(sessionId: string): Promise<boolean> {
+        if (!this.saveTimers.has(sessionId)
+            && !this.writerOffPending.has(sessionId)
+            && !this.saveWritesInFlight.has(sessionId)) {
+            return true;
+        }
+        return await new Promise<boolean>((resolve) => {
             const ws = this.flushWaiters.get(sessionId) ?? [];
-            ws.push(resolve);
+            ws.push((ok: boolean): void => { resolve(ok); });
             this.flushWaiters.set(sessionId, ws);
         });
     }
 
-    private drainFlushWaiters(sessionId: string): void {
+    private drainFlushWaiters(sessionId: string, ok: boolean): void {
         const ws = this.flushWaiters.get(sessionId);
         if (!ws) return;
         this.flushWaiters.delete(sessionId);
         for (const w of ws) {
             try {
-                w();
+                w(ok);
             } catch {
-                // resolve callbacks cannot usefully fail; never let one
+                // verdict callbacks cannot usefully fail; never let one
                 // breaker take down the flush chain
             }
         }
+    }
+
+    /** #4788 D2/D1-A: the request-end-boundary spill — handle.ts's request
+     *  finally block calls this FIRE-AND-FORGET after releaseInFlight, i.e. in
+     *  the gap between requests: the same "only drop between requests"
+     *  invariant the post-save drops observe (handoff replies keep object
+     *  identity sentinels — see handoff-response.ts — so dropping while some
+     *  request still references session state would corrupt them). Safety
+     *  chain; every link fails closed and skips the drop silently:
+     *   1. afterNextFlush → true: everything armed or mid-write settled WITH a
+     *      landing proof (any failed settle or missing proof vetoes),
+     *   2. inFlight == 0 re-checked after the await,
+     *   3. durableRevision === live revisionEpoch: the disk copy provably
+     *      covers the EXACT current state, so each dropped field is
+     *      transparently rebuildable from disk by its narrow-read loader
+     *      (invariants #4/#7: media stays on the disk-only path, metadata
+     *      stays a small proxy).
+     *  D1-A hard cap: exceeding BILI_SESSION_RESIDENT_HARD_MAX_BYTES forces
+     *  this same discharge even for sessions exempt from pool eviction and
+     *  warns once per 60 s. The non-droppable remainder (state/contentStore/
+     *  transient) is out of scope here — per-field discharge for those is a
+     *  second stage TODO(owner). Errors are swallowed by design: this is idle
+     *  upkeep at a request boundary, never caller-critical. */
+    async spillBetweenTurns(session: Session): Promise<void> {
+        if (session.inFlight > 0) return;
+        let landed: boolean;
+        try {
+            landed = await this.afterNextFlush(session.id);
+        } catch {
+            return;
+        }
+        if (!landed) return;
+        if (session.inFlight > 0) return; // re-check across the await
+        const cap = sessionResidentHardMaxBytes();
+        if (cap > 0 && sessionWeight(session) > cap) {
+            const now = Date.now();
+            if (now - (this.capWarnAt.get(session.id) ?? 0) >= 60_000) {
+                this.capWarnAt.set(session.id, now);
+                this.log("warn", `[persist] ${session.id}: resident estimate ${sessionWeight(session)} B exceeds the per-session hard cap ${cap} B (#4788 D1-A) — discharging droppable fields back to disk now, including pool-exempt sessions; remainder (state/contentStore/transient) is non-droppable`);
+            }
+        }
+        this.runIdleSpill(session);
+    }
+
+    /** #4788 D2: post-settle discharge shared by every save-settle path
+     *  (debounce timer fire, writerOff microtask, public writeNow, flushSync,
+     *  spillBetweenTurns) — the single implementation of the droppable-field
+     *  gate, so invariant #5 (index-only paths get equivalent drops) holds by
+     *  construction. No-op while another request is in flight or while the
+     *  disk proof lags the live revision. */
+    private runIdleSpillIfIdle(id: string): void {
+        const s = peekSession(id);
+        if (!s || s.inFlight > 0) return;
+        this.runIdleSpill(s);
+    }
+
+    private runIdleSpill(session: Session): void {
+        if (session.inFlight > 0) return;
+        // Disk-proof gate: durableRevision EQUAL to the live epoch means every
+        // markDirty since the last disk proof has itself landed, so all three
+        // fields are reconstructable from disk via their narrow-read loaders;
+        // anything newer keeps them resident until its own save settles.
+        // (convergeToDisk and the drop internals are untouched — invariant #3:
+        // stampOwnWrite always precedes any drop, as here.)
+        if (this.durableRevision.get(session.id) !== (session.revisionEpoch ?? 0)) return;
+        this.foldResidentTail(session);
+        this.dropResidentBlockContents(session);
+        this.dropResidentMetadata(session);
+    }
+
+    /** #4788 D2/D1-A: stamp that the disk copy of id now covers the given
+     *  revisionEpoch. Callers capture the epoch BEFORE the write/load that
+     *  proves it — build closures read live state at run time, so anything
+     *  newer may only ride along, never be missing; the gate's equality check
+     *  against the CURRENT epoch makes the whole scheme conservative. */
+    private noteDurable(id: string, revisionEpoch: number | undefined): void {
+        this.durableRevision.set(id, revisionEpoch ?? 0);
     }
 
     /** Asynchronously persist a session right now (skips the debounce). Throws
@@ -2727,20 +2902,32 @@ export class SessionStore {
             // #3133: drop the armed microtask (token mismatch below) — this
             // sync build subsumes it; later mutations re-arm on their own.
             this.writerOffPending.delete(session.id);
+            const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
             this.guardedBuild(session)();
             this.maybeCutForkBase(session);
+            this.noteDurable(session.id, proofRevision); // #4788 D2: index-only build landed
+            this.lastSaveLanded.set(session.id, true);
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
             this.dropResidentMetadata(session);
             return;
         }
-        await this.store.writeNow(session.id, this.guardedBuild(session));
+        const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the chain builds
+        this.saveWritesInFlight.add(session.id);
+        try {
+            await this.store.writeNow(session.id, this.guardedBuild(session));
+        } catch (err) {
+            this.saveWritesInFlight.delete(session.id);
+            throw err;
+        }
         this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
         this.maybeCutForkBase(session);
+        this.noteDurable(session.id, proofRevision);
+        this.lastSaveLanded.set(session.id, true);
         this.foldResidentTail(session);
         this.dropResidentBlockContents(session);
         this.dropResidentMetadata(session);
-        this.drainFlushWaiters(session.id);
+        this.drainFlushWaiters(session.id, true);
     }
 
     /** #4739: where this id's record lives RIGHT NOW — the one build-scoped
@@ -2866,6 +3053,7 @@ export class SessionStore {
         if (this.writerOffActive() || this.envelopeFrozen(session.id)) {
             // #3133: same subsume rule as writeNow.
             this.writerOffPending.delete(session.id);
+            const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync build
             try {
                 this.guardedBuild(session)();
             } catch (err) {
@@ -2877,6 +3065,8 @@ export class SessionStore {
                 return false;
             }
             this.maybeCutForkBase(session);
+            this.noteDurable(session.id, proofRevision); // #4788 D2: index-only flush landed
+            this.lastSaveLanded.set(session.id, true);
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
             this.dropResidentMetadata(session);
@@ -2891,9 +3081,11 @@ export class SessionStore {
             this.saveTimers.delete(session.id);
             this.saveBuilders.delete(session.id);
         }
+        const proofRevision = session.revisionEpoch; // #4788 D2: capture BEFORE the sync commit
         const ok = this.store.flushSync(session.id, this.guardedBuild(session));
         if (ok) {
             this.stampOwnWrite(session.id); // #3406: the write LANDED — prove our bytes are on disk
+            this.noteDurable(session.id, proofRevision);
             this.maybeCutForkBase(session);
             this.foldResidentTail(session);
             this.dropResidentBlockContents(session);
