@@ -1535,6 +1535,8 @@ test("HTTP a mid-history rewrite replaces the snapshot wholesale with an exact b
 });
 
 test("HTTP a cold-restored non-retained parent serves its intact raw tail immediately (#5140)", { timeout: 60_000 }, async () => {
+    // Pin the mode this raw-tail proof requires: under the runner's legacy
+    // baseline no unified rows exist and forkSnapshot fails closed (#4599).
     const oldMode = process.env.BILI_STORAGE_UNIFIED;
     process.env.BILI_STORAGE_UNIFIED = "full";
     const h = await harness(true);
@@ -1556,10 +1558,10 @@ test("HTTP a cold-restored non-retained parent serves its intact raw tail immedi
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
         assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);
     } finally {
-    if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
-    else process.env.BILI_STORAGE_UNIFIED = oldMode;
-    await h.close();
-}
+        await h.close();
+        if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
+        else process.env.BILI_STORAGE_UNIFIED = oldMode;
+    }
 });
 
 test("fork protocol v2: snapshot serves the light revision, a stale v1 whole-store revision is still accepted (#2671 Phase 2b)", { timeout: 60_000 }, async () => {
