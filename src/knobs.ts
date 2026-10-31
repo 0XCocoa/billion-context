@@ -436,6 +436,11 @@ export function sessionResidentMaxBytes(): number {
  *  active one — structural blind spot #4788), this bounds ONE session and
  *  triggers the between-turns field drops even for an exempt/only-active
  *  session. `0` disables the cap check entirely. */
+export function sessionResidentHardMaxBytes(): number {
+    const v = tInt("BILI_SESSION_RESIDENT_HARD_MAX_BYTES", loadConfigFile().sessions?.hardMaxBytes);
+    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : sessionResidentMaxBytes();
+}
+
 /** BILI_SESSION_CONTENT_STORE_PIN (1/true): keep each session's CCR content
  *  store ({byRef}/{byHash} originals) RESIDENT in memory instead of folding
  *  it away after its save lands (#4788 phase 2, discussion #3916-E; the
@@ -445,11 +450,6 @@ export function sessionResidentMaxBytes(): number {
 export function contentStorePinned(env: NodeJS.ProcessEnv = process.env): boolean {
     const raw = env.BILI_SESSION_CONTENT_STORE_PIN?.trim().toLowerCase();
     return raw === "1" || raw === "true";
-}
-
-export function sessionResidentHardMaxBytes(): number {
-    const v = tInt("BILI_SESSION_RESIDENT_HARD_MAX_BYTES", loadConfigFile().sessions?.hardMaxBytes);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : sessionResidentMaxBytes();
 }
 
 interface GcSettings {

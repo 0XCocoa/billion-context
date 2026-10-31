@@ -237,6 +237,49 @@ test("the unified ccr mirror is preferred over the legacy sidecar when both exis
     }
 });
 
+test("a fork-child store (copy only in the parent envelope, nothing of its own landed) stays resident", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "bili-cs-8-"));
+    const store = new SessionStore({ dir, debounceMs: 60_000, enabled: true });
+    try {
+        // A fork child receives its content store through the PARENT'S
+        // envelope (record.forkContentStore): rehydrated children start clean
+        // (persisted, no pending growth) with no sidecar of their own and no
+        // index rows under their id. Dropping RAM here would throw on first
+        // touch (child snapshot loses its parentRevision). The proof gate must
+        // refuse — and because the store is NOT dirty, this isolates the
+        // landed-copy check rather than the dirty veto.
+        const c = makeSession("cs-fork-child");
+        c.contentStore = seedStore(30);
+        c.contentStoreDirty = false;
+        c.persisted = true;
+
+        (store as unknown as { runIdleSpill(x: Session): void }).runIdleSpill(c);
+        assert.equal(
+            (store as unknown as { contentStoreLanded(id: string, m?: unknown): boolean }).contentStoreLanded(c.id, c.meta),
+            false,
+            "gate: no provably-landed copy yet",
+        );
+        assert.ok(!isDroppedContentStore(c.contentStore), "child store must stay resident while unproven");
+        assert.equal(Object.keys(c.contentStore!.byRef).length, 30, "full set still in RAM");
+
+        // The moment the child grows real content under its own id, adoption
+        // marks the store dirty; that save then writes its OWN sidecar, which
+        // is the proof, and the store folds like any settled one.
+        const grew = storeOriginal(c.contentStore!, {
+            ref: "m00099", rawId: "raw-99", text: "first original minted under the child's own id", kind: "tool", tokens: 7, head: "first child",
+        });
+        c.contentStore = grew;
+        c.contentStoreDirty = true;
+        snapshotForSave(c);
+        await store.writeNow(c);
+        assert.ok(isDroppedContentStore(c.contentStore), "landed copy = proof — folds as usual");
+        assert.equal(Object.keys(c.contentStore!.byRef).length, 31, "round-trips through its OWN sidecar");
+    } finally {
+        await closeQuietly(store);
+        rmrf(dir);
+    }
+});
+
 // --- helpers ---------------------------------------------------------------
 
 function readSidecar(dir: string): { byRef: Record<string, unknown>; byHash: Record<string, string> } {

@@ -646,25 +646,35 @@ export class SessionStore {
         ]);
     }
 
-    private readContentStoreRels(id: string, rels: string[]): MessageContentStore | null {
-        if (!this.enabled) return null;
-        // #3399/#3765: probe the winning source's CCR BEFORE rels[0]. Adoption
-        // rewrites meta.upstreamOrigin to the requesting route during loadSync,
-        // so rels[0] targets that route's sidecar — a degraded current-route twin
-        // with a valid-but-incomplete CCR would otherwise shadow the winning
-        // ledger's originals (missing refs → DIGEST DRIFT). A .fb.json fallback
-        // source keeps its canonical <base>.content-store.json name.
+    /** #4788 phase 2: candidate on-disk locations of id's content-store
+     *  envelope, in probe order — the winning source's canonical sidecar
+     *  (#3399/#3765: first, because adoption rewrites meta.upstreamOrigin to
+     *  the requesting route during loadSync, so rels[0] targets that route's
+     *  sidecar and a degraded current-route twin with a valid-but-incomplete
+     *  CCR would otherwise shadow the winning ledger's originals → DIGEST
+     *  DRIFT; a .fb.json fallback source keeps its <base>.content-store.json
+     *  name), then the rel-path candidates, then every .json file on disk
+     *  whose name matches the id. BOTH consumers must go through this —
+     *  readContentStoreRels (parse) and contentStoreLanded (existence proof)
+     *  — so the drop gate can never go positive on a path the reader would
+     *  not consult. */
+    private candidateContentStorePaths(id: string, rels: string[]): string[] {
         const source = this.sourceFiles.get(id);
         const sourceCcr = source
             ? (source.endsWith(".fb.json")
                 ? `${source.slice(0, -".fb.json".length)}.content-store.json`
                 : `${source.slice(0, -".json".length)}.content-store.json`)
             : null;
-        const paths = [...(sourceCcr ? [sourceCcr] : []),
+        return [...new Set([
+            ...(sourceCcr ? [sourceCcr] : []),
             ...rels.map(rel => path.join(this.sessionsDir, rel)),
             ...this.diskFiles.filter(file => fileNameMatchesId(path.basename(file), id))
-                .map(file => file.replace(/\.json$/, ".content-store.json"))];
-        for (const file of new Set(paths)) {
+                .map(file => file.replace(/\.json$/, ".content-store.json"))])];
+    }
+
+    private readContentStoreRels(id: string, rels: string[]): MessageContentStore | null {
+        if (!this.enabled) return null;
+        for (const file of this.candidateContentStorePaths(id, rels)) {
             let buf: Buffer;
             try {
                 buf = readFileSync(file);
@@ -3223,21 +3233,12 @@ export class SessionStore {
      *  uncertainty keeps the store resident. */
     private contentStoreLanded(id: string, meta?: { protocol?: string; upstreamOrigin?: string } | null): boolean {
         if (this.unifiedCcrFor(id) !== null) return true;
-        const rels = [
+        // Same candidate set the lazy loader probes (candidateContentStorePaths);
+        // existence checks only, no parsing.
+        for (const p of this.candidateContentStorePaths(id, [
             contentStoreRelPathFor(id, meta?.protocol, meta?.upstreamOrigin),
             contentStoreRelPathFor(id),
-        ];
-        const source = this.sourceFiles.get(id);
-        const sourceCcr = source
-            ? (source.endsWith(".fb.json")
-                ? `${source.slice(0, -".fb.json".length)}.content-store.json`
-                : `${source.slice(0, -".json".length)}.content-store.json`)
-            : null;
-        const paths = [...(sourceCcr ? [sourceCcr] : []),
-            ...rels.map((rel) => path.join(this.sessionsDir, rel)),
-            ...this.diskFiles.filter((file) => fileNameMatchesId(path.basename(file), id))
-                .map((file) => file.replace(/\.json$/, ".content-store.json"))];
-        for (const p of new Set(paths)) {
+        ])) {
             try { if (existsSync(p)) return true; } catch { /* probe only */ }
         }
         return false;
