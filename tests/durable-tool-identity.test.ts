@@ -84,9 +84,13 @@ test("dshTimeContextPath: clock readings get a path OUTSIDE durable/* — anchor
     const reading = { id: "t1", role: "user", contentType: "text", text: "Time sampled while preparing turn 3, step 2: 2026-10-29T12:00:00.000Z\nElapsed since the preceding turn: 45s" } as never;
     const echo = { id: "t2", role: "assistant", contentType: "text", text: "Time sampled while preparing turn 3, step 2: ..." } as never;
     const unrelated = { id: "t3", role: "user", contentType: "text", text: "What time is it?" } as never;
+    // A real human request that merely QUOTES the phrase mid-sentence must stay
+    // unclassified (prefix-anchored match) — otherwise Rule 3 would strand it.
+    const quote = { id: "t4", role: "user", contentType: "text", text: "Why does the log say \"Time sampled while preparing turn 3\" even though I asked nothing yet?" } as never;
     assert.equal(dshTimeContextPath(reading), "injected/time-context");
     assert.equal(dshTimeContextPath(echo), undefined, "assistant echo is never a carrier (#2766)");
     assert.equal(dshTimeContextPath(unrelated), undefined);
+    assert.equal(dshTimeContextPath(quote), undefined, "a real request quoting the phrase mid-sentence stays unclassified");
     // The dsh lane classifier resolves it end-to-end...
     const cl = durableMessageToolPaths["dsh"]!;
     assert.equal(cl(reading), "injected/time-context");

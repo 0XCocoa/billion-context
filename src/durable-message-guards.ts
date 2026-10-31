@@ -159,9 +159,14 @@ export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
  *  foldable" decision. The path still matters: kernel Rule 3 refuses
  *  virtual-path messages the last-user anchor (#5109), so a stale clock
  *  reading can never displace the newest human request from the protected
- *  zone. #2766: model echoes are never carriers (assistant gate below). */
+ *  zone. #2766: model echoes are never carriers (assistant gate below).
+ *  Matching is PREFIX-anchored (trimmed), not substring: renderText always
+ *  opens the message with the phrase, and a substring hit would reclassify
+ *  a real human request that merely quotes it mid-sentence — stranding it
+ *  from the Rule-3 anchor for no reason. Same discipline as
+ *  isAutoInjectedNotification's prefix list (#2286). */
 export function dshTimeContextPath(msg: CoreMessage): string | undefined {
-    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.includes("Time sampled while preparing turn")
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && msg.text.trim().startsWith("Time sampled while preparing turn")
         ? "injected/time-context"
         : undefined;
 }
